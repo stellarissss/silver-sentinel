@@ -42,7 +42,7 @@ from ..core.eventlog import emit
 from ..db import session_scope
 from ..domain import utcnow
 from ..models import TIER_CANDIDATE, TIER_COLD, Asset, DiscoveryEvent, KeywordHit, TaskRun
-from .ct import CertObservation, CertStreamClient, CTLogFollower, CtrlShSearch, DEFAULT_LOGS
+from .ct import CertObservation, CertStreamClient, CTLogFollower, CtrlShSearch
 from .dnsprobe import DNSProbe, SeedGenerator
 from .keywords import get_library
 
@@ -127,19 +127,11 @@ class DiscoveryEngine:
         self._stop.clear()
 
         if settings.allow_network:
-            log_urls = [u.strip() for u in settings.ct_poll_logs.split(",") if u.strip()] or DEFAULT_LOGS
-            for url in log_urls:
-                slug = url.rstrip("/").rsplit("/", 1)[-1][:24] or "log"
-                follower = CTLogFollower(
-                    url,
-                    settings.data_dir / "ct_state" / f"{slug}.json",
-                    batch=max(64, settings.ct_poll_batch),
-                )
-                (settings.data_dir / "ct_state").mkdir(parents=True, exist_ok=True)
-                self._followers.append(follower)
-
+            (settings.data_dir / "ct_state").mkdir(parents=True, exist_ok=True)
+            # 日志清单的选择放到后台线程做：探测 20 多条日志要十几秒，
+            # 不能把 API 启动卡住（健康检查会被容器判死）。
             self._threads.append(
-                threading.Thread(target=self._ct_loop, name="discover-ct", daemon=True)
+                threading.Thread(target=self._ct_manager, name="discover-ct-mgr", daemon=True)
             )
             self._threads.append(
                 threading.Thread(target=self._dns_loop, name="discover-dns", daemon=True)
@@ -156,7 +148,67 @@ class DiscoveryEngine:
 
         for t in self._threads:
             t.start()
-        log.info("发现引擎已启动：%d 个 CT 日志 + DNS 探测", len(self._followers))
+        log.info("发现引擎已启动：CT 跟随 %s 条日志 + DNS 探测", settings.ct_poll_logs or "自动选择")
+
+    # ------------------------------------------------------------ 日志清单管理
+    def _resolve_logs(self) -> list[str]:
+        configured = [u.strip() for u in settings.ct_poll_logs.split(",") if u.strip()]
+        if configured:
+            return configured
+        from .ct import fetch_usable_logs
+
+        return fetch_usable_logs(limit=settings.ct_poll_logs_limit)
+
+    def _spawn_follower(self, url: str) -> None:
+        slug = url.rstrip("/").rsplit("/", 1)[-1][:24] or "log"
+        if not slug or slug == "log":
+            parts = [p for p in url.rstrip("/").split("/") if p]
+            slug = (parts[-1] if parts else "log")[:24]
+        follower = CTLogFollower(
+            url,
+            settings.data_dir / "ct_state" / f"{slug}.json",
+            batch=max(64, settings.ct_poll_batch),
+        )
+        self._followers.append(follower)
+        # 每条日志一个线程：串行轮询时后几条会被前一条的慢请求拖死，
+        # 而日志响应时间波动很大（实测 0.5s～5s）。
+        t = threading.Thread(
+            target=self._ct_loop, args=(follower,), name=f"discover-ct-{slug}", daemon=True
+        )
+        t.start()
+
+    def _ct_manager(self) -> None:
+        try:
+            urls = self._resolve_logs()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("解析 CT 日志清单失败：%s", exc)
+            urls = []
+        for url in urls:
+            if self._stop.is_set():
+                return
+            self._spawn_follower(url)
+        if not self._followers:
+            log.warning("没有可用 CT 日志，发现层只剩 DNS 探测")
+
+        # 每半小时检查一次：日志冻结了就换一条。这是它最容易「静默失效」的地方。
+        while not self._stop.wait(1800):
+            frozen = [f for f in list(self._followers) if f.frozen and not getattr(f, "retired", False)]
+            if not frozen:
+                continue
+            try:
+                candidates = self._resolve_logs()
+            except Exception:  # noqa: BLE001
+                continue
+            used = {f.url.rstrip("/") for f in self._followers}
+            for dead in frozen:
+                dead.retired = True
+                spare = [u for u in candidates if u.rstrip("/") not in used]
+                if not spare:
+                    log.warning("CT 日志 %s 已冻结，但找不到替换日志", dead.url)
+                    continue
+                used.add(spare[0].rstrip("/"))
+                log.warning("CT 日志 %s 已冻结，改跟 %s", dead.url, spare[0])
+                self._spawn_follower(spare[0])
 
     def stop(self) -> None:
         self._stop.set()
@@ -166,18 +218,20 @@ class DiscoveryEngine:
         self._flush(force=True)
 
     # ------------------------------------------------------------ CT 轮询
-    def _ct_loop(self) -> None:
-        while not self._stop.is_set():
+    def _ct_loop(self, follower) -> None:
+        while not self._stop.is_set() and not getattr(follower, "retired", False):
             started = time.monotonic()
-            for follower in self._followers:
-                if self._stop.is_set():
-                    break
-                try:
-                    observations = follower.poll()
-                    if observations:
-                        self._on_ct_batch(observations)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("CT 轮询异常：%s", exc)
+            try:
+                # 连续取多批直到追平或预算用尽。单次只取一批的话，
+                # 日志增速（实测 ~2000 条/分钟/日志）一旦超过 batch/interval，
+                # 中间的证书就被永久跳过。
+                follower.catch_up(
+                    self._on_ct_batch,
+                    max_batches=80,
+                    budget=max(6.0, settings.ct_poll_interval * 0.8),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("CT 轮询异常 %s：%s", follower.url, exc)
             elapsed = time.monotonic() - started
             self._stop.wait(max(2.0, settings.ct_poll_interval - elapsed))
 
@@ -444,11 +498,16 @@ class DiscoveryEngine:
 
     # ------------------------------------------------------------ 状态
     def status(self) -> dict[str, Any]:
+        followers = list(self._followers)
         return {
             "running": self._running,
             "stats": self.stats.as_dict(),
             "keyword_library": self.lib.stats(),
-            "followers": [f.status() for f in self._followers],
+            "followers": [f.status() for f in followers],
+            "followers_total_lag": sum(
+                (f.status().get("lag") or 0) for f in followers if not getattr(f, "retired", False)
+            ),
+            "followers_frozen": sum(1 for f in followers if f.frozen),
             "stream": self._stream.status() if self._stream else None,
             "dns": self._dns.stats if self._dns else None,
             "seeds": self._seeds.stats() if self._seeds else None,

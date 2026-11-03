@@ -33,15 +33,21 @@ from ..config import settings
 
 log = logging.getLogger(__name__)
 
-# 默认日志集。按「国内可达性」排序——生产环境里 Google 系常常连不上，
-# 但 Cloudflare / DigiCert / Sectigo 一般没问题。
+# 默认日志集：优先 DigiCert / Cloudflare。Google 系在很多国内机房连不上
+# （实测 12s 超时），所以放最后，失败也不影响前面几条。
+# 注意日志会「冻结」——`nimbus2025` 这类年度日志在年底后被封存，tree_size 不再增长。
+# 因此除了这份静态清单，运行时会去官方 log_list.json 拉当前 usable 日志（见 fetch_usable_logs）。
 DEFAULT_LOGS = [
-    "https://ct.cloudflare.com/logs/nimbus2025",
-    "https://nessie2025.ct.digicert.com/log",
-    "https://yeti2025.ct.digicert.com/log",
-    "https://oak.ct.letsencrypt.org/2025h2",
-    "https://ct.googleapis.com/logs/us1/argon2025h2",
+    "https://wyvern.ct.digicert.com/2026h2/",
+    "https://sphinx.ct.digicert.com/2026h2/",
+    "https://ct.cloudflare.com/logs/nimbus2026/",
+    "https://elephant2026h2.ct.sectigo.com/",
+    "https://ct.googleapis.com/logs/us1/argon2026h2/",
 ]
+
+LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
+# 这些运营商在国内机房通常可达；排序时优先
+PREFERRED_OPERATORS = ("DigiCert", "Cloudflare", "Sectigo", "TrustAsia")
 
 UA = "Mozilla/5.0 (compatible; silver-sentinel/1.0; +https://github.com/stellarissss/silver-sentinel)"
 
@@ -76,6 +82,90 @@ def _http_json(url: str, timeout: float = 25.0) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"null")
+
+
+def fetch_usable_logs(limit: int = 6, timeout: float = 8.0) -> list[str]:
+    """从官方 log_list.json 取当前 `usable` 的日志，按可达性探测后返回。
+
+    为什么不自带一份写死的清单：CT 日志按半年度滚动，到期后**冻结**
+    （tree_size 不再增长）。写死的清单最多撑半年就会全部指向冻死的日志，
+    表现是「进程在跑、指标在涨、实际一条新证书都没进来」——最难发现的那种故障。
+    """
+    try:
+        data = _http_json(LOG_LIST_URL, timeout=timeout + 4)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        log.warning("拉取 CT 日志清单失败，用内置清单：%s", exc)
+        return list(DEFAULT_LOGS)[:limit]
+
+    # (operator, url) —— 同一运营商会开多条日志（按季度/分片），
+    # 全跟一家等于把鸡蛋放一个篮子：它限流或割接，采集中断就全停了。
+    candidates: list[tuple[str, str]] = []
+    for operator in data.get("operators", []) or []:
+        name = str(operator.get("name", ""))
+        for entry in operator.get("logs", []) or []:
+            state = entry.get("state") or {}
+            if not state.get("usable"):
+                continue
+            url = str(entry.get("url", "")).strip()
+            if url.startswith("https://"):
+                candidates.append((name, url))
+
+    if not candidates:
+        return list(DEFAULT_LOGS)[:limit]
+
+    def rank(item: tuple[str, str]) -> int:
+        name = item[0]
+        for i, op in enumerate(PREFERRED_OPERATORS):
+            if op.lower() == name.lower():
+                return i
+        return len(PREFERRED_OPERATORS)
+
+    candidates.sort(key=rank)
+
+    # 探测：拿到 tree_size，用来判断这条日志是否「成熟」（条目多 = 承载主流流量）。
+    # 并行探测，否则 20 多条 × 8s 超时会让启动卡上几分钟。
+    probed: dict[str, list[tuple[str, int]]] = {}
+    targets = candidates[: limit * 6]
+
+    def _probe(item: tuple[str, str]) -> tuple[str, str, int] | None:
+        name, url = item
+        try:
+            sth = _http_json(url.rstrip("/") + "/ct/v1/get-sth", timeout=timeout)
+            size = int(sth.get("tree_size", 0))
+            return (name, url, size) if size > 0 else None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError):
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for res in pool.map(_probe, targets):
+            if res:
+                name, url, size = res
+                probed.setdefault(name, []).append((url, size))
+
+    if not probed:
+        log.warning("官方清单里的日志全部不可达，退回内置清单")
+        return list(DEFAULT_LOGS)[:limit]
+
+    # 每个运营商只取条目最多的一条（最可能是当前主力日志），再按偏好顺序铺开
+    ordered = sorted(probed.items(), key=lambda kv: rank((kv[0], "")))
+    alive: list[str] = []
+    for _name, logs in ordered:
+        logs.sort(key=lambda x: -x[1])
+        alive.append(logs[0][0])
+        if len(alive) >= limit:
+            break
+    # 运营商不够多时，用次多的日志补齐
+    if len(alive) < limit:
+        for _name, logs in ordered:
+            for url, _size in logs[1:]:
+                if len(alive) >= limit:
+                    break
+                alive.append(url)
+
+    log.info("CT 日志清单：来自 %d 家运营商的 %d 条可用日志", len(probed), len(alive))
+    return alive
 
 
 def _parse_entry(entry: dict[str, Any]) -> tuple[list[str], str, str, str] | None:
@@ -129,20 +219,35 @@ def _parse_entry(entry: dict[str, Any]) -> tuple[list[str], str, str, str] | Non
 class CTLogFollower:
     """跟随一个 CT 日志的尾部。
 
-    游标持久化，进程重启后接着上次位置。落后超过 max_lag 直接跳段，
-    因为追历史没有意义——我们要的是「正在发生的事」。
+    游标持久化，进程重启后接着上次位置。
+
+    「尾部」不等于「最后 N 条」：日志头部的条目录入后往往要过几秒才可完整取回
+    （实测 Cloudflare nimbus 请求最后 256 条只返回 12 条）。所以追平后不是停在
+    `size`，而是保留 max_lag 的窗口慢慢往前啃——既拿得到数据，又不会因为跳段
+    把中间几千条新证书整段丢掉。落后超过 max_lag 时才真正跳段（宕机数小时之后
+    补历史没有意义，我们要的是「正在发生的事」）。
     """
 
-    def __init__(self, url: str, state_path: Path, *, batch: int = 256, max_lag: int = 20000) -> None:
+    def __init__(self, url: str, state_path: Path, *, batch: int = 256, max_lag: int = 8000) -> None:
         self.url = url.rstrip("/")
         self.state_path = state_path
         self.batch = batch
+        # 单次请求的条目数。日志侧通常还会再截断（实测 DigiCert 固定给 100 条），
+        # 所以这里取小一点，让并发页之间粒度更细、浪费更少。
+        self.page = max(32, min(256, batch))
+        # 读的位置比 tree_size 后退多少条：避开「刚录入但还取不到」的头部区域
+        self.trail = 500
         self.max_lag = max_lag
         self.index = 0
         self.tree_size = 0
         self.last_ok = 0.0
+        self._sth_at = 0.0
         self.last_error = ""
         self.total_seen = 0
+        self.caught_up_calls = 0
+        self.frozen = False
+        self._last_size = 0
+        self._same_size_polls = 0
         self._load()
 
     def _load(self) -> None:
@@ -160,64 +265,101 @@ class CTLogFollower:
             pass
 
     def poll(self) -> list[CertObservation]:
+        """取一页（供外部单步调用）。批量场景请用 catch_up()。"""
         try:
-            sth = _http_json(f"{self.url}/ct/v1/get-sth", timeout=15)
-            size = int(sth.get("tree_size", 0))
-            if size <= 0:
+            if not self._refresh_head():
                 return []
-            self.tree_size = size
-
-            if self.index == 0:
-                # 首次启动：从尾部回补一小段，建立基线
-                start = max(0, size - self.batch)
-            elif self.index > size:
-                # 日志被重置或游标异常，重新对齐
-                start = max(0, size - self.batch)
-            elif self.index == size:
-                # 已追平，等新条目。直接返回，别重复取尾部
-                self.last_ok = time.time()
+            start = self._next_start()
+            if start is None:
                 return []
-            else:
-                start = self.index
-                if size - start > self.max_lag:
-                    log.info("CT 日志 %s 落后 %d 条，跳段到尾部", self.url, size - start)
-                    start = size - self.batch
-
-            end = min(start + self.batch, size) - 1
-            if end < start:
+            base = start
+            entries = self._fetch_page(start, min(start + self.page, self._horizon()) - 1)
+            if not entries:
                 return []
-
-            data = _http_json(f"{self.url}/ct/v1/get-entries?start={start}&end={end}", timeout=40)
-            entries = data.get("entries", [])
-            self.index = end + 1
+            self.index = base + len(entries)
             self._save()
-            self.last_ok = time.time()
-            self.last_error = ""
-
-            out: list[CertObservation] = []
-            for offset, entry in enumerate(entries):
-                parsed = _parse_entry(entry)
-                if not parsed:
-                    continue
-                names, issuer, not_before, fingerprint = parsed
-                idx = start + offset
-                for name in names:
-                    out.append(
-                        CertObservation(
-                            domain=name,
-                            all_domains=names,
-                            issuer=issuer,
-                            not_before=not_before,
-                            fingerprint=fingerprint,
-                            log_url=self.url,
-                            entry_index=idx,
-                        )
-                    )
-            self.total_seen += len(out)
-            return out
+            return self._to_observations(entries, base)
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"[:200]
             return []
+
+    # ------------------------------------------------------------ 内部
+    def _horizon(self) -> int:
+        # 日志头部刚录入的条目往往还没对外提供（实测最后 256 条只能取到 12 条）。
+        # 所以读的位置比 tree_size 后退 trail 条，拿「已经落定」的数据。
+        return max(0, self.tree_size - self.trail)
+
+    def _refresh_head(self) -> bool:
+        """刷新 tree_size。5 秒内复用，避免每翻一页都多打一次 get-sth。"""
+        if self.tree_size and time.time() - self._sth_at < 5:
+            return True
+        sth = _http_json(f"{self.url}/ct/v1/get-sth", timeout=15)
+        size = int(sth.get("tree_size", 0))
+        self._sth_at = time.time()
+        if size <= 0:
+            return False
+        self.tree_size = size
+
+        # 冻结检测：年度日志到期后 tree_size 不再增长，索引照跑但永远拿不到新条目。
+        # 这是最隐蔽的失效——不报错、指标照涨，只是「什么也没发现」。
+        if size == self._last_size:
+            self._same_size_polls += 1
+            if self._same_size_polls == 8 and not self.frozen:
+                self.frozen = True
+                log.warning("CT 日志 %s 的 tree_size 连续 8 次未变化，疑似已冻结，建议换日志", self.url)
+        else:
+            self._same_size_polls = 0
+            self._last_size = size
+            self.frozen = False
+        return True
+
+    def _next_start(self) -> int | None:
+        horizon = self._horizon()
+        if self.index == 0 or self.index > self.tree_size:
+            # 首次接入或游标异常：从窗口尾部起，不追历史
+            self.index = max(0, horizon - self.page)
+        if horizon - self.index > self.max_lag:
+            log.info(
+                "CT 日志 %s 落后 %d 条，只保留最近 %d 条", self.url, horizon - self.index, self.max_lag
+            )
+            self.index = max(0, horizon - self.max_lag)
+        if self.index >= horizon:
+            self.last_ok = time.time()
+            self.caught_up_calls += 1
+            return None
+        return self.index
+
+    def _fetch_page(self, start: int, end: int) -> list[dict]:
+        if end < start:
+            return []
+        data = _http_json(f"{self.url}/ct/v1/get-entries?start={start}&end={end}", timeout=40)
+        entries = data.get("entries", []) or []
+        self.last_ok = time.time()
+        self.last_error = ""
+        return entries
+
+    def _to_observations(self, entries: list[dict], base: int) -> list[CertObservation]:
+        out: list[CertObservation] = []
+        for offset, entry in enumerate(entries):
+            parsed = _parse_entry(entry)
+            if not parsed:
+                continue
+            names, issuer, not_before, fingerprint = parsed
+            idx = base + offset
+            for name in names:
+                out.append(
+                    CertObservation(
+                        domain=name,
+                        all_domains=names,
+                        issuer=issuer,
+                        not_before=not_before,
+                        fingerprint=fingerprint,
+                        log_url=self.url,
+                        entry_index=idx,
+                    )
+                )
+        self.total_seen += len(out)
+        return out
 
     def status(self) -> dict[str, Any]:
         return {
@@ -226,9 +368,72 @@ class CTLogFollower:
             "tree_size": self.tree_size,
             "lag": max(0, self.tree_size - self.index) if self.tree_size else None,
             "total_seen": self.total_seen,
+            "frozen": self.frozen,
             "age_seconds": round(time.time() - self.last_ok, 1) if self.last_ok else None,
             "error": self.last_error,
         }
+
+    def catch_up(self, emit: Callable[[list[CertObservation]], None], *,
+                 max_batches: int = 60, budget: float = 20.0, parallel: int = 6) -> int:
+        """在时间预算内连续取多页，把积压啃完。
+
+        两个必须并行的地方：
+
+        1. **多页并发**。单页请求的返回条数由日志侧决定（实测 DigiCert 一次给 100 条、
+           耗时 10 秒），串行时一条日志的吞吐只有 600 条/分钟，而这类日志每分钟新增
+           约 2000 条——永远追不上，中间的证书就被永久跳过。
+        2. **多日志并发**。由 engine 每条日志起一个线程。
+
+        游标只按「实际返回条数」推进；某一页返回不满就丢弃后面预取的页，
+        下一轮从断点重来。宁可多打几次请求，也不能在游标上跳着走。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        deadline = time.monotonic() + budget
+        total = 0
+        batches = 0
+        with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+            while batches < max_batches and time.monotonic() < deadline:
+                try:
+                    if not self._refresh_head():
+                        break
+                    start = self._next_start()
+                    if start is None:
+                        break
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                    self.last_error = f"{type(exc).__name__}: {exc}"[:200]
+                    break
+
+                horizon = self._horizon()
+                starts = [s for s in (start + i * self.page for i in range(parallel)) if s < horizon]
+                futures = [
+                    pool.submit(self._fetch_page, s, min(s + self.page, horizon) - 1) for s in starts
+                ]
+
+                base = start
+                progressed = False
+                for fut in futures:
+                    try:
+                        entries = fut.result()
+                    except Exception:  # noqa: BLE001
+                        entries = []
+                    if not entries:
+                        break
+                    obs = self._to_observations(entries, base)
+                    self.index = base + len(entries)
+                    self._save()
+                    base = self.index
+                    batches += 1
+                    progressed = True
+                    if obs:
+                        emit(obs)
+                        total += len(obs)
+                    if len(entries) < self.page:
+                        # 不满页 = 这一页之后未必连续，剩下的预取作废
+                        break
+                if not progressed:
+                    break
+        return total
 
 
 class CertStreamClient:
@@ -240,6 +445,7 @@ class CertStreamClient:
         self.connected = False
         self.last_error = ""
         self.total = 0
+        self.failures = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -265,7 +471,8 @@ class CertStreamClient:
                     buffer: list[CertObservation] = []
                     last_flush = time.time()
                     while not self._stop.is_set():
-                        raw = ws.recv(timeout=30)
+                        # 公共实例经常「连上了但不推流」，超时给足 60s 再判死
+                        raw = ws.recv(timeout=60)
                         msg = json.loads(raw)
                         if msg.get("message_type") != "certificate_update":
                             continue
@@ -295,8 +502,17 @@ class CertStreamClient:
                             last_flush = time.time()
             except Exception as exc:  # noqa: BLE001
                 self.connected = False
+                self.failures += 1
                 self.last_error = f"{type(exc).__name__}: {exc}"[:160]
-                log.warning("certstream 断开（%s），%.0fs 后重连", self.last_error, backoff)
+                # 前两次和之后每 5 次记一条；公共实例常年在「连上但不推流」的状态，
+                # 每次都刷 warning 会把真正有用的日志埋掉。主路是 CT 轮询，这条只是补强。
+                if self.failures <= 2 or self.failures % 5 == 0:
+                    log.warning(
+                        "certstream 第 %d 次断开（%s），%.0fs 后重连；主路 CT 轮询不受影响",
+                        self.failures, self.last_error, backoff,
+                    )
+                    if self.failures == 3 and self.total == 0:
+                        log.warning("certstream 公共实例未推送任何数据，已降级为「仅 CT 轮询」")
                 self._stop.wait(backoff)
                 backoff = min(backoff * 1.8, 120.0)
 
@@ -305,6 +521,7 @@ class CertStreamClient:
             "url": self.url,
             "connected": self.connected,
             "total": self.total,
+            "failures": self.failures,
             "error": self.last_error,
         }
 

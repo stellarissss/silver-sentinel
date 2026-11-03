@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from ..db import session_scope
 from ..models import Asset, Evidence
-from ..normalize import extract_indicators
+from ..normalize import extract_indicators, is_shared_infra
 from .schema import CLUSTER_RELATIONS, node_key
 from .store import GraphStore, get_graph
 
@@ -74,14 +74,17 @@ class GraphBuilder:
 
     def _build_domain(self, asset: Asset, value: str, facts: dict, meta: dict, label: str) -> None:
         dkey = self.store.upsert_node("domain", value, label, {"tier": asset.tier, "score": asset.score})
+        # 共享基础设施（*.snowflake.com / *.amazonaws.com / *.vercel.app …）下，
+        # 证书与 IP 是平台分配的，拿来当「同伙」证据会把整朵云的客户判成一伙。
+        infra = is_shared_infra(value)
 
-        for ip in _as_list(facts.get("ips")) + _as_list(facts.get("a_records")):
+        for ip in ([] if infra else _as_list(facts.get("ips")) + _as_list(facts.get("a_records"))):
             self._link(("domain", value), ("ip", ip), "RESOLVES_TO")
         for ns in _as_list(facts.get("nameservers")):
             self._link(("domain", value), ("asn", ns), "HOSTED_ON")
 
         cert_fp = facts.get("cert_fingerprint") or meta.get("cert_fingerprint")
-        if cert_fp:
+        if cert_fp and not infra:
             self._link(("domain", value), ("cert", cert_fp), "HAS_CERT")
 
         registrar = facts.get("registrar") or meta.get("registrar")
@@ -219,6 +222,11 @@ class GraphBuilder:
 
         # 把 Campaign 关系也写进图
         self._link_campaigns()
+        # 节点数取图库真实值：builder 只负责建边，自己数是数不准的
+        try:
+            self.stats["nodes"] = int(self.store.stats().get("nodes", 0))
+        except Exception:  # noqa: BLE001
+            pass
         return self.stats
 
     def _link_campaigns(self) -> None:

@@ -12,6 +12,7 @@ import json
 import random
 import threading
 import time
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -19,7 +20,7 @@ import httpx
 from ..config import settings
 
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; SilverSentinel/0.1; +https://github.com/stellarissss/silver-sentinel) "
+    "Mozilla/5.0 (compatible; SilverSentinel/1.0; +https://github.com/stellarissss/silver-sentinel) "
     "anti-fraud-research"
 )
 
@@ -43,7 +44,31 @@ class _RateLimiter:
             self._next = now + self._interval
 
 
-_limiter = _RateLimiter(settings.rate_limit_per_sec)
+# 限速按「目标站点」而不是全局：全局桶会把流水线卡死——实测 8 线程并发研判时，
+# 全局 2 req/s 让每个目标都排在同一个队里，8 个目标串成 33 秒。
+# 按 host 限速既不失礼（对单个站点仍然克制），又不会互相拖累。
+_master = _RateLimiter(max(settings.rate_limit_per_sec * 4, 4.0))
+_host_limiters: dict[str, _RateLimiter] = {}
+_host_lock = threading.Lock()
+
+
+def _host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+
+
+def wait_turn(url: str) -> None:
+    """先过全局总闸，再过目标站点自己的闸。固定顺序，避免死锁。"""
+    host = _host_of(url)
+    with _host_lock:
+        limiter = _host_limiters.get(host)
+        if limiter is None:
+            limiter = _RateLimiter(settings.rate_limit_per_sec)
+            _host_limiters[host] = limiter
+    _master.wait()
+    limiter.wait()
 
 
 class HttpClient:
@@ -60,7 +85,7 @@ class HttpClient:
 
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
-            _limiter.wait()
+            wait_turn(url)
             try:
                 with httpx.Client(timeout=self.timeout, follow_redirects=True, headers=headers) as client:
                     resp = client.request(method, url, **kwargs)

@@ -36,6 +36,23 @@ FREE_HOSTING_SUFFIXES = (
     ".herokuapp.com", ".repl.co", ".ngrok.io", ".trycloudflare.com",
 )
 
+# 共享基础设施后缀：云厂商、对象存储、PaaS、建站平台。
+# 这些域下的子域由平台批量签发**通配符证书**，所以「共用证书」「同 IP」
+# 在这里没有任何归因价值——把它们算成团伙，等于把同一朵云上的所有客户判成一伙。
+# 发现层照常记录（宁可错杀），但图上不建证书/解析边，避免污染归因。
+SHARED_INFRA_SUFFIXES = (
+    ".amazonaws.com", ".cloudfront.net", ".elb.amazonaws.com",
+    ".azurewebsites.net", ".azureedge.net", ".blob.core.windows.net", ".cloudapp.azure.com",
+    ".snowflake.com", ".snowflakecomputing.com",
+    ".googleusercontent.com", ".appspot.com", ".run.app", ".web.app",
+    ".aliyuncs.com", ".oss-cn-hangzhou.aliyuncs.com", ".myqcloud.com", ".cos.ap-shanghai.myqcloud.com",
+    ".qiniucdn.com", ".bcebos.com", ".jdcloud.com", ".ctyunxs.cn",
+    ".digitaloceanspaces.com", ".r2.dev", ".workers.dev", ".deno.dev", ".fly.dev",
+    ".onrender.com", ".railway.app", ".render.com", ".now.sh",
+    ".notion.site", ".framer.app", ".webflow.io", ".wixsite.com", ".godaddysites.com",
+    ".myshopify.com", ".gitlab.io", ".bitbucket.io", ".sourceforge.io",
+)
+
 # 未备案/低成本注册常见 TLD，用作弱信号，不作单独判定
 CHEAP_TLDS = {"top", "xyz", "icu", "buzz", "cyou", "shop", "vip", "club", "online", "site", "live", "cc", "tk", "ml", "ga", "cf", "gq"}
 
@@ -149,9 +166,27 @@ def is_shortener(host: str) -> bool:
     return registrable_domain(normalize_domain(host)) in SHORTENERS
 
 
+def _suffix_hit(host: str, suffixes: tuple[str, ...]) -> bool:
+    """后缀命中判断。同时认「更深的子域」和「域名本身就是平台域」两种情况：
+    normalize_domain 可能把 demo.vercel.app 归一成 vercel.app，
+    只写 endswith('.vercel.app') 会漏掉后者。"""
+    for suf in suffixes:
+        bare = suf.lstrip(".")
+        if host == bare or host.endswith(suf):
+            return True
+    return False
+
+
 def is_free_hosting(host: str) -> bool:
-    host = normalize_domain(host)
-    return any(host.endswith(s) for s in FREE_HOSTING_SUFFIXES)
+    return _suffix_hit(normalize_domain(host), FREE_HOSTING_SUFFIXES)
+
+
+def is_shared_infra(host: str) -> bool:
+    """是否位于共享基础设施（云 / 对象存储 / 建站平台）之下。
+
+    这类域名的证书与 IP 由平台统一分配，不能作为「同一团伙」的证据。
+    """
+    return _suffix_hit(normalize_domain(host), SHARED_INFRA_SUFFIXES)
 
 
 def is_official_domain(host: str) -> bool:

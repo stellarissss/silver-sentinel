@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from .http import client
 
 _OPENPHISH_CACHE: tuple[float, set[str]] | None = None
 _OPENPHISH_TTL = 6 * 3600
+_OPENPHISH_LOCK = threading.Lock()
 
 _PKG_WATCHLIST = Path(__file__).resolve().parent.parent / "data" / "official_watchlist.yaml"
 
@@ -52,23 +54,37 @@ def urlhaus_lookup(host: str) -> dict | None:
 
 
 def openphish_listed(url_or_host: str) -> bool | None:
-    """OpenPhish 免费 feed，本地缓存 6 小时。返回 None 表示源不可用。"""
+    """OpenPhish 免费 feed，本地缓存 6 小时。返回 None 表示源不可用。
+
+    缓存必须真的生效：流水线一轮会扫几十个目标，每个都去拉一遍 feed
+    既是几秒×N 的延迟，也会让对方把我们当爬虫拉黑。
+    """
     global _OPENPHISH_CACHE
 
-    text = client.get_text(settings.openphish_feed)
-    if text is None:
-        return None
-
-    entries = {
-        line.strip().lower().rstrip("/")
-        for line in text.splitlines()
-        if line.strip() and not line.startswith("#")
-    }
-
-    now = time.time()
-    _OPENPHISH_CACHE = (now, entries)
-
     target = (url_or_host or "").strip().lower().rstrip("/")
+    now = time.time()
+    fresh = _OPENPHISH_CACHE is not None and (now - _OPENPHISH_CACHE[0]) < _OPENPHISH_TTL
+
+    if not fresh:
+        with _OPENPHISH_LOCK:
+            fresh = _OPENPHISH_CACHE is not None and (time.time() - _OPENPHISH_CACHE[0]) < _OPENPHISH_TTL
+            if not fresh:
+                text = client.get_text(settings.openphish_feed)
+                if text is None:
+                    # 拉不到就沿用旧缓存；一次都没成功过才认命返回 None（未知）
+                    return _openphish_match(target) if _OPENPHISH_CACHE else None
+                entries = {
+                    line.strip().lower().rstrip("/")
+                    for line in text.splitlines()
+                    if line.strip() and not line.startswith("#")
+                }
+                _OPENPHISH_CACHE = (time.time(), entries)
+
+    return _openphish_match(target)
+
+
+def _openphish_match(target: str) -> bool:
+    entries = _OPENPHISH_CACHE[1] if _OPENPHISH_CACHE else set()
     if target in entries:
         return True
     host = registrable_domain(normalize_domain(target))

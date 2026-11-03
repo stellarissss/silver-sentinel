@@ -124,9 +124,10 @@ def enrich_asset(asset_id: int, *, with_sandbox: bool = False) -> dict[str, Any]
                     facts["registered_at"] = rdap.registered_at.isoformat()
                 out["updated"].append("rdap")
 
-            icp = get_icp().lookup(host)
-            if icp.status != "unknown":
-                out["updated"].append("icp")
+            if settings.icp_ready:
+                icp = get_icp().lookup(host)
+                if icp.status != "unknown":
+                    out["updated"].append("icp")
 
             if settings.allow_network and not facts.get("ips"):
                 try:
@@ -155,7 +156,7 @@ def enrich_asset(asset_id: int, *, with_sandbox: bool = False) -> dict[str, Any]
         meta["facts"] = facts
         asset.meta = meta
         asset.enrich_count = (asset.enrich_count or 0) + 1
-        if kind in ("domain", "url"):
+        if kind in ("domain", "url") and settings.icp_ready:
             icp_row = get_icp().lookup(registrable_domain(normalized))
             if icp_row.status != "unknown":
                 asset.icp_status = icp_row.status
@@ -182,7 +183,9 @@ def _scan_one(asset_id: int) -> dict[str, Any]:
         meta = dict(asset.meta or {})
 
     try:
-        result = scan(kind, value, meta=meta, run_llm=False, do_cluster=False, trigger="pipeline")
+        result = scan(
+            kind, value, meta=meta, run_llm=False, do_cluster=False, trigger="pipeline", quick=True
+        )
         return {"ok": True, "asset_id": asset_id, "score": result.assessment.score,
                 "verdict": result.assessment.verdict, "tier": result.asset.get("tier")}
     except Exception as exc:  # noqa: BLE001
@@ -257,13 +260,18 @@ def run_cycle(*, scan_limit: int | None = None, enrich_limit: int = 40, rebuild_
                     .limit(enrich_limit)
                 ).all()
             ]
-        for aid in enrich_ids:
-            try:
-                enrich_asset(aid)
-                stats.enriched += 1
-            except Exception as exc:  # noqa: BLE001
-                stats.errors += 1
-                log.debug("富化失败 %s: %s", aid, exc)
+        # 富化是纯 IO（RDAP / DNS），必须并发。串行时 40 个目标要 80 秒以上，
+        # 周期永远追不上 tick，候选队列会越堆越长。
+        if enrich_ids:
+            with ThreadPoolExecutor(max_workers=max(2, min(8, settings.worker_concurrency))) as pool:
+                futures = {pool.submit(enrich_asset, aid): aid for aid in enrich_ids}
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                        stats.enriched += 1
+                    except Exception as exc:  # noqa: BLE001
+                        stats.errors += 1
+                        log.debug("富化失败 %s: %s", futures[fut], exc)
 
         # 3) 建图 + 找团伙
         if rebuild_graph and settings.graph_enabled:
@@ -397,7 +405,9 @@ class Scheduler:
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("周期异常：%s", exc)
-            self._stop.wait(max(60, settings.monitor_tick_seconds * 5))
+            # 每轮间隔：默认跟 tick 走（60s）。发现层每 5 秒落一批库，
+            # 5 分钟才研判一次会让新线索排长队，也拖慢「发现→告警」的时延。
+            self._stop.wait(max(30, settings.monitor_tick_seconds))
 
     def status(self) -> dict[str, Any]:
         with self._lock:

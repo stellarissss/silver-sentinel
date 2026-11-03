@@ -80,7 +80,15 @@ def _canonical(kind: str, value: str) -> tuple[str, str]:
     return value[:200], value.lower()
 
 
-def _collect_url_facts(url: str, host: str, ruleset, manual: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _collect_url_facts(
+    url: str, host: str, ruleset, manual: dict[str, Any], *, quick: bool = False
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """采集判定所需的被动情报。
+
+    quick=True 用于批量流水线：跳过 crt.sh（实测单次最长 70 秒），
+    因为发现层已经从 CT 日志拿到了证书与同源域名，不需要再查一遍。
+    单条人工研判仍走完整路径。
+    """
     facts: dict[str, Any] = {}
     meta: dict[str, Any] = {"host": host, "registrable": registrable_domain(host)}
 
@@ -118,12 +126,13 @@ def _collect_url_facts(url: str, host: str, ruleset, manual: dict[str, Any]) -> 
     if phish is not None:
         facts["openphish_listed"] = phish
 
-    try:
-        siblings = crtsh.siblings_of(domain)
-        if siblings:
-            meta["cert_siblings"] = siblings[:30]
-    except Exception:  # CT 日志偶发超时，不影响主流程
-        log.debug("crt.sh 查询失败", exc_info=True)
+    if not quick:
+        try:
+            siblings = crtsh.siblings_of(domain)
+            if siblings:
+                meta["cert_siblings"] = siblings[:30]
+        except Exception:  # CT 日志偶发超时，不影响主流程
+            log.debug("crt.sh 查询失败", exc_info=True)
 
     return facts, meta
 
@@ -187,6 +196,7 @@ def scan(
     run_llm: bool = True,
     do_cluster: bool = True,
     trigger: str = "manual",
+    quick: bool = False,
     session: Session | None = None,
 ) -> ScanResult:
     if session is None:
@@ -200,6 +210,7 @@ def scan(
                 run_llm=run_llm,
                 do_cluster=do_cluster,
                 trigger=trigger,
+                quick=quick,
                 session=own,
             )
 
@@ -218,7 +229,7 @@ def scan(
     if kind in {AssetKind.URL.value, AssetKind.DOMAIN.value}:
         url = display_value
         host = normalize_domain(url)
-        facts, extra_meta = _collect_url_facts(url, host, ruleset, manual)
+        facts, extra_meta = _collect_url_facts(url, host, ruleset, manual, quick=quick)
 
         if any(h in corpus for h in DOWNLOAD_HINTS) or ".apk" in url.lower():
             facts["forces_apk_download"] = True

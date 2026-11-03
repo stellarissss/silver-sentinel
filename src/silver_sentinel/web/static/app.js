@@ -101,8 +101,12 @@ function scoreColor(score) {
 
 /* ---------------- 路由 ---------------- */
 
-function switchView(view) {
+function switchView(view, { syncHash = true } = {}) {
   state.view = view;
+  // 地址栏跟着走：刷新后停在当前页，分享链接也能直接打开对应视图
+  if (syncHash && location.hash.slice(1) !== view) {
+    history.replaceState(null, "", view === "overview" ? location.pathname : `#${view}`);
+  }
   $$(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.view === view));
   $$(".view").forEach(v => v.classList.toggle("active", v.id === `view-${view}`));
   $("#page-title").textContent = VIEW_TITLES[view] || view;
@@ -655,10 +659,16 @@ function init() {
   loadHealth();
   loadOverview();
 
+  // 深链：/ #discover 直接打开对应视图
   if (location.hash) {
     const v = location.hash.slice(1);
-    if (VIEW_TITLES[v]) switchView(v);
+    if (VIEW_TITLES[v]) switchView(v, { syncHash: false });
   }
+  // 前进/后退、手改地址栏都要能切视图。缺了这一段，hash 变了页面没反应。
+  window.addEventListener("hashchange", () => {
+    const v = location.hash.slice(1) || "overview";
+    if (VIEW_TITLES[v] && v !== state.view) switchView(v, { syncHash: false });
+  });
 }
 
 document.addEventListener("DOMContentLoaded", init);

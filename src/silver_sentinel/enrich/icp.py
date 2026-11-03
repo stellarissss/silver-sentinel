@@ -224,8 +224,14 @@ class ICPClient:
                     self.stats["cached"] += 1
                 return cached
 
-        if not settings.icp_enabled:
-            return ICPResult(domain=domain, status="unknown", error="备案查询未启用")
+        # 必须先看「服务地址配了没有」。只看开关会导致：ICP 没配，但每次查询
+        # 仍然去令牌桶排队（默认 10 次/分钟 = 每个域等 6 秒），整条富化流水线被拖死。
+        if not settings.icp_ready:
+            return ICPResult(
+                domain=domain,
+                status="unknown",
+                error="备案查询未配置（SILVER_ICP_API 为空）" if settings.icp_enabled else "备案查询未启用",
+            )
         if self.available is False:
             return ICPResult(domain=domain, status="unknown", error=self.last_error or "服务不可用")
 

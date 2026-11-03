@@ -83,7 +83,8 @@ class Settings:
     ct_stream_url: str = "wss://certstream.calidog.io/"
     ct_stream_enabled: bool = True
     # 流断了之后的兜底：直接轮询 CT log 的 get-entries
-    ct_poll_logs: str = ""           # 逗号分隔；空则用内置默认日志集
+    ct_poll_logs: str = ""           # 逗号分隔；空则自动拉官方 log_list 里可用且可达的日志
+    ct_poll_logs_limit: int = 3      # 自动挑选时最多跟几条日志（每条一个线程）
     ct_poll_interval: int = 60
     ct_poll_batch: int = 256
     # 发现即入库的准入线。宁可错杀，命中一个词就进候选池
@@ -186,6 +187,7 @@ class Settings:
         self.ct_stream_url = _str("SILVER_CT_STREAM_URL", self.ct_stream_url)
         self.ct_stream_enabled = _bool("SILVER_CT_STREAM_ENABLED", True)
         self.ct_poll_logs = _str("SILVER_CT_POLL_LOGS", "")
+        self.ct_poll_logs_limit = max(1, _int("SILVER_CT_POLL_LOGS_LIMIT", self.ct_poll_logs_limit))
         self.ct_poll_interval = _int("SILVER_CT_POLL_INTERVAL", self.ct_poll_interval)
         self.ct_poll_batch = _int("SILVER_CT_POLL_BATCH", self.ct_poll_batch)
         self.discover_min_keyword_hits = _int("SILVER_DISCOVER_MIN_HITS", self.discover_min_keyword_hits)

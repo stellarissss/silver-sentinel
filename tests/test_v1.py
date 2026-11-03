@@ -309,3 +309,179 @@ def test_inject_deduplicates(fresh_db):
     second = engine.inject(["dup-check.top"])
     assert first["added"] == 1
     assert second["added"] == 0
+
+
+# ---------------------------------------------------------------- CT 跟随器
+# 这一组守的是「静默漏采」：不报错、指标在涨，但中间的证书被跳过。
+
+
+def test_cursor_advances_by_returned_entries_not_requested_range(tmp_path, monkeypatch):
+    """日志只返回区间的一部分时，游标必须按实际返回条数推进。
+
+    真实日志在负载高时会截断响应（请求 256 条只回 100 条）。
+    若把游标推到请求区间的末端，中间没返回的条目就被永久跳过——
+    这类 bug 在生产里几乎查不出来，只会表现为「总觉得漏」。
+    """
+    from silver_sentinel.discover import ct as ct_mod
+
+    follower = ct_mod.CTLogFollower("https://example-ct.test/log", tmp_path / "s.json", batch=100)
+    follower.tree_size = 10_000
+    follower.trail = 0
+    follower.index = 1_000          # 模拟「已经追过一段」的游标
+    follower.max_lag = 50_000       # 本用例不考察跳段逻辑
+    follower._sth_at = 9e18         # 别真去请求 get-sth
+
+    calls: list[tuple[int, int]] = []
+
+    def fake_json(url, timeout=25.0):
+        q = dict(p.split("=") for p in url.split("?")[1].split("&"))
+        start, end = int(q["start"]), int(q["end"])
+        calls.append((start, end))
+        # 每次只给 40 条，永远填不满请求的 100 条
+        return {"entries": [{"leaf_input": ""} for _ in range(min(40, end - start + 1))]}
+
+    monkeypatch.setattr(ct_mod, "_http_json", fake_json)
+    monkeypatch.setattr(ct_mod, "_parse_entry", lambda e: None)
+
+    follower.catch_up(lambda obs: None, max_batches=10, budget=5, parallel=1)
+
+    assert calls[0][0] == 1_000, "第一次应从游标位置开始"
+    # 相邻两次请求必须首尾相接（上一次 start + 实际返回 40），不能出现跳过
+    for prev, nxt in zip(calls, calls[1:]):
+        assert nxt[0] == prev[0] + 40, f"游标跳了：{prev} → {nxt}"
+    assert follower.index < 10_000, "游标不能一步跳到区间末端"
+
+
+def test_frozen_log_is_detected(tmp_path, monkeypatch):
+    """年度日志到期后 tree_size 不再变化，必须能被识别出来，否则「一直在跑但什么都没发现」。"""
+    from silver_sentinel.discover import ct as ct_mod
+
+    follower = ct_mod.CTLogFollower("https://example-ct.test/frozen", tmp_path / "f.json")
+    follower.trail = 0
+    monkeypatch.setattr(
+        ct_mod, "_http_json", lambda url, timeout=25.0: {"tree_size": 5000, "entries": []}
+    )
+
+    for _ in range(10):
+        follower._sth_at = 0
+        follower._refresh_head()
+
+    assert follower.frozen is True
+
+
+def test_live_log_is_not_marked_frozen(tmp_path, monkeypatch):
+    from silver_sentinel.discover import ct as ct_mod
+
+    follower = ct_mod.CTLogFollower("https://example-ct.test/live", tmp_path / "l.json")
+    sizes = iter(range(5000, 9000, 100))
+    monkeypatch.setattr(
+        ct_mod, "_http_json", lambda url, timeout=25.0: {"tree_size": next(sizes, 9000), "entries": []}
+    )
+
+    for _ in range(10):
+        follower._sth_at = 0
+        follower._refresh_head()
+
+    assert follower.frozen is False
+
+
+def test_log_selection_diversifies_operators(monkeypatch):
+    """日志选择必须跨运营商：全跟一家，它割接或限流就整条采集线停摆。"""
+    from silver_sentinel.discover import ct as ct_mod
+
+    usable = {"timestamp": "2026-11-01T00:00:00Z"}
+    listing = {
+        "operators": [
+            {"name": "DigiCert", "logs": [
+                {"url": "https://a1.digicert.test/", "state": {"usable": usable}},
+                {"url": "https://a2.digicert.test/", "state": {"usable": usable}},
+            ]},
+            {"name": "Cloudflare", "logs": [
+                {"url": "https://b1.cloudflare.test/", "state": {"usable": usable}},
+            ]},
+            {"name": "Retired", "logs": [
+                {"url": "https://c1.retired.test/", "state": {"readonly": {"final_tree_head": {}}}},
+            ]},
+        ]
+    }
+    sizes = {
+        "a1.digicert.test": 900,
+        "a2.digicert.test": 5000,
+        "b1.cloudflare.test": 300,
+        "c1.retired.test": 9999,
+    }
+
+    def fake_json(url, timeout=25.0):
+        if "log_list" in url:
+            return listing
+        host = url.split("//")[1].split("/")[0]
+        return {"tree_size": sizes.get(host, 0)}
+
+    monkeypatch.setattr(ct_mod, "_http_json", fake_json)
+    logs = ct_mod.fetch_usable_logs(limit=2)
+
+    hosts = {u.split("//")[1].split("/")[0] for u in logs}
+    assert len(hosts) == 2, "两家运营商应各取一条"
+    assert "a2.digicert.test" in hosts, "同运营商里应选条目最多的那条"
+    assert "c1.retired.test" not in hosts, "非 usable 的日志不能进来"
+
+
+def test_log_selection_falls_back_when_listing_unreachable(monkeypatch):
+    """官方清单拉不到时必须退回内置清单，不能一条日志都不跟。"""
+    from silver_sentinel.discover import ct as ct_mod
+
+    def boom(url, timeout=25.0):
+        raise OSError("network down")
+
+    monkeypatch.setattr(ct_mod, "_http_json", boom)
+    logs = ct_mod.fetch_usable_logs(limit=2)
+    assert logs == list(ct_mod.DEFAULT_LOGS)[:2]
+
+
+# ---------------------------------------------------------------- 共享基础设施
+
+
+def test_shared_infra_domains_are_recognised():
+    """云 / 对象存储 / 建站平台下的子域，证书与 IP 不能当作归因证据。"""
+    from silver_sentinel.normalize import is_free_hosting, is_shared_infra
+
+    assert is_shared_infra("npolnto-mz77057.eu-central-2.aws.snowflake.com")
+    assert is_shared_infra("abc.s3.amazonaws.com")
+    assert is_shared_infra("x.azurewebsites.net")
+    assert is_free_hosting("demo.vercel.app")
+    assert is_free_hosting("foo.github.io")
+    # 正常独立域名不能被误判，否则归因能力等于被关掉
+    assert not is_shared_infra("guohui-minsheng.top")
+    assert not is_shared_infra("gov.cn")
+    assert not is_free_hosting("guohui-minsheng.top")
+
+
+def test_shared_infra_has_no_cert_edge(fresh_db):
+    """共享基础设施上的域名不建 HAS_CERT / RESOLVES_TO 边，避免把整朵云判成一伙。"""
+    from silver_sentinel.graph.build import GraphBuilder
+    from silver_sentinel.graph.store import get_graph, reset_graph
+    from silver_sentinel.db import session_scope
+
+    reset_graph()
+    with session_scope() as s:
+        s.add(
+            Asset(
+                kind="domain",
+                value="abc123.eu-central-2.aws.snowflake.com",
+                normalized="abc123.eu-central-2.aws.snowflake.com",
+                tier=TIER_CANDIDATE,
+                meta={
+                    "facts": {
+                        "cert_fingerprint": "deadbeef" * 8,
+                        "ips": ["1.2.3.4"],
+                    }
+                },
+            )
+        )
+        s.flush()
+    GraphBuilder().build_all(limit=50)
+    store = get_graph()
+    sub = store.neighbors("domain:abc123.eu-central-2.aws.snowflake.com", depth=1)
+    rels = {e["rel"] if isinstance(e, dict) else e.rel for e in sub.edges}
+    assert "HAS_CERT" not in rels
+    assert "RESOLVES_TO" not in rels
