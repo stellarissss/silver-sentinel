@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>银发哨兵 · 涉老诈骗研判台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">哨</div>
+      <div class="brand-text">
+        <strong>银发哨兵</strong>
+        <span>Silver Sentinel v{{ version }}</span>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item active" data-view="overview"><span class="ico">◎</span>概览</button>
+      <button class="nav-item" data-view="scan"><span class="ico">⌕</span>研判台</button>
+      <button class="nav-item" data-view="assets"><span class="ico">▤</span>线索库</button>
+      <button class="nav-item" data-view="campaigns"><span class="ico">⛓</span>团伙</button>
+      <button class="nav-item" data-view="watch"><span class="ico">◉</span>监控</button>
+      <button class="nav-item" data-view="rules"><span class="ico">≡</span>规则库</button>
+    </nav>
+
+    <div class="side-status" id="side-status">
+      <div class="status-row"><span>情报网络</span><b id="st-net">…</b></div>
+      <div class="status-row"><span>LLM 研判</span><b id="st-llm">…</b></div>
+      <div class="status-row"><span>证据链</span><b id="st-chain">…</b></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1 id="page-title">概览</h1>
+      <div class="topbar-right">
+        <span class="hint" id="top-hint"></span>
+        <button class="btn ghost" id="btn-refresh">刷新</button>
+      </div>
+    </header>
+
+    <!-- 概览 -->
+    <section class="view active" id="view-overview">
+      <div class="kpis" id="kpis"></div>
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h2>判定分布</h2></div>
+          <div id="verdict-chart" class="bars"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>信号维度分布</h2></div>
+          <div id="category-chart" class="bars"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>风险最高线索</h2><span class="hint">按风险分排序</span></div>
+        <div id="top-assets" class="list"></div>
+      </div>
+    </section>
+
+    <!-- 研判台 -->
+    <section class="view" id="view-scan">
+      <div class="panel">
+        <div class="tabs" id="scan-tabs">
+          <button class="tab active" data-kind="url">链接 / 网址</button>
+          <button class="tab" data-kind="domain">域名</button>
+          <button class="tab" data-kind="apk">安装包 APK</button>
+          <button class="tab" data-kind="text">话术 / 聊天记录</button>
+          <button class="tab" data-kind="miniapp">小程序 / 公众号</button>
+        </div>
+
+        <div class="scan-body">
+          <div id="input-url" class="input-pane active">
+            <label>可疑链接</label>
+            <input id="in-url" type="text" placeholder="例如：http://xxx.top/reg?invite=123 或对方发来的短链">
+            <p class="tip">支持短链、带追踪参数的分享链接。系统会自动去掉 utm_* 等待参数再比对。</p>
+          </div>
+
+          <div id="input-domain" class="input-pane">
+            <label>域名</label>
+            <input id="in-domain" type="text" placeholder="例如：kuaishou-yinfa.top">
+            <p class="tip">会查询 RDAP 注册时间、CT 日志同证书域名、DNS 解析与仿冒品牌判定。</p>
+          </div>
+
+          <div id="input-apk" class="input-pane">
+            <label>上传 APK</label>
+            <div class="dropzone" id="dropzone">
+              <input type="file" id="in-apk" accept=".apk" hidden>
+              <div class="dz-inner">
+                <strong>点击选择或拖入 .apk 文件</strong>
+                <span>仅本地静态解析，不联网、不上传第三方</span>
+              </div>
+            </div>
+            <p class="tip">解析包名、签名证书、高危权限、加固特征、内嵌钱包地址与模板指纹。</p>
+          </div>
+
+          <div id="input-text" class="input-pane">
+            <label>话术内容</label>
+            <textarea id="in-text" rows="8" placeholder="粘贴聊天记录、群公告、宣传文案。可包含「免费领鸡蛋」「国家补贴」「下载 App 领 2 万元」等"></textarea>
+            <p class="tip">系统会自动抽取手机号、QQ、微信、钱包地址、包名与银行卡号（Luhn 校验）。</p>
+          </div>
+
+          <div id="input-miniapp" class="input-pane">
+            <label>小程序 / 公众号名称</label>
+            <input id="in-miniapp" type="text" placeholder="例如：国惠民生 惠民补贴中心">
+            <div class="row">
+              <label class="inline">分发方式</label>
+              <select id="in-channel">
+                <option value="unknown">未知</option>
+                <option value="qr">扫码</option>
+                <option value="link">他人转发链接</option>
+                <option value="sideload">外链下载安装</option>
+                <option value="store">应用商店</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row actions">
+            <label class="check"><input type="checkbox" id="use-llm" checked> 调用 LLM 辅助研判</label>
+            <button class="btn primary" id="btn-scan">开始研判</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="scan-result"></div>
+    </section>
+
+    <!-- 线索库 -->
+    <section class="view" id="view-assets">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>线索库</h2>
+          <div class="filters">
+            <input id="filter-q" type="text" placeholder="搜索标识…">
+            <select id="filter-verdict">
+              <option value="">全部判定</option>
+            </select>
+          </div>
+        </div>
+        <div id="asset-table" class="table-wrap"></div>
+      </div>
+    </section>
+
+    <!-- 团伙 -->
+    <section class="view" id="view-campaigns">
+      <div class="panel">
+        <div class="panel-head"><h2>归并后的团伙</h2><span class="hint">共享证书 / 模板指纹 / 收款地址 / 包名前缀</span></div>
+        <div id="campaign-list" class="list"></div>
+      </div>
+    </section>
+
+    <!-- 监控 -->
+    <section class="view" id="view-watch">
+      <div class="panel">
+        <div class="panel-head"><h2>新增监控目标</h2></div>
+        <div class="watch-form">
+          <select id="watch-kind">
+            <option value="keyword">关键词（CT 日志模糊搜索）</option>
+            <option value="domain">域名（定点盯防）</option>
+            <option value="brand">品牌词（仿冒变体探测）</option>
+          </select>
+          <input id="watch-value" type="text" placeholder="例如：领鸡蛋 / kuaishou / guohuiminsheng">
+          <input id="watch-interval" type="number" min="15" value="360" class="narrow">
+          <button class="btn primary" id="btn-watch-add">添加</button>
+          <button class="btn ghost" id="btn-watch-run">立即执行一轮</button>
+        </div>
+        <div id="watch-list" class="list"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>调度记录</h2></div>
+        <div id="run-list" class="list"></div>
+      </div>
+    </section>
+
+    <!-- 规则库 -->
+    <section class="view" id="view-rules">
+      <div class="panel">
+        <div class="panel-head"><h2>判定规则</h2><span class="hint">声明式配置，位于 rules/builtin.yaml，可外挂覆盖</span></div>
+        <div id="rule-list" class="rules"></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="drawer-mask" id="drawer-mask"></div>
+  <aside class="drawer" id="drawer">
+    <div class="drawer-head">
+      <h2 id="drawer-title">线索详情</h2>
+      <button class="btn ghost" id="drawer-close">关闭</button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

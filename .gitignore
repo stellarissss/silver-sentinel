@@ -1,0 +1,31 @@
+# --- 运行时数据 ---
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+uploads/
+evidence_store/
+
+# --- 凭据与本地配置 ---
+.env
+*.token
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

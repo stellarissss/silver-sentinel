@@ -1,0 +1,24 @@
+services:
+  sentinel:
+    build: .
+    image: silver-sentinel:0.1.0
+    container_name: silver-sentinel
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SILVER_DATA_DIR: /var/lib/silver-sentinel
+      SILVER_AUTOSTART_MONITOR: "1"
+    ports:
+      # 默认只绑本机，对外暴露请在前置反向代理上加鉴权
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - sentinel-data:/var/lib/silver-sentinel
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  sentinel-data:
