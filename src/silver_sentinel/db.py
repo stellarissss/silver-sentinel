@@ -1,17 +1,20 @@
-"""数据库会话与证据链校验。"""
+"""数据库会话、轻量迁移与证据链校验。"""
 
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import settings
 from .models import Base, Evidence
+
+log = logging.getLogger(__name__)
 
 _engine: Engine | None = None
 _SessionLocal: sessionmaker[Session] | None = None
@@ -34,6 +37,9 @@ def get_engine() -> Engine:
             def _sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
                 cur = dbapi_conn.cursor()
                 cur.execute("PRAGMA journal_mode=WAL")
+                # WAL + NORMAL 已能保证崩溃后数据库不损坏，只会丢最近若干事务。
+                # 真正的「一条不丢」由 events.jsonl 的 fsync 兜底（见 core/eventlog.py），
+                # 那里是顺序追加，代价远低于让每次 UPDATE 都 fsync。
                 cur.execute("PRAGMA synchronous=NORMAL")
                 cur.execute("PRAGMA busy_timeout=30000")
                 cur.execute("PRAGMA foreign_keys=ON")
@@ -62,8 +68,58 @@ def session_scope() -> Iterator[Session]:
         session.close()
 
 
+# 老库升级：create_all 不会给已存在的表补列，这里显式处理。
+# 只做「加列 / 加索引」这两种安全操作，不动已有数据。
+_ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "assets": [
+        ("tier", "VARCHAR(16) DEFAULT 'candidate'"),
+        ("discovery_source", "VARCHAR(32) DEFAULT 'manual'"),
+        ("discovery_reason", "TEXT DEFAULT ''"),
+        ("dismiss_reason", "TEXT DEFAULT ''"),
+        ("icp_status", "VARCHAR(24) DEFAULT 'unknown'"),
+        ("icp_license", "VARCHAR(80) DEFAULT ''"),
+        ("icp_entity", "VARCHAR(200) DEFAULT ''"),
+        ("icp_checked_at", "DATETIME"),
+        ("enrich_count", "INTEGER DEFAULT 0"),
+    ],
+}
+
+_ADDED_INDEXES: list[str] = [
+    "CREATE INDEX IF NOT EXISTS ix_assets_tier ON assets (tier)",
+    "CREATE INDEX IF NOT EXISTS ix_assets_discovery_source ON assets (discovery_source)",
+    "CREATE INDEX IF NOT EXISTS ix_assets_tier_score ON assets (tier, score)",
+    "CREATE INDEX IF NOT EXISTS ix_discovery_events_normalized ON discovery_events (normalized)",
+    "CREATE INDEX IF NOT EXISTS ix_discovery_events_asset_id ON discovery_events (asset_id)",
+    "CREATE INDEX IF NOT EXISTS ix_graph_edges_src ON graph_edges (src)",
+    "CREATE INDEX IF NOT EXISTS ix_graph_edges_dst ON graph_edges (dst)",
+    "CREATE INDEX IF NOT EXISTS ix_graph_edges_rel ON graph_edges (rel)",
+    "CREATE INDEX IF NOT EXISTS ix_graph_nodes_type ON graph_nodes (type)",
+]
+
+
 def init_db() -> None:
-    Base.metadata.create_all(get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    if engine.dialect.name != "sqlite":
+        return
+
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    with engine.begin() as conn:
+        for table, columns in _ADDED_COLUMNS.items():
+            if table not in existing_tables:
+                continue
+            present = {c["name"] for c in insp.get_columns(table)}
+            for name, ddl in columns:
+                if name in present:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+                log.info("迁移：%s 增加列 %s", table, name)
+        for ddl in _ADDED_INDEXES:
+            try:
+                conn.execute(text(ddl))
+            except Exception:  # 索引失败不该阻断启动
+                log.debug("索引创建跳过：%s", ddl)
 
 
 def reset_engine(db_url: str | None = None) -> None:
@@ -105,3 +161,19 @@ def verify_chain(session: Session, asset_id: int | None = None) -> dict:
         prev = row.chain_hash
         checked += 1
     return {"ok": True, "checked": checked, "head": prev}
+
+
+def db_stats() -> dict:
+    """运维页用的粗粒度统计，避免把大表全扫一遍。"""
+    from .models import Asset, DiscoveryEvent, Evidence, GraphEdge, GraphNode
+
+    with session_scope() as s:
+        from sqlalchemy import func
+
+        return {
+            "assets": s.scalar(select(func.count(Asset.id))) or 0,
+            "evidence": s.scalar(select(func.count(Evidence.id))) or 0,
+            "discovery_events": s.scalar(select(func.count(DiscoveryEvent.id))) or 0,
+            "graph_nodes": s.scalar(select(func.count(GraphNode.id))) or 0,
+            "graph_edges": s.scalar(select(func.count(GraphEdge.id))) or 0,
+        }

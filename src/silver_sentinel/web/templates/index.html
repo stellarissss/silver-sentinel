@@ -20,17 +20,21 @@
 
     <nav class="nav">
       <button class="nav-item active" data-view="overview"><span class="ico">◎</span>概览</button>
+      <button class="nav-item" data-view="discover"><span class="ico">◈</span>发现流<span class="dot" id="dot-discover"></span></button>
       <button class="nav-item" data-view="scan"><span class="ico">⌕</span>研判台</button>
       <button class="nav-item" data-view="assets"><span class="ico">▤</span>线索库</button>
+      <button class="nav-item" data-view="graph"><span class="ico">⬡</span>关系图谱</button>
       <button class="nav-item" data-view="campaigns"><span class="ico">⛓</span>团伙</button>
       <button class="nav-item" data-view="watch"><span class="ico">◉</span>监控</button>
+      <button class="nav-item" data-view="ops"><span class="ico">⚙</span>运维</button>
       <button class="nav-item" data-view="rules"><span class="ico">≡</span>规则库</button>
     </nav>
 
     <div class="side-status" id="side-status">
+      <div class="status-row"><span>发现引擎</span><b id="st-discover">…</b></div>
       <div class="status-row"><span>情报网络</span><b id="st-net">…</b></div>
-      <div class="status-row"><span>LLM 研判</span><b id="st-llm">…</b></div>
       <div class="status-row"><span>证据链</span><b id="st-chain">…</b></div>
+      <div class="status-row"><span>实时流</span><b id="st-stream">…</b></div>
     </div>
   </aside>
 
@@ -59,6 +63,93 @@
       <div class="panel">
         <div class="panel-head"><h2>风险最高线索</h2><span class="hint">按风险分排序</span></div>
         <div id="top-assets" class="list"></div>
+      </div>
+    </section>
+
+    <!-- 发现流 -->
+    <section class="view" id="view-discover">
+      <div class="kpis" id="discover-kpis"></div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>实时发现</h2>
+            <span class="hint" id="discover-live">实时推送中</span>
+          </div>
+          <div id="discover-feed" class="feed"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>情报源状态</h2></div>
+          <div id="source-status" class="list compact"></div>
+          <div class="panel-head" style="margin-top:14px"><h2>词库命中排行</h2><span class="hint">用于淘汰长期误报的词</span></div>
+          <div id="keyword-hits" class="list compact"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>批量注入</h2><span class="hint">举报线索、群内链接、已知样本的基础设施，一行一个</span></div>
+        <textarea id="inject-values" rows="4" placeholder="guohui-minsheng.top&#10;zhongke-kangyang.top"></textarea>
+        <div class="row actions">
+          <select id="inject-source">
+            <option value="manual">人工录入</option>
+            <option value="report">举报线索</option>
+            <option value="evidence">案件材料</option>
+          </select>
+          <input id="inject-note" type="text" placeholder="备注（可选）">
+          <button class="btn primary" id="btn-inject">注入候选池</button>
+          <button class="btn ghost" id="btn-crtsh">按词根回溯 crt.sh</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 关系图谱 -->
+    <section class="view" id="view-graph">
+      <div class="panel graph-panel">
+        <div class="panel-head">
+          <h2>基础设施关系图</h2>
+          <div class="filters">
+            <input id="graph-key" type="text" placeholder="跳转到节点，如 domain:guohui.top">
+            <button class="btn ghost" id="btn-graph-load">加载</button>
+            <button class="btn ghost" id="btn-graph-overview">全局视图</button>
+            <button class="btn ghost" id="btn-graph-rebuild">重建图</button>
+          </div>
+        </div>
+        <div class="graph-shell">
+          <canvas id="graph-canvas"></canvas>
+          <div class="graph-legend" id="graph-legend"></div>
+          <div class="graph-tip" id="graph-tip">点击节点查看详情 · 滚轮缩放 · 拖拽平移</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 运维 -->
+    <section class="view" id="view-ops">
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h2>能力矩阵</h2><span class="hint">诚实标注哪些能力真的开着</span></div>
+          <div id="capability-grid" class="caps"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>运行时</h2></div>
+          <div id="runtime-stats" class="list compact"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>任务台账</h2>
+          <div class="filters">
+            <button class="btn ghost" id="btn-run-cycle">手动跑一轮</button>
+            <button class="btn ghost" id="btn-run-replica">同步副本</button>
+            <button class="btn ghost" id="btn-verify-chain">校验证据链</button>
+          </div>
+        </div>
+        <div id="task-list" class="list compact"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>事件日志</h2><span class="hint">只追加、带哈希链，任何一行被改都会被 verify 抓到</span></div>
+        <div id="event-tail" class="feed small"></div>
       </div>
     </section>
 
@@ -196,5 +287,6 @@
 
 </div>
 <script src="/static/app.js"></script>
+<script src="/static/views.js"></script>
 </body>
 </html>

@@ -38,6 +38,9 @@ from .normalize import (
     tld_of,
 )
 from .scoring.engine import assess, load_ruleset, priority_of
+from . import triage
+from .discover.keywords import get_library
+from .enrich.icp import get_icp
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +135,25 @@ def _collect_apk_facts(path: str, ruleset) -> tuple[dict[str, Any], dict[str, An
     facts = dict(result["facts"])
     facts["distribution_channel"] = "sideload"
 
+    apk_text = result.get("text", "") or ""
+    raw_urls = list(result.get("urls") or [])
+    # collector 会把裸域名也塞进 urls（为了让短域名不漏），这里拆开：
+    # 带协议头的才是 URL 节点，裸域名归到 domains
+    urls = [u for u in raw_urls if "://" in u]
+    bare_domains = [u for u in raw_urls if "://" not in u]
+    # 内嵌域名是「App 指向哪个站」的唯一线索，必须同时从 URL 和裸字符串里捞。
+    # 骗子经常在代码里只写域名不写协议头，只靠 URL 正则会全漏。
+    indicators = extract_indicators(apk_text) if apk_text else {}
+    embedded: list[str] = []
+    for u in urls + bare_domains:
+        host = normalize_domain(u)
+        if host and "." in host and host not in embedded:
+            embedded.append(host)
+    for d in indicators.get("domains", []):
+        if d not in embedded:
+            embedded.append(d)
+    embedded = [d for d in embedded if not d.endswith((".apk", ".png", ".jpg", ".gif", ".svg"))]
+
     meta = {
         "apk": {
             "sha256": result["sha256"],
@@ -145,10 +167,14 @@ def _collect_apk_facts(path: str, ruleset) -> tuple[dict[str, Any], dict[str, An
         "package_name": facts.get("package_name", ""),
         "wallet_addresses": facts.get("wallet_addresses", []),
         "template_hash": result.get("template_hash", ""),
-        "urls": result.get("urls", [])[:30],
+        "urls": urls[:30],
+        "domains": embedded[:40],
         "keywords": result.get("keywords", [])[:30],
+        "strings_sample": (result.get("text", "") or "")[:4000],
     }
-    return facts, meta, result.get("text", "")
+    facts["embedded_domains"] = embedded[:40]
+    facts["embedded_urls"] = urls[:30]
+    return facts, meta, apk_text
 
 
 def scan(
@@ -222,6 +248,18 @@ def scan(
 
     indicators = extract_indicators(corpus) if corpus else {}
 
+    # ---- 词库匹配：把「发现层看见的词」变成可计分的信号。
+    # 没有这一步，发现引擎挑出来的候选到了研判环节会因为「规则库没这条」而被打回冷存，
+    # 形成「发现得越多、判得越少」的倒挂。
+    kw_host = ""
+    if kind in {AssetKind.URL.value, AssetKind.DOMAIN.value}:
+        kw_host = normalize_domain(display_value)
+    kw_match = get_library().match_any(kw_host, f"{display_value} {corpus[:4000]}")
+    if kw_match.hits:
+        facts["keyword_hint"] = round(kw_match.score, 3)
+        facts["keyword_terms"] = kw_match.terms[:8]
+        facts["keyword_clusters"] = sorted(kw_match.clusters)
+
     # ---- 官方通报匹配（名称类命中直接可给高权重）
     haystack_names = [
         display_value,
@@ -287,6 +325,22 @@ def scan(
         }
         assessment.llm = llm_analyzer.analyze(payload)
 
+    # ---- 富化：ICP 备案（只对值得查的目标，接口有严格频率限制）
+    icp_result = None
+    if stored_kind in ("domain", "url") and assessment.score >= 12:
+        probe_host = extra_meta.get("host") or registrable_domain(display_value)
+        probe_domain = registrable_domain(probe_host) if probe_host else ""
+        if probe_domain:
+            try:
+                icp_result = get_icp().lookup(probe_domain)
+                if icp_result.status == "registered":
+                    facts["icp_registered"] = True
+                    facts["icp_entity"] = icp_result.entity
+                elif icp_result.status == "unregistered":
+                    facts["icp_registered"] = False
+            except Exception:  # noqa: BLE001
+                log.debug("ICP 查询失败", exc_info=True)
+
     # ---- 落库
     now = utcnow()
     asset = session.scalar(select(Asset).where(Asset.kind == stored_kind, Asset.normalized == normalized))
@@ -302,7 +356,16 @@ def scan(
     asset.score = assessment.score
     asset.confidence = assessment.confidence
     asset.verdict = assessment.verdict
-    asset.meta = {**(asset.meta or {}), **extra_meta, "last_trigger": trigger}
+    asset.meta = {**(asset.meta or {}), **extra_meta, "last_trigger": trigger, "facts": facts}
+
+    if icp_result is not None:
+        asset.icp_status = icp_result.status
+        asset.icp_license = icp_result.license
+        asset.icp_entity = icp_result.entity
+        asset.icp_checked_at = now
+
+    # ---- 分级：把评分翻译成「下一步做什么」
+    decision = triage.apply(asset, facts=facts)
 
     if assessment.llm:
         asset.meta = {**asset.meta, "llm": assessment.llm}
@@ -373,4 +436,6 @@ def scan(
         "scan_count": asset.scan_count,
         "meta": asset.meta,
     }
+    asset_payload["tier"] = asset.tier
+    asset_payload["triage_reasons"] = decision.reasons[:6]
     return ScanResult(asset_id=asset.id, created=created, assessment=assessment, asset=asset_payload)

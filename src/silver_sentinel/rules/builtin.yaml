@@ -326,6 +326,38 @@ rules:
     detail: 承诺无条件发放或恢复百万级以上资产，是民族资产解冻类骗局的标志性许诺。
     cite: 公安部民族资产解冻类诈骗专项；媒体披露的「资产恢复」话术
 
+  # ---------------------------------------------------------------- 词库主题
+  # 由 discover/keywords.py 的词库产出。分两档，互斥，避免同一件事被计两次。
+  - id: KW-001
+    category: impersonation
+    title: 命中强主题词根（机构冒充/骗局专属/品牌冒用）
+    weight: 26
+    confidence: 0.7
+    when:
+      all:
+        - fact: keyword_hint
+          op: gte
+          value: 0.8
+    detail: 域名或语料中出现「国科/中科/国惠/民族资产解冻/被冒用品牌」等强主题词根，是非官方主体冒用权威名义的典型特征。
+    cite: 词库 cluster=authority/scam_signature/brand
+
+  - id: KW-002
+    category: impersonation
+    title: 命中多个政策/诱导主题词
+    weight: 14
+    confidence: 0.55
+    when:
+      all:
+        - fact: keyword_hint
+          op: gte
+          value: 0.5
+        - not:
+            fact: keyword_hint
+            op: gte
+            value: 0.8
+    detail: 语料反复出现养老、补贴、免费领、签到等主题词，符合「以福利为饵」的话术结构。
+    cite: 词库 cluster=policy_theme/inducement
+
   # ---------------------------------------------------------------- 资金模式
   - id: FIN-001
     category: financial

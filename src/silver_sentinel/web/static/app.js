@@ -14,10 +14,13 @@ const state = {
 
 const VIEW_TITLES = {
   overview: "概览",
+  discover: "发现流",
   scan: "研判台",
   assets: "线索库",
+  graph: "关系图谱",
   campaigns: "团伙",
   watch: "监控",
+  ops: "运维",
   rules: "规则库",
 };
 
@@ -105,9 +108,12 @@ function switchView(view) {
   $("#page-title").textContent = VIEW_TITLES[view] || view;
   const loaders = {
     overview: loadOverview,
+    discover: loadDiscover,
     assets: loadAssets,
+    graph: loadGraphView,
     campaigns: loadCampaigns,
     watch: loadWatch,
+    ops: loadOps,
     rules: loadRules,
   };
   if (loaders[view]) loaders[view]();
@@ -116,23 +122,44 @@ function switchView(view) {
 /* ---------------- 健康与概览 ---------------- */
 
 async function loadHealth() {
+  // 每个状态位单独设值：某个元素在改版中被移除时不该让整块状态失效
+  const setStatus = (sel, text, cls) => {
+    const el = $(sel);
+    if (!el) return;
+    el.textContent = text;
+    el.className = cls;
+  };
+
   try {
     const h = await api("/api/health");
-    const net = $("#st-net");
-    net.textContent = h.network ? "在线" : "离线";
-    net.className = h.network ? "ok" : "off";
 
-    const llm = $("#st-llm");
-    llm.textContent = h.llm.configured ? h.llm.model : "未配置";
-    llm.className = h.llm.configured ? "ok" : "warn";
+    setStatus("#st-net", h.network ? "在线" : "离线", h.network ? "ok" : "off");
 
-    const chain = $("#st-chain");
-    const ok = h.evidence_chain && h.evidence_chain.ok;
-    chain.textContent = ok ? `完好 ${h.evidence_chain.checked}` : (h.evidence_chain && h.evidence_chain.ok === null ? "空" : "异常");
-    chain.className = ok ? "ok" : (h.evidence_chain && h.evidence_chain.ok === null ? "off" : "warn");
+    // 发现引擎：真的在跑才算「采集中」，否则如实写「未启动」
+    setStatus(
+      "#st-discover",
+      h.discover_running ? "采集中" : "未启动",
+      h.discover_running ? "ok" : "off"
+    );
+    setStatus(
+      "#st-llm",
+      h.llm && h.llm.configured ? h.llm.model : "未配置",
+      h.llm && h.llm.configured ? "ok" : "warn"
+    );
 
-    $("#top-hint").textContent = `规则 ${h.rules.count} 条 · 引擎 v${h.rules.version}`;
+    const chain = h.evidence_chain || {};
+    if (chain.ok === null || chain.ok === undefined || !chain.checked) {
+      setStatus("#st-chain", "空", "off");
+    } else if (chain.ok) {
+      setStatus("#st-chain", `完好 ${chain.checked}`, "ok");
+    } else {
+      setStatus("#st-chain", "异常", "bad");
+    }
+
+    const hint = $("#top-hint");
+    if (hint) hint.textContent = `规则 ${h.rules.count} 条 · 引擎 v${h.rules.version}`;
   } catch (e) {
+    setStatus("#st-net", "不可达", "bad");
     toast(`状态检查失败：${e.message}`);
   }
 }

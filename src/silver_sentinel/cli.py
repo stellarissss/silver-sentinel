@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from .config import settings
@@ -206,6 +207,228 @@ def cmd_health(args) -> int:  # noqa: ARG001
         "network": settings.allow_network,
         "llm": llm.status(),
         "rules": len(load_ruleset().rules),
+        "capabilities": settings.capability_report(),
+    }
+    print(json.dumps(info, ensure_ascii=False, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------- 发现
+
+
+def cmd_discover(args) -> int:
+    """发现引擎的运维入口。
+
+    长期跑用 `--foreground`（或直接交给 serve 的调度器）；
+    临时补漏用 `inject` / `search`，不需要常驻进程。
+    """
+    from .discover.engine import get_engine
+
+    init_db()
+
+    if args.action == "status":
+        print(json.dumps(get_engine().status(), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.action == "words":
+        from collections import defaultdict
+
+        from .discover.keywords import get_library
+
+        lib = get_library()
+        stats = lib.stats()
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for term in lib.terms:
+            grouped[term.cluster].append(term.text)
+        print(f"{BOLD}词库{RESET}：{stats['terms']} 个词根 · {stats['pinyin_terms']} 条拼音变体 · "
+              f"{len(grouped)} 个语义簇")
+        for name, words in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+            sample = "、".join(words[:20])
+            more = "" if len(words) <= 20 else f" …（共 {len(words)}）"
+            print(f"\n  {CYA}{name}{RESET}  {DIM}{sample}{more}{RESET}")
+        return 0
+
+    if args.action == "inject":
+        values = list(args.values or [])
+        if args.file:
+            values += [
+                line.strip()
+                for line in Path(args.file).read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        if not values:
+            print("没有可导入的值。用位置参数或 --file。", file=sys.stderr)
+            return 2
+        print(json.dumps(get_engine().inject(values, note=args.note or ""), ensure_ascii=False))
+        return 0
+
+    if args.action == "search":
+        terms = list(args.values or [])
+        if not terms:
+            print("需要至少一个词根，例如：discover search 国惠 中科", file=sys.stderr)
+            return 2
+        print(json.dumps(get_engine().search_history(terms), ensure_ascii=False))
+        return 0
+
+    # run / foreground
+    engine = get_engine()
+    engine.start()
+    if not engine.status().get("running"):
+        print(f"{YEL}发现引擎未启动{RESET}：检查 SILVER_DISCOVER_ENABLED 与 SILVER_ALLOW_NETWORK", file=sys.stderr)
+        return 1
+
+    duration = args.minutes * 60 if args.minutes else 0
+    started = time.monotonic()
+    print(f"{GRN}发现引擎运行中{RESET}，{'常驻，Ctrl-C 停止' if not duration else f'{args.minutes} 分钟后自动停止'}")
+    try:
+        while True:
+            time.sleep(15)
+            st = engine.status()
+            s = st["stats"]
+            print(
+                f"  {DIM}{int(time.monotonic() - started):>5}s{RESET} "
+                f"证书 {s.get('certs_seen', 0)} → 命中 {s.get('keyword_hits', 0)} "
+                f"→ 入库 {s.get('created', 0)}  待落库 {st.get('pending', 0)}"
+            )
+            if duration and time.monotonic() - started >= duration:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        engine.stop()
+    print(json.dumps(engine.status(), ensure_ascii=False, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------- 流水线
+
+
+def cmd_cycle(args) -> int:
+    from .pipeline import run_cycle
+
+    init_db()
+    result = run_cycle(
+        scan_limit=args.scan_limit,
+        enrich_limit=args.enrich,
+        rebuild_graph=not args.no_graph,
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        mark = f"{GRN}完成{RESET}" if result.get("ok") else f"{RED}失败{RESET}"
+        print(f"{BOLD}一轮流水线{mark}")
+        print(f"  研判 {result.get('scanned', 0)}  富化 {result.get('enriched', 0)}  "
+              f"图边 {result.get('graph_edges', 0)}  团伙 {result.get('campaigns', {})}  "
+              f"衰减 {result.get('decayed', 0)}  耗时 {result.get('elapsed', 0):.1f}s")
+        if result.get("error"):
+            print(f"  {RED}{result['error']}{RESET}")
+    return 0 if result.get("ok") else 1
+
+
+def cmd_graph(args) -> int:
+    from .graph.build import build_graph
+    from .graph.community import sync_campaigns
+    from .graph.store import get_graph
+
+    init_db()
+    if args.action == "stats":
+        print(json.dumps(get_graph().stats(), ensure_ascii=False, indent=2))
+        return 0
+    if args.action == "build":
+        print(json.dumps(build_graph(limit=args.limit), ensure_ascii=False, indent=2))
+        return 0
+    if args.action == "communities":
+        print(json.dumps(sync_campaigns(), ensure_ascii=False, indent=2))
+        return 0
+    # rebuild = build + 归并
+    built = build_graph(limit=args.limit)
+    merged = sync_campaigns()
+    print(json.dumps({"graph": built, "campaigns": merged}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_enrich(args) -> int:
+    from .pipeline import enrich_asset, probe_web
+
+    init_db()
+    if args.probe:
+        result = probe_web(args.asset_id)
+    else:
+        result = enrich_asset(args.asset_id, with_sandbox=args.sandbox)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok", True) else 1
+
+
+# ---------------------------------------------------------------- 证据与副本
+
+
+def cmd_log(args) -> int:
+    from .core.eventlog import EventLog
+
+    init_db()
+    if args.action == "verify":
+        log_file = EventLog()
+        try:
+            result = log_file.verify(deep=not args.fast)
+        finally:
+            log_file.close()
+        if result.get("ok"):
+            print(f"{GRN}事件日志完好{RESET}：{result.get('checked', 0)} 条，"
+                  f"链头 {str(result.get('head', ''))[:16]}…")
+            return 0
+        print(f"{RED}事件日志异常{RESET}：第 {result.get('broken_at_line')} 行，{result.get('reason')}")
+        return 1
+    # tail
+    log_file = EventLog()
+    try:
+        for ev in log_file.tail(args.n):
+            print(f"#{ev.seq:<8} {ev.ts} {ev.kind:<20} {json.dumps(ev.payload, ensure_ascii=False)[:160]}")
+    finally:
+        log_file.close()
+    return 0
+
+
+def cmd_replica(args) -> int:
+    from .core.replica import get_replica
+
+    init_db()
+    replica = get_replica()
+    if args.action == "status":
+        print(json.dumps(replica.status(), ensure_ascii=False, indent=2))
+        return 0
+    if args.action == "restore":
+        print(json.dumps(replica.restore_events(), ensure_ascii=False, indent=2))
+        return 0
+    result = replica.run_once(include_db=args.with_db)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok", True) else 1
+
+
+def cmd_ops(args) -> int:  # noqa: ARG001
+    """一眼看全：能力降级、发现吞吐、待办积压、证据完整性。"""
+    from .core.eventlog import EventLog
+    from .db import db_stats
+    from .discover.engine import get_engine
+    from .graph.store import get_graph
+    from .models import Campaign
+
+    init_db()
+    log_file = EventLog()
+    try:
+        integrity = log_file.verify(deep=False)
+    finally:
+        log_file.close()
+
+    with session_scope() as session:
+        campaigns = session.query(Campaign).count()
+
+    info = {
+        "capabilities": settings.capability_report(),
+        "db": db_stats(),
+        "eventlog": integrity,
+        "discover": get_engine().status()["stats"],
+        "graph": get_graph().stats(),
+        "campaigns": campaigns,
     }
     print(json.dumps(info, ensure_ascii=False, indent=2))
     return 0
@@ -253,6 +476,53 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("verify-chain", help="校验证据链完整性")
     p.add_argument("--asset", type=int)
     p.set_defaults(func=cmd_verify)
+
+    # ------------------------------------------------------------ 发现
+    p = sub.add_parser("discover", help="发现引擎：CT 监控 / 词库 / 注入 / 历史补漏")
+    p.add_argument(
+        "action",
+        choices=["run", "status", "words", "inject", "search"],
+        help="run 常驻运行，status 看吞吐，words 看词库覆盖，inject 导入清单，search 翻 crt.sh 历史",
+    )
+    p.add_argument("values", nargs="*", help="inject 的域名，或 search 的词根")
+    p.add_argument("--file", help="从文件批量导入（每行一个域名，# 开头为注释）")
+    p.add_argument("--note", help="导入备注，会写进发现流水")
+    p.add_argument("--minutes", type=float, default=0, help="run 的时长（分钟），0 为常驻")
+    p.set_defaults(func=cmd_discover)
+
+    # ------------------------------------------------------------ 流水线与图
+    p = sub.add_parser("cycle", help="跑一轮完整流水线（研判→富化→建图→团伙→衰减）")
+    p.add_argument("--scan-limit", type=int, help="本轮最多研判多少个候选")
+    p.add_argument("--enrich", type=int, default=40, help="本轮最多富化多少个")
+    p.add_argument("--no-graph", action="store_true", help="跳过建图，只跑研判与富化")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_cycle)
+
+    p = sub.add_parser("graph", help="关系图谱：建图 / 统计 / 团伙归并")
+    p.add_argument("action", choices=["rebuild", "build", "stats", "communities"])
+    p.add_argument("--limit", type=int, default=5000)
+    p.set_defaults(func=cmd_graph)
+
+    p = sub.add_parser("enrich", help="富化单个资产（备案 / RDAP / 可选沙箱）")
+    p.add_argument("asset_id", type=int)
+    p.add_argument("--sandbox", action="store_true", help="允许进沙箱跑 APK")
+    p.add_argument("--probe", action="store_true", help="跑一次真实网页抓取")
+    p.set_defaults(func=cmd_enrich)
+
+    # ------------------------------------------------------------ 证据与副本
+    p = sub.add_parser("log", help="事件日志：校验哈希链 / 看末尾")
+    p.add_argument("action", choices=["verify", "tail"])
+    p.add_argument("-n", type=int, default=20, help="tail 显示条数")
+    p.add_argument("--fast", action="store_true", help="只校验链头，不逐条重算")
+    p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("replica", help="异地副本：同步 / 状态 / 恢复")
+    p.add_argument("action", choices=["sync", "status", "restore"])
+    p.add_argument("--with-db", action="store_true", help="同时同步数据库快照")
+    p.set_defaults(func=cmd_replica)
+
+    p = sub.add_parser("ops", help="运维总览：能力降级、积压、证据完整性")
+    p.set_defaults(func=cmd_ops)
 
     p = sub.add_parser("rules", help="查看规则库")
     p.set_defaults(func=cmd_rules)

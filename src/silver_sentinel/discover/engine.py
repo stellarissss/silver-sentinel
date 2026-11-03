@@ -1,0 +1,470 @@
+"""发现引擎：把「世界里新出现的东西」变成「候选池里的记录」。
+
+核心原则
+--------
+**发现不等于判定。** 这里只回答「值不值得看一眼」，不回答「是不是诈骗」。
+所以阈值设得很低（默认 0.30），命中即收；判定交给 scoring，分级交给 triage。
+这条链路允许「宁可错杀」——错杀的成本只是几 KB 存储。
+
+数据流
+------
+CT 日志 / certstream / DNS 探测 / 人工导入
+        ↓ 规范化 + 白名单
+    词库匹配（hint 分）
+        ↓ 去重（内存 LRU + 库唯一键）
+  DiscoveryEvent（只追加的流水）
+        ↓ upsert
+   Asset(tier=candidate) —— 进入研判队列
+        ↓
+   事件总线（前端实时看到）
+
+吞吐设计
+--------
+批量落库：攒够 100 条或 2 秒写一次，避免每条一个事务。
+去重分两级：内存 set 挡住同一批内的重复，数据库唯一键挡住跨批重复。
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+from sqlalchemy import select
+
+from ..config import settings
+from ..core.bus import bus
+from ..core.eventlog import emit
+from ..db import session_scope
+from ..domain import utcnow
+from ..models import TIER_CANDIDATE, TIER_COLD, Asset, DiscoveryEvent, KeywordHit, TaskRun
+from .ct import CertObservation, CertStreamClient, CTLogFollower, CtrlShSearch, DEFAULT_LOGS
+from .dnsprobe import DNSProbe, SeedGenerator
+from .keywords import get_library
+
+log = logging.getLogger(__name__)
+
+# 低于这个 hint 分的域名进冷存：仍然记录，但不进研判队列。
+# 设得低是刻意的——「宁可错杀」，冷存比漏掉便宜。
+COLD_THRESHOLD = 0.30
+
+
+@dataclass
+class DiscoverStats:
+    seen: int = 0
+    matched: int = 0
+    queued: int = 0
+    duplicated: int = 0
+    whitelisted: int = 0
+    cold: int = 0
+    db_errors: int = 0
+    started_at: float = field(default_factory=time.time)
+
+    def as_dict(self) -> dict[str, Any]:
+        uptime = max(1.0, time.time() - self.started_at)
+        return {
+            "seen": self.seen,
+            "matched": self.matched,
+            "queued": self.queued,
+            "duplicated": self.duplicated,
+            "whitelisted": self.whitelisted,
+            "cold": self.cold,
+            "db_errors": self.db_errors,
+            "uptime_seconds": round(uptime, 1),
+            "rate_per_min": round(self.queued / uptime * 60, 1),
+        }
+
+
+class Deduper:
+    """两级去重：内存 LRU 挡批量内重复，数据库唯一键挡跨批。"""
+
+    def __init__(self, capacity: int = 200_000) -> None:
+        self._seen: deque[str] = deque(maxlen=capacity)
+        self._set: set[str] = set()
+        self._lock = threading.Lock()
+
+    def add(self, key: str) -> bool:
+        """首次出现返回 True。"""
+        with self._lock:
+            if key in self._set:
+                return False
+            if len(self._seen) == self._seen.maxlen:
+                old = self._seen[0]
+                self._set.discard(old)
+            self._seen.append(key)
+            self._set.add(key)
+            return True
+
+
+class DiscoveryEngine:
+    def __init__(self) -> None:
+        self.lib = get_library()
+        self.stats = DiscoverStats()
+        self.deduper = Deduper(settings.discover_queue_capacity)
+        self.pending: deque[tuple[CertObservation | None, str, str, float, list[str]]] = deque()
+        self._pending_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._followers: list[CTLogFollower] = []
+        self._stream: CertStreamClient | None = None
+        self._dns: DNSProbe | None = None
+        self._seeds: SeedGenerator | None = None
+        self._dns_offset = 0
+        self._running = False
+        self._last_flush = time.time()
+        self._ct_sh = CtrlShSearch()
+        self._ct_sh_last: dict[str, float] = {}
+
+    # ------------------------------------------------------------ 生命周期
+    def start(self) -> None:
+        if self._running or not settings.discover_enabled:
+            return
+        self._running = True
+        self._stop.clear()
+
+        if settings.allow_network:
+            log_urls = [u.strip() for u in settings.ct_poll_logs.split(",") if u.strip()] or DEFAULT_LOGS
+            for url in log_urls:
+                slug = url.rstrip("/").rsplit("/", 1)[-1][:24] or "log"
+                follower = CTLogFollower(
+                    url,
+                    settings.data_dir / "ct_state" / f"{slug}.json",
+                    batch=max(64, settings.ct_poll_batch),
+                )
+                (settings.data_dir / "ct_state").mkdir(parents=True, exist_ok=True)
+                self._followers.append(follower)
+
+            self._threads.append(
+                threading.Thread(target=self._ct_loop, name="discover-ct", daemon=True)
+            )
+            self._threads.append(
+                threading.Thread(target=self._dns_loop, name="discover-dns", daemon=True)
+            )
+            self._threads.append(
+                threading.Thread(target=self._flush_loop, name="discover-flush", daemon=True)
+            )
+            self._seeds = SeedGenerator()
+            self._dns = DNSProbe(settings.data_dir / "dns_cache.json")
+
+            if settings.ct_stream_enabled and settings.ct_stream_url:
+                self._stream = CertStreamClient(settings.ct_stream_url, self._on_ct_batch)
+                self._stream.start()
+
+        for t in self._threads:
+            t.start()
+        log.info("发现引擎已启动：%d 个 CT 日志 + DNS 探测", len(self._followers))
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._running = False
+        if self._stream:
+            self._stream.stop()
+        self._flush(force=True)
+
+    # ------------------------------------------------------------ CT 轮询
+    def _ct_loop(self) -> None:
+        while not self._stop.is_set():
+            started = time.monotonic()
+            for follower in self._followers:
+                if self._stop.is_set():
+                    break
+                try:
+                    observations = follower.poll()
+                    if observations:
+                        self._on_ct_batch(observations)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("CT 轮询异常：%s", exc)
+            elapsed = time.monotonic() - started
+            self._stop.wait(max(2.0, settings.ct_poll_interval - elapsed))
+
+    def _on_ct_batch(self, observations: list[CertObservation]) -> None:
+        for obs in observations:
+            self.stats.seen += 1
+            domain = obs.domain.lower().strip(".")
+            if not domain or "." not in domain:
+                continue
+            if self.lib.is_whitelisted(domain):
+                self.stats.whitelisted += 1
+                continue
+            result = self.lib.match_domain(domain)
+            # 一个词都没命中 = 与我们的关注面无关，直接丢弃（这是唯一会丢的分支）
+            if not result.hits and result.score < COLD_THRESHOLD:
+                self.stats.cold += 1
+                continue
+            if result.score < COLD_THRESHOLD:
+                # 命中了弱词但分不够：进冷存。仍然记录，将来有新证据可直接激活
+                self.stats.cold += 1
+            self.stats.matched += 1
+            if not self.deduper.add(domain):
+                self.stats.duplicated += 1
+                continue
+            with self._pending_lock:
+                self.pending.append((obs, "domain", domain, result.score, result.terms))
+
+    # ------------------------------------------------------------ DNS 探测
+    def _dns_loop(self) -> None:
+        # 先等 CT 跑起来，避免启动瞬间抢带宽
+        self._stop.wait(20)
+        while not self._stop.is_set():
+            try:
+                if not self._seeds or not self._dns:
+                    break
+                batch = self._seeds.candidates(self._dns_offset, 300)
+                self._dns_offset = (self._dns_offset + 300) % max(1, len(self._seeds.seeds))
+                found = self._dns.probe_many(d for d, _ in batch)
+                origin_map = dict(batch)
+                for res in found:
+                    domain = res.domain
+                    if self.lib.is_whitelisted(domain):
+                        self.stats.whitelisted += 1
+                        continue
+                    match = self.lib.match_domain(domain)
+                    score = max(match.score, 0.45)   # DNS 探测命中的词根本身带信号
+                    self.stats.seen += 1
+                    self.stats.matched += 1
+                    if not self.deduper.add(domain):
+                        self.stats.duplicated += 1
+                        continue
+                    obs = CertObservation(
+                        domain=domain,
+                        all_domains=[domain],
+                        issuer="",
+                        not_before="",
+                        fingerprint="",
+                        log_url="dns_probe",
+                        entry_index=0,
+                        source="dns_probe",
+                    )
+                    with self._pending_lock:
+                        self.pending.append(
+                            (obs, "domain", domain, score, match.terms or [origin_map.get(domain, "")])
+                        )
+                log.info(
+                    "DNS 探测：%d 个候选，%d 个已注册（累计存在 %d）",
+                    len(batch), len(found), self._dns.stats["exists"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("DNS 探测异常：%s", exc)
+            self._stop.wait(45)
+
+    # ------------------------------------------------------------ 落库
+    def _flush_loop(self) -> None:
+        while not self._stop.is_set():
+            self._stop.wait(2.0)
+            self._flush()
+
+    def _flush(self, force: bool = False) -> None:
+        with self._pending_lock:
+            if not self.pending:
+                return
+            if not force and len(self.pending) < 60 and (time.time() - self._last_flush) < 5:
+                return
+            batch = list(self.pending)
+            self.pending.clear()
+        self._last_flush = time.time()
+
+        rows: list[tuple[CertObservation | None, str, str, float, list[str]]] = batch
+        try:
+            with session_scope() as session:
+                created = self._persist(session, rows)
+            self.stats.queued += created
+        except Exception as exc:  # noqa: BLE001
+            self.stats.db_errors += 1
+            log.warning("发现批写入失败（%d 条）：%s", len(rows), exc)
+            # 失败不重排队：事件日志里已有流水，人工可回放
+            emit("discover.flush_failed", count=len(rows), error=str(exc)[:200])
+
+    def _persist(self, session, rows: list[tuple]) -> int:
+        now = time.time()
+        created = 0
+        assets: list[dict[str, Any]] = []
+        for obs, kind, value, score, terms in rows:
+            normalized = value
+            existing = session.scalar(
+                select(Asset.id).where(Asset.kind == kind, Asset.normalized == normalized)
+            )
+            if existing:
+                # 只更新 last_seen 和发现原因，不动评分——评分由研判链路负责
+                asset = session.get(Asset, existing)
+                if asset is not None:
+                    asset.last_seen = utcnow()
+                    asset.enrich_count = (asset.enrich_count or 0) + 1
+                    if score > (asset.meta or {}).get("discover_hint", 0):
+                        meta = dict(asset.meta or {})
+                        meta["discover_hint"] = round(score, 3)
+                        asset.meta = meta
+                session.add(
+                    DiscoveryEvent(
+                        source=obs.source if obs else "manual",
+                        kind=kind,
+                        value=value,
+                        normalized=normalized,
+                        matched_terms=terms[:12],
+                        score_hint=round(score, 3),
+                        asset_id=existing,
+                        raw=obs.as_dict() if obs else {},
+                    )
+                )
+                continue
+
+            asset = Asset(
+                kind=kind,
+                value=value,
+                normalized=normalized,
+                tier=TIER_CANDIDATE if score >= COLD_THRESHOLD else TIER_COLD,
+                discovery_source=obs.source if obs else "manual",
+                discovery_reason="、".join(terms[:6]),
+                score=0.0,
+                verdict="insufficient",
+                meta={"discover_hint": round(score, 3)},
+            )
+            session.add(asset)
+            session.flush()
+            session.add(
+                DiscoveryEvent(
+                    source=obs.source if obs else "manual",
+                    kind=kind,
+                    value=value,
+                    normalized=normalized,
+                    matched_terms=terms[:12],
+                    score_hint=round(score, 3),
+                    asset_id=asset.id,
+                    raw=obs.as_dict() if obs else {},
+                )
+            )
+            assets.append(
+                {
+                    "id": asset.id,
+                    "kind": kind,
+                    "value": value,
+                    "score": round(score, 3),
+                    "terms": terms[:6],
+                    "source": obs.source if obs else "manual",
+                }
+            )
+            created += 1
+
+            # 词库命中统计：用来淘汰永远误报的词
+            for term in terms[:6]:
+                if not term:
+                    continue
+                row = session.get(KeywordHit, term)
+                if row:
+                    row.hits += 1
+                    row.last_hit = utcnow()
+                else:
+                    session.add(KeywordHit(term=term, hits=1))
+
+        session.commit()
+
+        for item in assets[:40]:
+            bus.publish("discovery", item)
+        if assets:
+            emit("discover.batch", created=len(assets), sample=[a["value"] for a in assets[:5]])
+        return created
+
+    # ------------------------------------------------------------ 手动注入
+    def inject(self, values: Iterable[str], *, source: str = "manual", note: str = "") -> dict[str, Any]:
+        """人工/外部导入。用于举报线索、批量域名清单、已知样本附带的基础设施。"""
+        added = 0
+        skipped = 0
+        with session_scope() as session:
+            for raw in values:
+                value = str(raw).strip().lower().rstrip(".")
+                if not value or "." not in value:
+                    skipped += 1
+                    continue
+                if self.lib.is_whitelisted(value):
+                    skipped += 1
+                    continue
+                if not self.deduper.add(value):
+                    skipped += 1
+                    continue
+                match = self.lib.match_domain(value)
+                obs = CertObservation(
+                    domain=value, all_domains=[value], issuer="", not_before="",
+                    fingerprint="", log_url=source, entry_index=0, source=source,
+                )
+                note_text = note or "人工导入"
+                existing = session.scalar(
+                    select(Asset.id).where(Asset.kind == "domain", Asset.normalized == value)
+                )
+                if existing:
+                    skipped += 1
+                    continue
+                asset = Asset(
+                    kind="domain", value=value, normalized=value,
+                    tier=TIER_CANDIDATE, discovery_source=source,
+                    discovery_reason=note_text + ("；命中：" + "、".join(match.terms[:5]) if match.terms else ""),
+                    meta={"discover_hint": round(match.score, 3)},
+                )
+                session.add(asset)
+                session.flush()
+                session.add(
+                    DiscoveryEvent(
+                        source=source, kind="domain", value=value, normalized=value,
+                        matched_terms=match.terms[:12], score_hint=round(match.score, 3),
+                        asset_id=asset.id, raw={"note": note_text},
+                    )
+                )
+                added += 1
+            session.commit()
+        bus.publish("discovery_injected", {"added": added, "skipped": skipped, "source": source})
+        emit("discover.inject", added=added, skipped=skipped, source=source)
+        return {"added": added, "skipped": skipped}
+
+    def search_history(self, terms: list[str], limit_per_term: int = 60) -> dict[str, Any]:
+        """按词根翻 crt.sh 历史。慢，只在需要补漏时手动触发。"""
+        total = 0
+        for term in terms[:20]:
+            last = self._ct_sh_last.get(term, 0)
+            if time.time() - last < 3600:      # 同一词根一小时最多查一次
+                continue
+            self._ct_sh_last[term] = time.time()
+            observations = self._ct_sh.search(term, limit=limit_per_term)
+            for obs in observations:
+                domain = obs.domain.lower()
+                if not domain or self.lib.is_whitelisted(domain):
+                    continue
+                match = self.lib.match_domain(domain)
+                if match.score < COLD_THRESHOLD and not match.hits:
+                    continue
+                if not self.deduper.add(domain):
+                    continue
+                with self._pending_lock:
+                    self.pending.append((obs, "domain", domain, match.score, match.terms))
+                total += 1
+            time.sleep(2)
+        self._flush(force=True)
+        return {"queued": total}
+
+    # ------------------------------------------------------------ 状态
+    def status(self) -> dict[str, Any]:
+        return {
+            "running": self._running,
+            "stats": self.stats.as_dict(),
+            "keyword_library": self.lib.stats(),
+            "followers": [f.status() for f in self._followers],
+            "stream": self._stream.status() if self._stream else None,
+            "dns": self._dns.stats if self._dns else None,
+            "seeds": self._seeds.stats() if self._seeds else None,
+            "pending": len(self.pending),
+            "crt_sh_error": self._ct_sh.last_error,
+        }
+
+
+_engine: DiscoveryEngine | None = None
+_lock = threading.Lock()
+
+
+def get_engine() -> DiscoveryEngine:
+    global _engine
+    if _engine is None:
+        with _lock:
+            if _engine is None:
+                _engine = DiscoveryEngine()
+    return _engine

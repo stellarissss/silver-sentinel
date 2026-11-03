@@ -15,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
+from . import __version__
 from .analyzers import llm as llm_analyzer
 from .config import settings
 from .db import init_db, session_scope, verify_chain
@@ -26,20 +27,68 @@ from .scoring.engine import load_ruleset
 
 WEB_DIR = Path(__file__).parent / "web"
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _discover_running() -> bool:
+    """发现引擎是否在跑。不在跑就如实返回 False——控制台据此显示「未启动」，
+    而不是让人误以为基座在监控。"""
+    try:
+        from .discover.engine import get_engine
+
+        return bool(get_engine().status().get("running"))
+    except Exception:  # noqa: BLE001
+        return False
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
-    init_db()
-    from .monitor import start_background
-
     import os
 
+    init_db()
+
+    # 兼容两种写法：SILVER_AUTOSTART（旧）与 SILVER_AUTOSTART_MONITOR（编排文件里用的）
+    flag = os.environ.get("SILVER_AUTOSTART") or os.environ.get("SILVER_AUTOSTART_MONITOR", "1")
+    autostart = flag.strip().lower() in {"1", "true", "yes"}
+    if autostart:
+        # 发现 → 调度 → 副本，三条后台线各自独立；任何一个挂了不影响其余
+        try:
+            from .discover.engine import get_engine
+
+            get_engine().start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("发现引擎启动失败：%s", exc)
+        try:
+            from .pipeline import get_scheduler
+
+            get_scheduler().start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("调度器启动失败：%s", exc)
+        try:
+            from .core.replica import get_replica
+
+            get_replica().start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("副本启动失败：%s", exc)
+
     if os.environ.get("SILVER_AUTOSTART_MONITOR", "0").strip() in {"1", "true", "yes"}:
+        from .monitor import start_background
+
         start_background()
     yield
 
+    # 优雅收尾：把事件日志刷盘，别丢最后几条
+    try:
+        from .core.eventlog import get_log
 
-app = FastAPI(title="银发哨兵", version="0.1.0", lifespan=lifespan)
+        get_log().close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+app = FastAPI(title="银发哨兵", version="1.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 
@@ -79,15 +128,26 @@ def _asset_row(asset: Asset) -> dict[str, Any]:
         "last_seen": asset.last_seen.isoformat(),
         "scan_count": asset.scan_count,
         "reviewed_by": asset.reviewed_by,
+        "tier": asset.tier,
+        "discovery_source": asset.discovery_source,
+        "discovery_reason": asset.discovery_reason,
+        "icp_status": asset.icp_status,
+        "icp_entity": asset.icp_entity,
+        "campaign_name": asset.campaign.name if asset.campaign else "",
     }
 
 
 # ---------------------------------------------------------------- 页面
 
 
+from .api_extra import router as extra_router  # noqa: E402
+
+app.include_router(extra_router)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse("index.html", {"request": request, "version": "0.1.0"})
+    return templates.TemplateResponse("index.html", {"request": request, "version": __version__})
 
 
 # ---------------------------------------------------------------- 接口
@@ -104,9 +164,11 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "0.1.0",
+        "version": __version__,
         "network": settings.allow_network,
         "llm": llm_analyzer.status(),
+        "capabilities": settings.capability_report(),
+        "discover_running": _discover_running(),
         "evidence_chain": chain,
         "rules": {"count": len(load_ruleset().rules), "version": load_ruleset().version},
     }
@@ -197,22 +259,26 @@ async def api_scan_apk(file: UploadFile, run_llm: bool = Query(default=True)) ->
 def api_assets(
     verdict: str | None = None,
     q: str | None = None,
-    limit: int = Query(default=50, le=200),
+    tier: str | None = None,
+    kind: str | None = None,
+    source: str | None = None,
+    limit: int = Query(default=50, le=300),
     offset: int = 0,
 ) -> dict[str, Any]:
     with session_scope() as session:
         stmt = select(Asset).order_by(Asset.score.desc(), Asset.last_seen.desc())
-        if verdict:
-            stmt = stmt.where(Asset.verdict == verdict)
-        if q:
-            stmt = stmt.where(Asset.value.contains(q))
-        rows = list(session.scalars(stmt.offset(offset).limit(limit)))
-
         count_stmt = select(func.count(Asset.id))
-        if verdict:
-            count_stmt = count_stmt.where(Asset.verdict == verdict)
-        if q:
-            count_stmt = count_stmt.where(Asset.value.contains(q))
+        for condition in (
+            (Asset.verdict == verdict) if verdict else None,
+            (Asset.value.contains(q)) if q else None,
+            (Asset.tier == tier) if tier else None,
+            (Asset.kind == kind) if kind else None,
+            (Asset.discovery_source == source) if source else None,
+        ):
+            if condition is not None:
+                stmt = stmt.where(condition)
+                count_stmt = count_stmt.where(condition)
+        rows = list(session.scalars(stmt.offset(offset).limit(limit)))
         total = session.scalar(count_stmt) or 0
         return {"items": [_asset_row(a) for a in rows], "total": total}
 

@@ -66,6 +66,11 @@ DANGEROUS_APIS = {
 
 _CN_RUN = re.compile(r"[\u4e00-\u9fff][\u4e00-\u9fff0-9A-Za-z，。！？、：；]{1,24}")
 _ASCII_RUN = re.compile(rb"[\x20-\x7e]{16,140}")
+# 短的域名（guohui-vip.top 只有 14 字符）过不了 _ASCII_RUN 的 16 字符门槛，
+# 而「App 指向哪个站」恰恰是最关键的一条关系。单独用域名形状捞一遍。
+_DOMAINLIKE = re.compile(
+    rb"(?<![a-zA-Z0-9.-])((?:[a-z0-9][a-z0-9-]{0,50}\.)+(?:top|xyz|cn|com|net|org|cc|vip|shop|site|online|club|icu|buzz|cyou|wang|xin|ltd|work|live|fun|info|me|io|co|app|link|tech|store|space|website|pro|ink|cloud|host|press|art|bar|rest|group|life|world|today|digital|studio|agency|solutions|services|systems|network|center|support|team|tools|works|zone|city|plus|one|run|dev|page|blog|wiki|media|news|video|music|photo|pics|design|email|chat|social|community|global|international|asia|mobi|tel|travel|jobs|careers|education|training|school|college|university|institute|academy|clinic|hospital|health|care|fitness|coffee|food|recipes|menu|bar|pub|beer|wine|shop|store|market|sale|deal|discount|coupon|gift|present|prize|award|win|bet|casino|poker|lottery|game|games|play|toys|kids|baby|family|home|house|property|estate|rent|lease|mortgage|loan|credit|finance|bank|money|cash|fund|invest|capital|trade|exchange|market|stock|bond|insurance|policy|claim|legal|law|attorney|lawyer|court|judge|police|security|guard|protect|safe|alarm|lock|key|door|window|roof|build|construction|repair|service|maintenance|clean|wash|laundry|dry|iron|sew|tailor|fashion|style|beauty|spa|massage|salon|hair|nail|makeup|skin|cosmetic|perfume|jewelry|watch|bag|shoe|cloth|wear|dress|shirt|pants|hat|cap|sock|glove|scarf|belt|tie|suit|coat|jacket|jean|short|skirt))(?![a-zA-Z0-9-])"
+)
 _URL = re.compile(rb"https?://[\x21-\x7e]{4,160}")
 _PERM = re.compile(r"android\.permission\.[A-Z_0-9]{3,60}")
 
@@ -218,6 +223,7 @@ def _cert_info(zf: zipfile.ZipFile) -> dict[str, Any]:
 
 def _scan_blobs(zf: zipfile.ZipFile) -> dict[str, Any]:
     urls: set[str] = set()
+    _seen_domains: set[str] = set()
     cn_chunks: list[str] = []
     ascii_chunks: list[str] = []
     apis: set[str] = set()
@@ -260,9 +266,16 @@ def _scan_blobs(zf: zipfile.ZipFile) -> dict[str, Any]:
             urls.add(match.decode("latin-1", "ignore"))
 
         # dex 里的钱包地址、手机号、包名都是 ASCII，单独收集一段供指标抽取
-        if lower.endswith(".dex") and len(ascii_chunks) < 1200:
-            for chunk in _ASCII_RUN.findall(blob)[:400]:
-                ascii_chunks.append(chunk.decode("latin-1", "ignore"))
+        if lower.endswith(".dex"):
+            if len(ascii_chunks) < 1200:
+                for chunk in _ASCII_RUN.findall(blob)[:400]:
+                    ascii_chunks.append(chunk.decode("latin-1", "ignore"))
+            # 裸域名单独捞，不受 16 字符阈值影响
+            for match in _DOMAINLIKE.findall(blob)[:600]:
+                candidate = match.decode("latin-1", "ignore").lower()
+                if len(candidate) >= 5 and candidate not in _seen_domains:
+                    _seen_domains.add(candidate)
+                    urls.add(candidate)
 
         if lower.endswith((".html", ".htm")):
             html_parts.append(blob.decode("utf-8", "ignore")[:20000])

@@ -1,24 +1,144 @@
+# 银发哨兵 v1.0 部署编排
+#
+# 最小可用：            docker compose up -d --build
+# 加图数据库：          docker compose --profile graph up -d
+# 加异地副本（MinIO）： docker compose --profile replica up -d
+# 加动态沙箱（MobSF）： docker compose --profile sandbox up -d
+# 全都要：              docker compose --profile graph --profile replica --profile sandbox up -d
+#
+# 说明：所有附加服务都是「可缺省」的。缺省时系统自动降级——图走内置 SQLite 图引擎、
+# 副本不做、APK 走静态行为推演——并在控制台的「运维」页如实标注，不假装可用。
+
 services:
   sentinel:
-    build: .
-    image: silver-sentinel:0.1.0
+    build:
+      context: .
+      args:
+        # 需要真实浏览器取证时设为 1（镜像会大 ~400MB，装 chromium 与系统依赖）
+        WITH_SANDBOX: "0"
+    image: silver-sentinel:1.0.0
     container_name: silver-sentinel
     restart: unless-stopped
     env_file:
       - .env
     environment:
       SILVER_DATA_DIR: /var/lib/silver-sentinel
+      # 单进程部署：发现引擎 + 周期调度都跟 API 同进程
       SILVER_AUTOSTART_MONITOR: "1"
+      SILVER_SCHEDULER_IN_PROCESS: "1"
+      # 走 profile 时这两个会被下面的服务覆盖，这里给空值保证不报错
+      SILVER_NEO4J_URI: ${SILVER_NEO4J_URI:-}
+      SILVER_REPLICA_TARGET: ${SILVER_REPLICA_TARGET:-}
     ports:
-      # 默认只绑本机，对外暴露请在前置反向代理上加鉴权
+      # 默认只绑本机。对外暴露请在前置反向代理上加鉴权（Basic / OAuth2 Proxy 均可）
       - "127.0.0.1:8000:8000"
     volumes:
       - sentinel-data:/var/lib/silver-sentinel
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     security_opt:
       - no-new-privileges:true
     read_only: true
     tmpfs:
       - /tmp
+      # chromium 需要可写缓存；WITH_SANDBOX=1 时才有意义
+      - /home/sentinel/.cache:size=512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------- Neo4j
+  neo4j:
+    image: neo4j:5-community
+    container_name: silver-neo4j
+    profiles: ["graph"]
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-changeme}
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512M
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*,gds.*
+    ports:
+      # 7687 只给容器网络内部用，不对外暴露；需要外部连接再手动放开
+      - "127.0.0.1:7474:7474"
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------- MinIO（S3 兼容，做异地副本）
+  minio:
+    image: minio/minio:latest
+    container_name: silver-minio
+    profiles: ["replica"]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-silver}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-silver-secret}
+    ports:
+      - "127.0.0.1:9001:9001"     # 控制台
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # 首次启动自动建桶，省掉手工初始化
+  minio-init:
+    image: minio/mc:latest
+    profiles: ["replica"]
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}; do sleep 2; done;
+      mc mb -p local/$${SILVER_REPLICA_BUCKET};
+      mc version enable local/$${SILVER_REPLICA_BUCKET} || true;
+      echo 'minio bucket ready'
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-silver}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-silver-secret}
+      SILVER_REPLICA_BUCKET: ${SILVER_REPLICA_BUCKET:-silver-sentinel}
+    restart: "no"
+
+  # ---------------------------------------------------------------- MobSF（APK 动态分析）
+  mobsf:
+    image: opensecurity/mobile-security-framework-mobsf:latest
+    container_name: silver-mobsf
+    profiles: ["sandbox"]
+    restart: unless-stopped
+    environment:
+      MOBSF_API_KEY: ${MOBSF_API_KEY:-silver-mobsf-key}
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - mobsf-data:/home/mobsf/.MobSF
+    # MobSF 需要跑在特权容器里做动态分析；静态分析不需要，按需取舍
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   sentinel-data:
+  neo4j-data:
+  neo4j-logs:
+  minio-data:
+  mobsf-data:
