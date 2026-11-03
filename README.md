@@ -38,6 +38,10 @@
 
 ![研判结果](docs/screenshots/scan.png)
 
+跨资产归并：共享签名证书、页面模板指纹或收款钱包的线索会自动并成一个团伙。
+
+![团伙归并](docs/screenshots/campaigns.png)
+
 ---
 
 ## 快速开始
