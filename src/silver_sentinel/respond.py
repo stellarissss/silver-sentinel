@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .domain import VERDICT_LABELS, utcnow
+from .opsec import redact_obj
 from .models import Asset, Evidence, ReportDraft, SignalRow
 
 # 渠道元数据。url 为官方入口，字段说明用于指导人工填报。
@@ -227,7 +228,7 @@ def build(session: Session, asset_id: int, channel: str = "12321", *, reporter: 
     signals = _signals(session, asset_id)
     evidence = list(session.scalars(select(Evidence).where(Evidence.asset_id == asset_id).order_by(Evidence.id)))
 
-    body = render_markdown(asset, signals, evidence, channel, reporter=reporter)
+    body = redact_obj(render_markdown(asset, signals, evidence, channel, reporter=reporter))
     payload = {
         "channel": channel,
         "channel_name": CHANNELS[channel]["name"],
@@ -240,6 +241,7 @@ def build(session: Session, asset_id: int, channel: str = "12321", *, reporter: 
         "evidence_count": len(evidence),
         "evidence_hashes": [e.sha256 for e in evidence],
     }
+    payload = redact_obj(payload)          # 导出前抹掉采集端标识，避免把基础设施写进举报材料
 
     draft = ReportDraft(asset_id=asset_id, channel=channel, payload=payload, body=body)
     session.add(draft)
@@ -279,7 +281,7 @@ def one_pager(session: Session, asset_id: int) -> dict[str, Any]:
 def export_bundle(session: Session, asset_id: int, channels: list[str] | None = None) -> dict[str, Any]:
     channels = channels or ["12321", "12377", "cyberpolice", "12315"]
     drafts = [build(session, asset_id, c) for c in channels]
-    return {
+    bundle = {
         "asset_id": asset_id,
         "generated_at": utcnow().isoformat(),
         "reports": [
@@ -287,6 +289,7 @@ def export_bundle(session: Session, asset_id: int, channels: list[str] | None = 
         ],
         "one_pager": one_pager(session, asset_id),
     }
+    return redact_obj(bundle)
 
 
 def to_json(bundle: dict[str, Any]) -> str:

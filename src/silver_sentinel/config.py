@@ -17,10 +17,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_dotenv(path: Path) -> None:
-    """极简 .env 解析：只补全尚未存在的变量，不覆盖真实环境。"""
-    if not path.is_file():
+    """极简 .env 解析：只补全尚未存在的变量，不覆盖真实环境。
+
+    注意：进程的工作目录可能不可读（例如以 silver 用户从 /root 启动），
+    这里必须吞掉 OSError，否则一个无关文件就能让整个进程起不来。
+    """
+    try:
+        if not path.is_file():
+            return
+        text = path.read_text(encoding="utf-8")
+    except OSError:
         return
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -127,6 +135,40 @@ class Settings:
     # adb/emulator 设备串号（可选）
     android_serial: str = ""
 
+    # ---------------------------------------------------------------- 出站防护（OPSEC）
+    # 默认开启：拦内网/元数据、去标识 UA、导出脱敏。是否需要代理才允许访问可疑目标，
+    # 由 allow_direct 控制；生产环境应设为 0（fail-closed）。
+    opsec_enabled: bool = True
+    opsec_allow_direct: bool = True
+    # 逗号分隔，支持 socks5h://（远端解析，避免 DNS 泄露）/ http://
+    opsec_proxies: str = ""
+    # 本机对外 IP，多个用逗号分隔；留空则自动探测网卡地址
+    opsec_own_ips: str = ""
+    # 额外需要从产物中抹除的标识（机构名、邮箱、内网域名）
+    opsec_identifiers: str = ""
+    # 追加的禁访后缀（默认已含政务/监管/CA）
+    opsec_deny_suffixes: str = ""
+    # 沙箱浏览器没有隔离出口时是否直接拒绝运行
+    opsec_require_proxy_for_sandbox: bool = True
+    # 探针串：用于识别反射型蜜罐
+    opsec_canary: bool = True
+
+    # ---------------------------------------------------------------- 加密证据仓
+    # 原始证据以 AES-256-GCM 加密后存放；仓库侧只留 SHA-256、哈希链与保管链。
+    vault_enabled: bool = False
+    vault_backend: str = "dir"          # dir | s3 | webdav | ipfs
+    vault_target: str = ""
+    vault_node_id: str = ""             # 留空自动生成并持久化
+    vault_interval: int = 120           # 自动 pull+push 的间隔（秒）
+    vault_key: str = ""                 # base64 32 字节；优先级最高
+    vault_key_file: str = ""            # 默认 <data>/vault.key
+    vault_passphrase: str = ""          # 无 key 时用口令派生（scrypt）
+    vault_access_key: str = ""
+    vault_secret_key: str = ""
+    vault_bucket: str = "silver-sentinel-vault"
+    vault_remove_plaintext: bool = False  # 上传并校验后删除本地明文
+    vault_verify_blobs: bool = True
+
     # ---------------------------------------------------------------- 副本
     replica_enabled: bool = False
     replica_backend: str = "dir"      # dir | s3 | webdav
@@ -159,7 +201,14 @@ class Settings:
     stream_heartbeat: int = 15
 
     def __post_init__(self) -> None:
-        _load_dotenv(PROJECT_ROOT / ".env")
+        # 加载顺序：显式指定的文件 → 当前工作目录 → 源码根目录。
+        # 已存在的环境变量一律不覆盖，systemd/容器的优先级最高。
+        candidates = [PROJECT_ROOT / ".env", Path.cwd() / ".env"]
+        explicit = os.environ.get("SILVER_ENV_FILE", "").strip()
+        if explicit:
+            candidates.insert(0, Path(explicit))
+        for candidate in candidates:
+            _load_dotenv(candidate)
         self.data_dir = Path(os.environ.get("SILVER_DATA_DIR", str(self.data_dir))).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "evidence").mkdir(exist_ok=True)
@@ -216,6 +265,29 @@ class Settings:
         self.mobsf_base_url = _str("SILVER_MOBSF_URL", "").rstrip("/")
         self.mobsf_api_key = _str("SILVER_MOBSF_KEY", "")
         self.android_serial = _str("SILVER_ANDROID_SERIAL", "")
+
+        self.opsec_enabled = _bool("SILVER_OPSEC_ENABLED", True)
+        self.opsec_allow_direct = _bool("SILVER_OPSEC_ALLOW_DIRECT", True)
+        self.opsec_proxies = _str("SILVER_OPSEC_PROXIES", "")
+        self.opsec_own_ips = _str("SILVER_OPSEC_OWN_IPS", "")
+        self.opsec_identifiers = _str("SILVER_OPSEC_IDENTIFIERS", "")
+        self.opsec_deny_suffixes = _str("SILVER_OPSEC_DENY_SUFFIXES", "")
+        self.opsec_require_proxy_for_sandbox = _bool("SILVER_OPSEC_REQUIRE_PROXY_SANDBOX", True)
+        self.opsec_canary = _bool("SILVER_OPSEC_CANARY", True)
+
+        self.vault_enabled = _bool("SILVER_VAULT_ENABLED", False)
+        self.vault_backend = _str("SILVER_VAULT_BACKEND", "dir").lower()
+        self.vault_target = _str("SILVER_VAULT_TARGET", "")
+        self.vault_node_id = _str("SILVER_VAULT_NODE_ID", "")
+        self.vault_interval = _int("SILVER_VAULT_INTERVAL", 120)
+        self.vault_key = _str("SILVER_VAULT_KEY", "")
+        self.vault_key_file = _str("SILVER_VAULT_KEY_FILE", "")
+        self.vault_passphrase = _str("SILVER_VAULT_PASSPHRASE", "")
+        self.vault_access_key = _str("SILVER_VAULT_ACCESS_KEY", "")
+        self.vault_secret_key = _str("SILVER_VAULT_SECRET_KEY", "")
+        self.vault_bucket = _str("SILVER_VAULT_BUCKET", "silver-sentinel-vault")
+        self.vault_remove_plaintext = _bool("SILVER_VAULT_REMOVE_PLAINTEXT", False)
+        self.vault_verify_blobs = _bool("SILVER_VAULT_VERIFY", True)
 
         self.replica_enabled = _bool("SILVER_REPLICA_ENABLED", False)
         self.replica_backend = _str("SILVER_REPLICA_BACKEND", self.replica_backend).lower()
@@ -277,6 +349,14 @@ class Settings:
     def icp_tier_set(self) -> set[str]:
         return {t.strip() for t in self.icp_tiers.split(",") if t.strip()}
 
+    @property
+    def vault_ready(self) -> bool:
+        return bool(self.vault_enabled and self.vault_target)
+
+    @property
+    def egress_isolated(self) -> bool:
+        return bool(self.opsec_proxies.strip())
+
     def capability_report(self) -> dict[str, bool | str]:
         """给运维页面看的「哪些能力真的开着」。坦承降级比假装可用重要。"""
         return {
@@ -287,6 +367,12 @@ class Settings:
             "sandbox_web": self.sandbox_enabled and self.sandbox_browser_enabled,
             "sandbox_apk": "mobsf" if self.mobsf_ready else ("emulator" if self.android_serial else "static-only"),
             "replica": self.replica_backend if self.replica_enabled else "off",
+            "vault": "off" if not self.vault_enabled else (self.vault_backend if self.vault_target else "unconfigured"),
+            "egress": (
+                "off"
+                if not self.opsec_enabled
+                else ("proxy" if self.egress_isolated else ("direct-degraded" if self.opsec_allow_direct else "blocked"))
+            ),
             "llm": "ready" if self.llm_ready else "off",
         }
 

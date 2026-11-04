@@ -29,11 +29,13 @@ import re
 import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from ..config import settings
+from ..opsec import EgressBlocked, get_guard
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +92,8 @@ class WebObservation:
     error: str = ""
     elapsed: float = 0.0
     engine: str = "playwright"
+    honeypot: dict[str, Any] = field(default_factory=dict)
+    egress: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +113,8 @@ class WebObservation:
             "error": self.error,
             "elapsed": round(self.elapsed, 2),
             "engine": self.engine,
+            "honeypot": self.honeypot,
+            "egress": self.egress,
         }
 
 
@@ -140,6 +146,11 @@ class WebSandbox:
                     "--disable-gpu",
                     "--disable-background-networking",
                     "--disable-features=NetworkPrediction,Translate",
+                    # WebRTC 是浏览器最容易漏内网/真实出口的地方：强制只走代理 UDP
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    # 去掉 navigator.webdriver 这个最廉价的机器人标记
+                    "--disable-blink-features=AutomationControlled",
                 ],
             )
             self.available = True
@@ -159,6 +170,31 @@ class WebSandbox:
             self.stats["blocked_private"] += 1
             return obs
 
+        guard = get_guard()
+        try:
+            kind = guard.preflight(url)
+        except EgressBlocked as exc:
+            obs.error = f"出站被拒：{exc.reason}"
+            self.stats["blocked_egress"] = self.stats.get("blocked_egress", 0) + 1
+            return obs
+
+        proxy_url = guard.proxy_for(url)
+        # 浏览器执行是最强的指纹（WebRTC / Canvas / TLS），没有隔离出口就不跑。
+        if settings.opsec_require_proxy_for_sandbox and kind == "suspect" and not proxy_url:
+            obs.error = "沙箱要求隔离出口：未配置代理，已拒绝运行（避免暴露采集机 IP 与内网地址）"
+            self.stats["blocked_egress"] = self.stats.get("blocked_egress", 0) + 1
+            return obs
+        obs.egress = "proxy" if proxy_url else "direct"
+
+        # 一次性探针串：只用于识别「把我们请求原样回显」的反射型蜜罐
+        canary = ""
+        nav_url = url
+        if settings.opsec_canary and kind == "suspect":
+            canary = "ssv" + uuid.uuid4().hex[:12]
+            parts = urlsplit(url)
+            if not parts.query:
+                nav_url = urlunsplit((parts.scheme, parts.netloc, parts.path, f"_={canary}", ""))
+
         try:
             browser = self._ensure_browser()
         except Exception as exc:  # noqa: BLE001
@@ -168,18 +204,23 @@ class WebSandbox:
 
         context = None
         try:
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Linux; Android 12; SM-G9910) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-                ),
-                viewport={"width": 414, "height": 896},
-                locale="zh-CN",
-                timezone_id="Asia/Shanghai",
-                ignore_https_errors=True,
-                java_script_enabled=True,
-                accept_downloads=False,
-            )
+            context_kwargs: dict[str, Any] = {
+                "user_agent": guard.headers_for(url, mobile=True)["User-Agent"],
+                "viewport": {"width": 414, "height": 896},
+                "locale": "zh-CN",
+                "timezone_id": "Asia/Shanghai",
+                "ignore_https_errors": True,
+                "java_script_enabled": True,
+                "accept_downloads": False,
+                "geolocation": None,
+                "permissions": [],
+            }
+            if proxy_url:
+                # Playwright 只认 socks5://，远端解析是 Chromium 的默认行为
+                context_kwargs["proxy"] = {
+                    "server": proxy_url.replace("socks5h://", "socks5://", 1)
+                }
+            context = browser.new_context(**context_kwargs)
             context.set_default_timeout(timeout * 1000)
 
             page = context.new_page()
@@ -232,7 +273,7 @@ class WebSandbox:
                 else None,
             )
 
-            response = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            response = page.goto(nav_url, wait_until="domcontentloaded", timeout=timeout * 1000)
             page.wait_for_timeout(2500)      # 给 JS 跳转留时间
 
             obs.status = response.status if response else 0
@@ -250,7 +291,6 @@ class WebSandbox:
                 obs.html_len = len(html)
             except Exception:  # noqa: BLE001
                 html = ""
-
             # 表单：只看 action 与字段名，不看用户填什么（也没有用户）
             try:
                 obs.forms = page.evaluate(
@@ -297,6 +337,13 @@ class WebSandbox:
             except Exception:  # noqa: BLE001
                 pass
 
+            # 蜜罐识别：页面回显了采集端 IP / 本次探针串 / 云元数据地址
+            obs.honeypot = guard.honeypot_check(
+                (obs.text or "") + "\n" + (html or ""), canary=canary, request_url=url
+            )
+            if obs.honeypot.get("suspected"):
+                self.stats["honeypot"] = self.stats.get("honeypot", 0) + 1
+
             self.stats["ok"] += 1
         except Exception as exc:  # noqa: BLE001
             obs.error = f"{type(exc).__name__}: {exc}"[:300]
@@ -320,6 +367,8 @@ class WebSandbox:
             "stats": self.stats,
             "allow_private_ip": settings.sandbox_allow_private_ip,
             "timeout": settings.sandbox_timeout,
+            "egress": "proxy" if get_guard().proxies else "direct",
+            "require_proxy": settings.opsec_require_proxy_for_sandbox,
         }
 
     def close(self) -> None:

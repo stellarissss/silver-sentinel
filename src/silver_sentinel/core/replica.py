@@ -242,6 +242,47 @@ class Replica:
             )
         return count
 
+    def sync_vault_blobs(self, batch: int = 400) -> int:
+        """把证据仓的密文也复制一份。
+
+        开了 SILVER_VAULT_REMOVE_PLAINTEXT 后，evidence/ 目录是空的；
+        如果副本只备份明文，机器一坏就只剩远端 vault 一份。密文体积小、
+        内容寻址、天然幂等，跟着副本走一遍成本很低。
+        """
+        src = settings.data_dir / "vault" / "blobs"
+        if not src.is_dir():
+            return 0
+        manifest_path = settings.data_dir / "replica_vault_manifest.json"
+        synced: set[str] = set()
+        if manifest_path.is_file():
+            try:
+                synced = set(json.loads(manifest_path.read_text(encoding="utf-8")).get("files", []))
+            except (json.JSONDecodeError, AttributeError):
+                synced = set()
+
+        count = 0
+        newly: list[str] = []
+        for path in sorted(src.rglob("*.ssv"), key=lambda p: p.stat().st_mtime):
+            if count >= batch:
+                break
+            name = f"vault/{path.relative_to(src)}"
+            if name in synced:
+                continue
+            data = path.read_bytes()
+            if not self._put(name, data) or not self._verify_remote(name, len(data)):
+                self.state.failed += 1
+                continue
+            synced.add(name)
+            newly.append(name)
+            count += 1
+            self.state.files_synced += 1
+            self.state.bytes_sent += len(data)
+            self.state.verified += 1
+
+        if newly:
+            manifest_path.write_text(json.dumps({"files": sorted(synced)}, ensure_ascii=False), encoding="utf-8")
+        return count
+
     def sync_db(self) -> bool:
         """数据库快照。SQLite 用 backup API 拿到一致性副本，不能直接 copy 正在写的库。"""
         if not settings.db_url.startswith("sqlite"):
@@ -288,6 +329,7 @@ class Replica:
             try:
                 result["event_bytes"] = self.sync_events()
                 result["evidence_files"] = self.sync_evidence()
+                result["vault_blobs"] = self.sync_vault_blobs()
                 if include_db:
                     result["db"] = self.sync_db()
                 self.state.last_ok = True

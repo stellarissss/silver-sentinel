@@ -232,6 +232,57 @@ replica/            增量分片：part-00000001.jsonl …，写完回读比对�
 
 ---
 
+## 证据仓：加密存放，账本可验证，多端可合并
+
+副本解决"机器没了"，证据仓解决"证据被改过、带不走、合不到一起"。
+
+```
+data/vault/blobs/ab/<sha256>.ssv    AES-256-GCM 密文，内容寻址
+data/ledger/<node>.jsonl            SHA-256 + 采集时间 + 资产 + prev/hash 哈希链
+data/ledger/custody-<node>.jsonl    保管链：采集/加密/上传/下载/导入/拒绝/删除明文
+data/vault.key                      32 字节主密钥（0600，绝不进仓库）
+```
+
+- **原始文件加密**：AAD 绑定内容哈希与长度，改名、截断、换密钥都解不开。
+- **仓库只放固定信息**：`vault export` 导出的目录只有账本、保管链、`SHA256SUMS`，不含任何原始文件。
+- **多端同步**：每个节点写自己的账本，合并按 `sha256` 去重；支持 `dir` / `s3` / `webdav` / `ipfs`。
+  新设备 `vault pull` 一次即可拥有全部历史，并能独立 `vault verify`。
+- **实时性**：默认 120 秒一轮 pull+push，可调；不做长连接，避免把证据仓变成必须常连的在线服务。
+
+```bash
+silver-sentinel vault init              # 生成密钥，离线抄走 key_b64
+silver-sentinel vault push / pull / sync
+silver-sentinel vault verify            # 账本链 + 抽样解密
+silver-sentinel vault export --out ./ledger-2026-11
+```
+
+细节见 [证据保管与多端同步](docs/09-证据保管与多端同步.md)。
+
+---
+
+## 不让对手看见我们
+
+对手会反查。所以出站默认走四道闸，任何一道不满足就不发请求：
+
+| 闸 | 做什么 |
+| --- | --- |
+| 分类 | 内部服务 / 公开情报 / 可疑目标 / 禁访（政务、监管、内网、云元数据） |
+| 出口 | 可疑目标必须走代理池；`socks5h` 远端解析，避免 DNS 泄露；代理失败自动冷却 |
+| 指纹 | UA 池按目标稳定分配；不含项目名/GitHub 地址；请求前随机抖动 |
+| 回写 | 证据备注、举报材料、导出 JSON 统一脱敏：自身 IP、主机名、数据目录、密钥一律抹除 |
+
+沙箱浏览器额外强制：无隔离出口直接拒绝运行；关闭非代理 UDP、屏蔽 WebRTC 内网地址、
+去掉 `navigator.webdriver`。页面回显采集端 IP 或一次性探针串时，标记为疑似蜜罐。
+
+```bash
+silver-sentinel opsec status
+silver-sentinel opsec check https://example.com
+```
+
+> 生产环境请设 `SILVER_OPSEC_ALLOW_DIRECT=0`：没有代理时宁可少抓，也不直连。
+
+---
+
 ## 沙箱边界
 
 会真跑可疑页面和 APK，但边界写死在代码里：
@@ -359,6 +410,8 @@ curl -N :8000/api/stream       # SSE：发现流 / 周期事件
 - **沙箱不等于真实设备**：Playwright 跑的是桌面 Chromium，移动端 UA 与 WebView 行为有差异；APK 动态分析需要 MobSF 或真机，否则只有静态推演。
 - **LLM 不是必需项**。没有 key 时系统照常工作，只是少了「把信号串成剧本」那层叙事。
 - **不替代执法**。系统输出是线索，不是定性结论；同名不同主体真实存在，命中通报后必须人工核对包名、域名与收款方。
+- **出站隔离依赖代理**。未配代理且 `SILVER_OPSEC_ALLOW_DIRECT=0` 时，可疑页面与沙箱会直接拒绝运行——这是刻意的 fail-closed，不是故障。Tor 在境内多数机房无法建链，建议自建 SOCKS5。
+- **证据密钥是单点**。`vault.key` 丢失则密文永久不可读；请离线备份，并与数据分盘存放。
 
 ---
 
@@ -370,7 +423,9 @@ curl -N :8000/api/stream       # SSE：发现流 / 周期事件
 - [架构、部署与长期运维](docs/04-架构与运维.md)
 - [调研来源](docs/05-调研来源.md)
 - [v1.0 升级说明](docs/06-v1.0-升级说明.md)
-- [30 分钟试运行验收报告](docs/07-试运行报告.md)
+- [30 分钟试运行验收报告（沙箱环境）](docs/07-试运行报告.md)
+- [项目全景与差距评估](docs/08-项目全景与差距评估.md)
+- [证据保管与多端同步](docs/09-证据保管与多端同步.md)
 
 ---
 

@@ -29,3 +29,9 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# --- 证据仓密钥与本地密文（绝不能进仓库）---
+*.key
+/vault-store/
+/vault/
+/ledger-*/

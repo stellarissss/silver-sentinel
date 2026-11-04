@@ -4,11 +4,16 @@
 不抓取可疑站点正文。理由有二 ——
 1) 访问即给对方贡献 UV，还可能触发其反制（记录 IP、下发定向载荷）；
 2) 静态证据已足够支撑判定，动态取证应由执法/平台侧在受控环境完成。
+
+所有出站都经过 opsec 闸门：分类 → 选出口 → 换指纹 → 抖动 → 失败记账。
+可疑目标在未配置代理且策略为 fail-closed 时会被直接拒绝（EgressBlocked），
+调用方应把它当作「正常降级」，而不是异常。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import random
 import threading
 import time
@@ -18,11 +23,9 @@ from typing import Any
 import httpx
 
 from ..config import settings
+from ..opsec import EgressBlocked, get_guard
 
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; SilverSentinel/1.0; +https://github.com/stellarissss/silver-sentinel) "
-    "anti-fraud-research"
-)
+log = logging.getLogger(__name__)
 
 
 class NetworkDisabled(RuntimeError):
@@ -76,25 +79,41 @@ class HttpClient:
         self.timeout = timeout or settings.http_timeout
         self.retries = retries if retries is not None else settings.http_retries
 
+    def _client(self, url: str, headers: dict[str, str]) -> httpx.Client:
+        kwargs: dict[str, Any] = {
+            "timeout": self.timeout,
+            "follow_redirects": True,
+            "headers": headers,
+        }
+        proxy = get_guard().proxy_for(url)
+        if proxy:
+            kwargs["proxy"] = proxy
+        return httpx.Client(**kwargs)
+
     def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         if not settings.allow_network:
             raise NetworkDisabled("离线模式（SILVER_ALLOW_NETWORK=0）下不允许网络请求")
 
-        headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+        guard = get_guard()
+        kind = guard.preflight(url)          # 可能抛 EgressBlocked
+        headers = guard.headers_for(url)
         headers.update(kwargs.pop("headers", {}) or {})
 
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             wait_turn(url)
+            guard.jitter(suspect=(kind == "suspect"))
             try:
-                with httpx.Client(timeout=self.timeout, follow_redirects=True, headers=headers) as client:
+                with self._client(url, headers) as client:
                     resp = client.request(method, url, **kwargs)
+                guard.note_failure(url, True)
                 if resp.status_code in {429, 500, 502, 503, 504} and attempt < self.retries:
                     time.sleep(min(8.0, 1.5 * (2**attempt)) + random.uniform(0, 0.4))
                     continue
                 return resp
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = exc
+                guard.note_failure(url, False)
                 if attempt < self.retries:
                     time.sleep(min(8.0, 1.2 * (2**attempt)))
                     continue
@@ -106,7 +125,8 @@ class HttpClient:
             if resp.status_code != 200:
                 return None
             return resp.json()
-        except (NetworkDisabled, RuntimeError, json.JSONDecodeError):
+        except (NetworkDisabled, EgressBlocked, RuntimeError, json.JSONDecodeError) as exc:
+            log.debug("GET JSON 降级：%s（%s）", url, exc)
             return None
 
     def post_json(self, url: str, **kwargs: Any) -> Any | None:
@@ -115,14 +135,16 @@ class HttpClient:
             if resp.status_code != 200:
                 return None
             return resp.json()
-        except (NetworkDisabled, RuntimeError, json.JSONDecodeError):
+        except (NetworkDisabled, EgressBlocked, RuntimeError, json.JSONDecodeError) as exc:
+            log.debug("POST JSON 降级：%s（%s）", url, exc)
             return None
 
     def get_text(self, url: str, **kwargs: Any) -> str | None:
         try:
             resp = self._request("GET", url, **kwargs)
             return resp.text if resp.status_code == 200 else None
-        except (NetworkDisabled, RuntimeError):
+        except (NetworkDisabled, EgressBlocked, RuntimeError) as exc:
+            log.debug("GET TEXT 降级：%s（%s）", url, exc)
             return None
 
 

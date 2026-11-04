@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import logging
 import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
-from dataclasses import dataclass, field
+
+import httpx
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,7 +31,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.x509.oid import ExtensionOID
 
-from ..config import settings
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
 # 这些运营商在国内机房通常可达；排序时优先
 PREFERRED_OPERATORS = ("DigiCert", "Cloudflare", "Sectigo", "TrustAsia")
 
-UA = "Mozilla/5.0 (compatible; silver-sentinel/1.0; +https://github.com/stellarissss/silver-sentinel)"
+# UA 由 opsec 统一分配：同一目标稳定、跨目标不同，且不含任何项目标识
 
 
 @dataclass(slots=True)
@@ -79,9 +80,38 @@ class CertObservation:
 
 
 def _http_json(url: str, timeout: float = 25.0) -> Any:
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read() or b"null")
+    """统一走 OPSEC 闸门：不自报身份、按策略选出口、失败转 OSError 便于降级。"""
+    from ..opsec import EgressBlocked, get_guard
+
+    guard = get_guard()
+    try:
+        guard.preflight(url)
+    except EgressBlocked as exc:
+        raise OSError(str(exc)) from exc
+    kwargs: dict[str, Any] = {
+        "timeout": timeout,
+        "follow_redirects": True,
+        "headers": guard.headers_for(url),
+    }
+    proxy = guard.proxy_for(url)
+    if proxy:
+        kwargs["proxy"] = proxy
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            with httpx.Client(**kwargs) as client:
+                resp = client.get(url)
+                if resp.status_code == 200:
+                    return resp.json()
+                # 429/5xx 是 CT 日志的常态限流，退避后重试；4xx 其余直接失败
+                if resp.status_code not in {429, 500, 502, 503, 504}:
+                    raise OSError(f"HTTP {resp.status_code}")
+                last = OSError(f"HTTP {resp.status_code}")
+        except (httpx.HTTPError, ValueError) as exc:
+            last = exc
+        if attempt < 2:
+            time.sleep(1.5 * (2**attempt) + random.uniform(0, 0.5))
+    raise OSError(str(last or "请求失败"))
 
 
 def fetch_usable_logs(limit: int = 6, timeout: float = 8.0) -> list[str]:
@@ -374,7 +404,7 @@ class CTLogFollower:
         }
 
     def catch_up(self, emit: Callable[[list[CertObservation]], None], *,
-                 max_batches: int = 60, budget: float = 20.0, parallel: int = 6) -> int:
+                 max_batches: int = 60, budget: float = 20.0, parallel: int = 8) -> int:
         """在时间预算内连续取多页，把积压啃完。
 
         两个必须并行的地方：
@@ -418,7 +448,8 @@ class CTLogFollower:
                     except Exception:  # noqa: BLE001
                         entries = []
                     if not entries:
-                        break
+                        # 单页被限流/超时只跳过这一页，别把整轮追平也一起放弃
+                        continue
                     obs = self._to_observations(entries, base)
                     self.index = base + len(entries)
                     self._save()

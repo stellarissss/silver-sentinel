@@ -43,6 +43,20 @@ def _discover_running() -> bool:
         return False
 
 
+def _opsec_summary() -> dict[str, Any]:
+    try:
+        from . import opsec
+
+        info = opsec.status()
+        return {
+            "enabled": info["enabled"],
+            "proxies": info["proxy_count"],
+            "egress": "proxy" if info["proxy_count"] else ("direct-degraded" if settings.opsec_allow_direct else "blocked"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"enabled": False, "error": str(exc)}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     import os
@@ -72,6 +86,12 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             get_replica().start()
         except Exception as exc:  # noqa: BLE001
             logger.warning("副本启动失败：%s", exc)
+        try:
+            from .vault import get_vault
+
+            get_vault().start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("证据仓同步启动失败：%s", exc)
 
     if os.environ.get("SILVER_AUTOSTART_MONITOR", "0").strip() in {"1", "true", "yes"}:
         from .monitor import start_background
@@ -170,8 +190,51 @@ def health() -> dict[str, Any]:
         "capabilities": settings.capability_report(),
         "discover_running": _discover_running(),
         "evidence_chain": chain,
+        "opsec": _opsec_summary(),
         "rules": {"count": len(load_ruleset().rules), "version": load_ruleset().version},
     }
+
+
+@app.get("/api/opsec")
+def opsec_status() -> dict[str, Any]:
+    """出站防护状态：是否隔离、代理数量、脱敏了多少标识。"""
+    from . import opsec
+
+    return opsec.status()
+
+
+def _vault_status() -> dict[str, Any]:
+    from .vault import VaultError, get_vault
+
+    if not settings.vault_enabled:
+        return {"enabled": False, "reason": "SILVER_VAULT_ENABLED=0"}
+    try:
+        return get_vault().status()
+    except VaultError as exc:
+        return {"enabled": True, "error": str(exc)}
+
+
+@app.get("/api/vault")
+def vault_status() -> dict[str, Any]:
+    return _vault_status()
+
+
+@app.post("/api/vault/sync")
+def vault_sync() -> dict[str, Any]:
+    from .vault import get_vault
+
+    if not settings.vault_enabled:
+        raise HTTPException(400, "证据仓未启用")
+    return get_vault().sync_once()
+
+
+@app.post("/api/vault/verify")
+def vault_verify() -> dict[str, Any]:
+    from .vault import get_vault
+
+    if not settings.vault_enabled:
+        raise HTTPException(400, "证据仓未启用")
+    return get_vault().verify()
 
 
 @app.get("/api/stats")

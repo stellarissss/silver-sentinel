@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -404,6 +405,89 @@ def cmd_replica(args) -> int:
     return 0 if result.get("ok", True) else 1
 
 
+
+
+def cmd_vault(args) -> int:
+    """加密证据仓：初始化、固化、拉取、校验、导出账本。"""
+    from .vault import VaultError, get_vault
+
+    init_db()
+    vault = get_vault()
+    action = args.action
+
+    if action == "init":
+        existing = vault.keys.path
+        if existing.is_file() and not args.force:
+            print(f"密钥已存在：{existing}（确需重建请加 --force，旧密文将无法解密）")
+            return 1
+        key = vault.keys.create(args.passphrase or settings.vault_passphrase)
+        print(json.dumps({
+            "ok": True,
+            "node": vault.node_id,
+            "key_file": str(existing),
+            "key_id": vault.keys.key_id,
+            "key_b64": __import__("base64").b64encode(key).decode(),
+            "notice": "请离线备份上方 key_b64；丢失后所有密文不可恢复，泄露则等于证据公开。",
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    if action == "status":
+        print(json.dumps(vault.status(), ensure_ascii=False, indent=2))
+        return 0
+
+    if action == "push":
+        result = vault.push(limit=args.limit)
+    elif action == "pull":
+        result = vault.pull(limit=args.limit)
+    elif action == "sync":
+        result = vault.sync_once()
+    elif action == "verify":
+        result = vault.verify(deep=not args.fast)
+    elif action == "export":
+        if not args.out:
+            print("需要 --out 指定导出目录")
+            return 2
+        result = vault.export_ledger(args.out)
+    elif action == "import":
+        if not args.src:
+            print("需要 --src 指定账本目录")
+            return 2
+        result = vault.import_ledger(args.src)
+    else:
+        print(f"未知操作：{action}")
+        return 2
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok", True) else 1
+
+
+def cmd_opsec(args) -> int:
+    """出站防护自检：分类、脱敏、当前出口状态。"""
+    from .opsec import get_guard, redact_obj, status
+
+    guard = get_guard()
+    if args.action == "status":
+        print(json.dumps(status(), ensure_ascii=False, indent=2))
+        return 0
+    if args.action == "check":
+        if not args.value:
+            print("需要提供 URL")
+            return 2
+        try:
+            kind = guard.preflight(args.value)
+            result = {"url": args.value, "class": kind, "proxy": guard.proxy_for(args.value)}
+        except Exception as exc:  # noqa: BLE001
+            result = {"url": args.value, "blocked": True, "reason": str(exc)}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.action == "redact":
+        text = args.value or ""
+        print(json.dumps(redact_obj(text), ensure_ascii=False, indent=2))
+        return 0
+    return 2
+
+
+
 def cmd_ops(args) -> int:  # noqa: ARG001
     """一眼看全：能力降级、发现吞吐、待办积压、证据完整性。"""
     from .core.eventlog import EventLog
@@ -422,6 +506,30 @@ def cmd_ops(args) -> int:  # noqa: ARG001
     with session_scope() as session:
         campaigns = session.query(Campaign).count()
 
+    from . import opsec
+    from .vault import VaultError, get_vault
+
+    # 本命令是独立进程：直接调 get_engine() 只会拿到一个刚创建的空引擎。
+    # 若要查看常驻服务，设置 SILVER_API_URL 让它去读运行中进程的真实状态。
+    live: dict = {}
+    api_base = os.environ.get("SILVER_API_URL", "").rstrip("/")
+    if api_base:
+        import urllib.request
+
+        for name, path in (("discover", "/api/discover/status"), ("vault", "/api/vault")):
+            try:
+                with urllib.request.urlopen(f"{api_base}{path}", timeout=3) as resp:
+                    live[name] = json.loads(resp.read())
+            except Exception:  # noqa: BLE001
+                pass
+
+    vault_info: dict = {"enabled": settings.vault_enabled}
+    if settings.vault_enabled:
+        try:
+            vault_info = get_vault().status()
+        except VaultError as exc:
+            vault_info["error"] = str(exc)
+
     info = {
         "capabilities": settings.capability_report(),
         "db": db_stats(),
@@ -429,6 +537,10 @@ def cmd_ops(args) -> int:  # noqa: ARG001
         "discover": get_engine().status()["stats"],
         "graph": get_graph().stats(),
         "campaigns": campaigns,
+        "opsec": opsec.status(),
+        "vault": vault_info,
+        "live": live,
+        "note": "discover 字段来自本进程；常驻服务状态请设 SILVER_API_URL 或直接请求 /api/discover/status",
     }
     print(json.dumps(info, ensure_ascii=False, indent=2))
     return 0
@@ -520,6 +632,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", choices=["sync", "status", "restore"])
     p.add_argument("--with-db", action="store_true", help="同时同步数据库快照")
     p.set_defaults(func=cmd_replica)
+
+    p = sub.add_parser("vault", help="加密证据仓：固化、拉取、校验、导出账本")
+    p.add_argument("action", choices=["init", "status", "push", "pull", "sync", "verify", "export", "import"])
+    p.add_argument("--out", help="export 的目标目录")
+    p.add_argument("--src", help="import 的账本目录")
+    p.add_argument("--limit", type=int, default=500, help="单次最多处理多少条")
+    p.add_argument("--passphrase", help="init 时用口令派生密钥（留空则随机生成）")
+    p.add_argument("--force", action="store_true", help="init 时覆盖已有密钥（危险）")
+    p.add_argument("--fast", action="store_true", help="verify 只校验账本链，不解密抽样")
+    p.set_defaults(func=cmd_vault)
+
+    p = sub.add_parser("opsec", help="出站防护：状态 / 分类检查 / 脱敏")
+    p.add_argument("action", choices=["status", "check", "redact"])
+    p.add_argument("value", nargs="?")
+    p.set_defaults(func=cmd_opsec)
 
     p = sub.add_parser("ops", help="运维总览：能力降级、积压、证据完整性")
     p.set_defaults(func=cmd_ops)
