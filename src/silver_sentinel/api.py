@@ -108,7 +108,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         pass
 
 
-app = FastAPI(title="银发哨兵", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="银发哨兵", version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 
@@ -167,7 +167,9 @@ app.include_router(extra_router)
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse("index.html", {"request": request, "version": __version__})
+    # Starlette ≥0.29 的新签名：request 在前，模板名在后。
+    # 旧写法 ("index.html", {...}) 在新版里会把 dict 当模板名，触发 unhashable。
+    return templates.TemplateResponse(request, "index.html", {"version": __version__})
 
 
 # ---------------------------------------------------------------- 接口

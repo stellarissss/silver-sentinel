@@ -19,6 +19,19 @@ def test_health_reports_engine_state(fresh_db):
     assert data["network"] is False
 
 
+def test_index_page_renders(fresh_db):
+    """首页必须真的能渲染。
+
+    这条用例是为一个真实事故补的：Starlette 0.29 改了 TemplateResponse 的签名，
+    旧写法 ("index.html", {...}) 会把 dict 当模板名，线上表现为首页 500，
+    而 API 全部正常——只看接口健康检查是发现不了的。
+    """
+    with _client() as c:
+        resp = c.get("/")
+    assert resp.status_code == 200
+    assert "银发哨兵" in resp.text
+
+
 def test_scan_endpoint_returns_explainable_result(fresh_db):
     with _client() as c:
         resp = c.post(

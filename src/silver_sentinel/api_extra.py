@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 
+from . import __version__
 from .config import settings
 from .core.bus import bus
 from .core.eventlog import get_log
@@ -332,9 +333,10 @@ def ops_status() -> dict[str, Any]:
     from .db import db_stats
 
     return {
-        "version": "1.0.0",
+        "version": __version__,
         "capabilities": settings.capability_report(),
-        "data_dir": str(settings.data_dir),
+        # 运维页只显示相对标识：绝对路径属于基础设施信息，不该出现在界面/截图里
+        "data_dir": "data/",
         "discover": {"running": eng.status()["running"], "stats": eng.status()["stats"]},
         "scheduler": sched.status(),
         "graph": graph_info,
