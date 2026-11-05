@@ -81,6 +81,10 @@ class WebObservation:
     status: int = 0
     title: str = ""
     text: str = ""
+    # 原始快照：HTML 原文与首屏截图。它们是「当时页面长什么样」的唯一凭据，
+    # 页面明天改版就再也拿不回来了，必须原样固化。
+    html: str = ""
+    screenshot: bytes = b""
     html_len: int = 0
     redirects: list[dict[str, Any]] = field(default_factory=list)
     requests: list[dict[str, Any]] = field(default_factory=list)
@@ -103,6 +107,7 @@ class WebObservation:
             "title": self.title[:200],
             "text": self.text[:20000],
             "html_len": self.html_len,
+            "screenshot_bytes": len(self.screenshot),
             "redirects": self.redirects[:30],
             "requests": self.requests[:200],
             "forms": self.forms[:20],
@@ -288,9 +293,15 @@ class WebSandbox:
                 obs.text = ""
             try:
                 html = page.content()
+                obs.html = html
                 obs.html_len = len(html)
             except Exception:  # noqa: BLE001
                 html = ""
+            # 截图放在最后：等 JS 渲染与跳转都结束，截到的才是受害者看到的那一屏
+            try:
+                obs.screenshot = page.screenshot(full_page=False, type="png", animations="disabled")
+            except Exception as exc:  # noqa: BLE001
+                log.debug("截图失败：%s", exc)
             # 表单：只看 action 与字段名，不看用户填什么（也没有用户）
             try:
                 obs.forms = page.evaluate(

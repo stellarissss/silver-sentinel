@@ -83,7 +83,9 @@ class GraphBuilder:
         for ns in _as_list(facts.get("nameservers")):
             self._link(("domain", value), ("asn", ns), "HOSTED_ON")
 
-        cert_fp = facts.get("cert_fingerprint") or meta.get("cert_fingerprint")
+        # 证书指纹是同一团伙最强的关联证据：一张证书签过的域名，几乎必然同源。
+        # 优先读资产列（CT 发现时写入），再退回 meta/facts 里的旧字段。
+        cert_fp = asset.fingerprint or facts.get("cert_fingerprint") or meta.get("cert_fingerprint")
         if cert_fp and not infra:
             self._link(("domain", value), ("cert", cert_fp), "HAS_CERT")
 

@@ -11,9 +11,51 @@ import unicodedata
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 # 常见二级公共后缀，用于取「可注册域名」
+# 两级公共后缀：不做归并会出大事故（x.co.za 和 y.co.za 会被当成同一个站）。
+# 这里取「常见 + 中国相关」的集合；冷门后缀宁可少归并，也不要把不同主体并成一个。
 TWO_LEVEL_SUFFIXES = {
-    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
-    "co.uk", "org.uk", "co.jp", "com.hk", "com.tw", "com.sg",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn", "mil.cn",
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+    "com.hk", "org.hk", "net.hk", "edu.hk", "gov.hk",
+    "com.tw", "org.tw", "net.tw", "edu.tw", "gov.tw",
+    "com.mo", "edu.mo", "gov.mo",
+    "com.sg", "edu.sg", "gov.sg",
+    "com.br", "net.br", "org.br", "gov.br", "edu.br",
+    "co.za", "org.za", "gov.za", "net.za",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "co.nz", "org.nz", "govt.nz",
+    "co.kr", "or.kr", "go.kr", "ne.kr",
+    "com.my", "gov.my", "edu.my",
+    "co.id", "or.id", "go.id", "ac.id",
+    "co.th", "or.th", "go.th", "ac.th",
+    "com.vn", "gov.vn", "edu.vn",
+    "com.ph", "gov.ph", "edu.ph",
+    "com.pk", "gov.pk", "edu.pk",
+    "com.sa", "gov.sa", "edu.sa",
+    "com.tr", "gov.tr", "edu.tr",
+    "com.ar", "gov.ar", "edu.ar",
+    "com.mx", "gob.mx", "edu.mx",
+    "com.co", "gov.co", "edu.co",
+    "com.pe", "gob.pe", "edu.pe",
+    "com.ua", "gov.ua", "edu.ua",
+    "com.pl", "gov.pl", "edu.pl",
+    "com.ru", "gov.ru", "edu.ru",
+    "com.es", "gob.es", "edu.es",
+    "co.il", "gov.il", "ac.il",
+    "com.eg", "gov.eg", "edu.eg",
+    "com.ng", "gov.ng", "edu.ng",
+    "co.ke", "go.ke", "ac.ke",
+}
+
+# 可以安全按「末两级」取注册域的后缀；不在表里的国别后缀宁可不归并
+_SIMPLE_TLDS = {
+    "cn", "com", "net", "org", "top", "xyz", "cc", "info", "app", "dev", "cloud",
+    "site", "online", "shop", "vip", "club", "live", "work", "ink", "fun", "icu",
+    "buzz", "cyou", "ltd", "store", "tech", "space", "website", "host", "press",
+    "link", "pro", "biz", "me", "tv", "io", "co", "ai", "so", "ws", "mobi",
+    "asia", "art", "design", "today", "life", "world", "group", "email", "digital",
+    "pub", "run", "sh", "one", "page", "news", "blog", "fit", "best", "life",
 }
 
 TRACKING_PARAMS = {
@@ -43,7 +85,9 @@ FREE_HOSTING_SUFFIXES = (
 SHARED_INFRA_SUFFIXES = (
     ".amazonaws.com", ".cloudfront.net", ".elb.amazonaws.com",
     ".azurewebsites.net", ".azureedge.net", ".blob.core.windows.net", ".cloudapp.azure.com",
-    ".snowflake.com", ".snowflakecomputing.com",
+    ".snowflake.com", ".snowflake.app", ".snowflakecomputing.com",
+    # 设备/平台的「每账号一个随机子域」：名字里带 mz/gk 纯属巧合
+    ".viam.cloud", ".myvolumio.org", ".ccaiplatform.com", ".aws.dev",
     ".googleusercontent.com", ".appspot.com", ".run.app", ".web.app",
     ".aliyuncs.com", ".oss-cn-hangzhou.aliyuncs.com", ".myqcloud.com", ".cos.ap-shanghai.myqcloud.com",
     ".qiniucdn.com", ".bcebos.com", ".jdcloud.com", ".ctyunxs.cn",
@@ -51,6 +95,7 @@ SHARED_INFRA_SUFFIXES = (
     ".onrender.com", ".railway.app", ".render.com", ".now.sh",
     ".notion.site", ".framer.app", ".webflow.io", ".wixsite.com", ".godaddysites.com",
     ".myshopify.com", ".gitlab.io", ".bitbucket.io", ".sourceforge.io",
+    ".pages.dev", ".netlify.app", ".vercel.app", ".azurestaticapps.net", ".github.io",
 )
 
 # 未备案/低成本注册常见 TLD，用作弱信号，不作单独判定
@@ -155,6 +200,31 @@ def registrable_domain(host: str) -> str:
     if ".".join(labels[-2:]) in TWO_LEVEL_SUFFIXES:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:])
+
+
+# 免费二级域平台：骗子正是用「平台域 + 自己起的名字」来落地，
+# 归并到平台域等于把线索扔了，所以这类只保留完整主机名。
+NO_COLLAPSE_SUFFIXES = (
+    ".duckdns.org", ".dpdns.org", ".ddns.net", ".no-ip.org", ".hopto.org",
+    ".zapto.org", ".serveo.net", ".ngrok.io", ".ngrok-free.app",
+    ".trycloudflare.com", ".localtunnel.me", ".us.kg", ".eu.org",
+    ".blogspot.com", ".wordpress.com", ".wixsite.com", ".framer.app",
+)
+
+
+def collapse_host(host: str) -> str:
+    """把主机归并到注册域；后缀不可识别时原样返回，避免把不同主体并成一个。
+
+    这是「宁可少归并」的取舍：并错了会把两个无关团伙焊在一起，
+    比多留几条资产严重得多。
+    """
+    if _suffix_hit(host, NO_COLLAPSE_SUFFIXES):
+        return host
+    apex = registrable_domain(host)
+    labels = apex.split(".")
+    if len(labels) == 2 and labels[1] not in _SIMPLE_TLDS:
+        return host
+    return apex
 
 
 def tld_of(host: str) -> str:

@@ -116,6 +116,18 @@ rules:
     detail: 境内提供服务的网站/应用未履行 ICP 备案，属违规运营。
     cite: 《互联网信息服务管理办法》
 
+  - id: ICP-001
+    category: reputation
+    title: 列入工信部违法违规名单
+    weight: 34
+    confidence: 0.95
+    when:
+      fact: icp_violation
+      op: eq
+      value: listed
+    detail: 工信部备案系统「违法违规域名查询」已将该域名列管，属官方定性依据。
+    cite: 工信部 ICP/IP地址/域名信息备案管理系统 · 违法违规域名查询
+
   - id: DIST-003
     category: distribution
     title: 域名注册时间过短

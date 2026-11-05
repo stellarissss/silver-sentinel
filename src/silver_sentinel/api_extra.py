@@ -331,10 +331,12 @@ def ops_status() -> dict[str, Any]:
 
     log = get_log()
     from .db import db_stats
+    from .enrich.icp import get_icp
 
     return {
         "version": __version__,
         "capabilities": settings.capability_report(),
+        "icp": get_icp().status(),
         # 运维页只显示相对标识：绝对路径属于基础设施信息，不该出现在界面/截图里
         "data_dir": "data/",
         "discover": {"running": eng.status()["running"], "stats": eng.status()["stats"]},

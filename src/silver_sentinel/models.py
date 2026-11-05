@@ -93,6 +93,9 @@ class Asset(Base):
     icp_status: Mapped[str] = mapped_column(String(24), default="unknown")
     icp_license: Mapped[str] = mapped_column(String(80), default="")
     icp_entity: Mapped[str] = mapped_column(String(200), default="")
+    # 工信部违法违规名单：listed | clean | unknown。比「有无备案」更强的官方信号
+    icp_violation: Mapped[str] = mapped_column(String(16), default="unknown")
+    icp_violation_title: Mapped[str] = mapped_column(String(200), default="")
     icp_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     first_seen: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
@@ -285,6 +288,8 @@ class ICPCache(Base):
     license: Mapped[str] = mapped_column(String(80), default="")
     entity: Mapped[str] = mapped_column(String(200), default="")
     nature: Mapped[str] = mapped_column(String(40), default="")
+    violation: Mapped[str] = mapped_column(String(16), default="unknown")
+    violation_title: Mapped[str] = mapped_column(String(200), default="")
     raw: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     checked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 

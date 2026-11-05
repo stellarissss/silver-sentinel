@@ -101,6 +101,8 @@ class Settings:
     discover_cold_retention_days: int = 180
     # 每轮发现最多入队多少条待研判（防止一次 CT 风暴打爆队列）
     discover_queue_capacity: int = 50000
+    # 同一注册域下的多主机是否归并成一个资产（主机清单留在 meta.hosts）
+    discover_collapse_subdomains: bool = True
 
     # ---------------------------------------------------------------- ICP 备案
     icp_enabled: bool = True
@@ -110,6 +112,8 @@ class Settings:
     # 每分钟最多查询次数。工信部接口对频率敏感，无节制会触发封禁
     icp_rate_per_minute: int = 10
     icp_cache_days: int = 30
+    # 是否同时查工信部「违法违规域名」名单（多一次请求，但换来官方定性信号）
+    icp_violation_check: bool = True
     # 只对这些分级的目标查询备案，避免无差别扫描
     icp_tiers: str = "candidate,watch,confirmed"
 
@@ -242,12 +246,16 @@ class Settings:
         self.discover_min_keyword_hits = _int("SILVER_DISCOVER_MIN_HITS", self.discover_min_keyword_hits)
         self.discover_cold_retention_days = _int("SILVER_COLD_RETENTION_DAYS", self.discover_cold_retention_days)
         self.discover_queue_capacity = _int("SILVER_DISCOVER_QUEUE", self.discover_queue_capacity)
+        self.discover_collapse_subdomains = _bool(
+            "SILVER_DISCOVER_COLLAPSE_SUBDOMAINS", self.discover_collapse_subdomains
+        )
 
         self.icp_enabled = _bool("SILVER_ICP_ENABLED", True)
         self.icp_api_base = _str("SILVER_ICP_API", "").rstrip("/")
         self.icp_timeout = _float("SILVER_ICP_TIMEOUT", self.icp_timeout)
         self.icp_rate_per_minute = _int("SILVER_ICP_RPM", self.icp_rate_per_minute)
         self.icp_cache_days = _int("SILVER_ICP_CACHE_DAYS", self.icp_cache_days)
+        self.icp_violation_check = _bool("SILVER_ICP_VIOLATION", self.icp_violation_check)
         self.icp_tiers = _str("SILVER_ICP_TIERS", self.icp_tiers)
 
         self.graph_enabled = _bool("SILVER_GRAPH_ENABLED", True)
@@ -364,7 +372,18 @@ class Settings:
             "ct_stream": self.ct_stream_enabled and self.allow_network,
             "icp": self.icp_ready,
             "graph": "neo4j" if self.neo4j_ready else ("builtin" if self.graph_enabled else "off"),
-            "sandbox_web": self.sandbox_enabled and self.sandbox_browser_enabled,
+            # 配了浏览器但没有隔离出口，实际一次也跑不起来（fail-closed），
+            # 报 true 就是自欺：运维页必须显示「有能力但被出口卡住」。
+            "sandbox_web": (
+                self.sandbox_enabled
+                and self.sandbox_browser_enabled
+                and (self.egress_isolated or self.opsec_allow_direct)
+            ),
+            "sandbox_web_blocked_by": (
+                "" if (self.egress_isolated or self.opsec_allow_direct) else "no-proxy"
+            )
+            if (self.sandbox_enabled and self.sandbox_browser_enabled)
+            else "",
             "sandbox_apk": "mobsf" if self.mobsf_ready else ("emulator" if self.android_serial else "static-only"),
             "replica": self.replica_backend if self.replica_enabled else "off",
             "vault": "off" if not self.vault_enabled else (self.vault_backend if self.vault_target else "unconfigured"),

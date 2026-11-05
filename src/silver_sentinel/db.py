@@ -79,8 +79,14 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("icp_status", "VARCHAR(24) DEFAULT 'unknown'"),
         ("icp_license", "VARCHAR(80) DEFAULT ''"),
         ("icp_entity", "VARCHAR(200) DEFAULT ''"),
+        ("icp_violation", "VARCHAR(16) DEFAULT 'unknown'"),
+        ("icp_violation_title", "VARCHAR(200) DEFAULT ''"),
         ("icp_checked_at", "DATETIME"),
         ("enrich_count", "INTEGER DEFAULT 0"),
+    ],
+    "icp_cache": [
+        ("violation", "VARCHAR(16) DEFAULT 'unknown'"),
+        ("violation_title", "VARCHAR(200) DEFAULT ''"),
     ],
 }
 

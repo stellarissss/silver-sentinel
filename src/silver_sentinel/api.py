@@ -239,6 +239,16 @@ def vault_verify() -> dict[str, Any]:
     return get_vault().verify()
 
 
+@app.get("/api/icp")
+def icp_status() -> dict[str, Any]:
+    """备案查询的实时状态：可用性、限速、缓存命中与违规命中数。"""
+    from .enrich.icp import get_icp
+
+    info = get_icp().status()
+    info["configured"] = settings.icp_ready
+    return info
+
+
 @app.get("/api/stats")
 def stats() -> dict[str, Any]:
     with session_scope() as session:

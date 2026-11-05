@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "silver-sentinel"
-version = "1.1.0"
+version = "1.2.0"
 description = "银发哨兵：涉老诈骗的持续发现、动态取证、图谱归因与处置闭环"
 readme = "README.md"
 requires-python = ">=3.11"

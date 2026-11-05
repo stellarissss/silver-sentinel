@@ -32,7 +32,7 @@ function renderDiscoverKpis(status, kpi) {
     { label: "入候选池", value: fmtNum(s.queued), hint: "已落库待研判" },
     { label: "待写队列", value: fmtNum(status.pending), hint: "内存缓冲" },
     { label: "词库规模", value: fmtNum(lib.terms), hint: `${(lib.by_cluster && Object.keys(lib.by_cluster).length) || 0} 个语义簇` },
-    { label: "发现速率", value: `${s.rate_per_min || 0}/分`, hint: "入池速度" },
+    { label: "证书吞吐", value: `${s.certs_per_min || 0}/分`, hint: `入池 ${s.assets_per_min || 0}/分` },
   ];
   const el = $("#discover-kpis");
   if (!el) return;

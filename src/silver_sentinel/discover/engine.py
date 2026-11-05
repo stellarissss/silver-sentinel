@@ -37,6 +37,7 @@ from typing import Any, Iterable
 from sqlalchemy import select
 
 from ..config import settings
+from ..normalize import collapse_host
 from ..core.bus import bus
 from ..core.eventlog import emit
 from ..db import session_scope
@@ -75,7 +76,11 @@ class DiscoverStats:
             "cold": self.cold,
             "db_errors": self.db_errors,
             "uptime_seconds": round(uptime, 1),
-            "rate_per_min": round(self.queued / uptime * 60, 1),
+            # 这两个数以前混在一起叫 rate_per_min，显示成 1.7/分，
+            # 看起来像「系统几乎没在工作」——其实那是入池速度，不是采集速度。
+            "certs_per_min": round(self.seen / uptime * 60, 1),
+            "assets_per_min": round(self.queued / uptime * 60, 1),
+            "rate_per_min": round(self.seen / uptime * 60, 1),
         }
 
 
@@ -238,26 +243,36 @@ class DiscoveryEngine:
     def _on_ct_batch(self, observations: list[CertObservation]) -> None:
         for obs in observations:
             self.stats.seen += 1
-            domain = obs.domain.lower().strip(".")
-            if not domain or "." not in domain:
+            host = obs.domain.lower().strip(".")
+            if not host or "." not in host:
                 continue
-            if self.lib.is_whitelisted(domain):
+            if self.lib.is_whitelisted(host):
                 self.stats.whitelisted += 1
                 continue
-            result = self.lib.match_domain(domain)
+            # 一张证书常带 10~30 个 SAN，同一站点的 www/分中心/后台会各算一个资产：
+            # 实测 22 小时里 2,512 个主机只对应 1,251 个注册域，一半是重复。
+            # 归并到注册域，主机清单留在 meta.hosts，图里仍然能连到具体主机。
+            domain = collapse_host(host) if settings.discover_collapse_subdomains else host
+            if not domain:
+                continue
+            result = self.lib.match_domain(host)
             # 一个词都没命中 = 与我们的关注面无关，直接丢弃（这是唯一会丢的分支）
             if not result.hits and result.score < COLD_THRESHOLD:
                 self.stats.cold += 1
                 continue
+            # 只有「载体词」的域名（app./m./www. 这种前缀命中）价值为零：
+            # 一个 "app" 就把全世界的 app.xxx.com 收进来，等于没有筛选。
+            # 低于阈值一律算冷存，不入资产表——需要时还能从事件流水回放。
             if result.score < COLD_THRESHOLD:
-                # 命中了弱词但分不够：进冷存。仍然记录，将来有新证据可直接激活
                 self.stats.cold += 1
+                continue
             self.stats.matched += 1
             if not self.deduper.add(domain):
                 self.stats.duplicated += 1
                 continue
+            obs_host = host
             with self._pending_lock:
-                self.pending.append((obs, "domain", domain, result.score, result.terms))
+                self.pending.append((obs, "domain", domain, result.score, result.terms, obs_host))
 
     # ------------------------------------------------------------ DNS 探测
     def _dns_loop(self) -> None:
@@ -295,7 +310,8 @@ class DiscoveryEngine:
                     )
                     with self._pending_lock:
                         self.pending.append(
-                            (obs, "domain", domain, score, match.terms or [origin_map.get(domain, "")])
+                            (obs, "domain", domain, score,
+                             match.terms or [origin_map.get(domain, "")], domain)
                         )
                 log.info(
                     "DNS 探测：%d 个候选，%d 个已注册（累计存在 %d）",
@@ -321,7 +337,7 @@ class DiscoveryEngine:
             self.pending.clear()
         self._last_flush = time.time()
 
-        rows: list[tuple[CertObservation | None, str, str, float, list[str]]] = batch
+        rows = batch
         try:
             with session_scope() as session:
                 created = self._persist(session, rows)
@@ -336,7 +352,7 @@ class DiscoveryEngine:
         now = time.time()
         created = 0
         assets: list[dict[str, Any]] = []
-        for obs, kind, value, score, terms in rows:
+        for obs, kind, value, score, terms, host in rows:
             normalized = value
             existing = session.scalar(
                 select(Asset.id).where(Asset.kind == kind, Asset.normalized == normalized)
@@ -347,10 +363,20 @@ class DiscoveryEngine:
                 if asset is not None:
                     asset.last_seen = utcnow()
                     asset.enrich_count = (asset.enrich_count or 0) + 1
-                    if score > (asset.meta or {}).get("discover_hint", 0):
-                        meta = dict(asset.meta or {})
+                    meta = dict(asset.meta or {})
+                    changed = False
+                    if score > meta.get("discover_hint", 0):
                         meta["discover_hint"] = round(score, 3)
+                        changed = True
+                    hosts = meta.get("hosts") or []
+                    if host and host not in hosts and len(hosts) < 30:
+                        meta["hosts"] = hosts + [host]
+                        changed = True
+                    if changed:
                         asset.meta = meta
+                    # 证书指纹是同一团伙最强的关联证据，第一次拿到就记住
+                    if obs is not None and obs.fingerprint and not asset.fingerprint:
+                        asset.fingerprint = obs.fingerprint[:64]
                 session.add(
                     DiscoveryEvent(
                         source=obs.source if obs else "manual",
@@ -374,7 +400,8 @@ class DiscoveryEngine:
                 discovery_reason="、".join(terms[:6]),
                 score=0.0,
                 verdict="insufficient",
-                meta={"discover_hint": round(score, 3)},
+                fingerprint=(obs.fingerprint[:64] if obs is not None else ""),
+                meta={"discover_hint": round(score, 3), "hosts": [host] if host else []},
             )
             session.add(asset)
             session.flush()

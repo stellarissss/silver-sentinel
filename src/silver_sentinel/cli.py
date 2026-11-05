@@ -217,6 +217,89 @@ def cmd_health(args) -> int:  # noqa: ARG001
 # ---------------------------------------------------------------- 发现
 
 
+def _reconcile(args) -> int:
+    """按当前词库复算存量资产，把旧版子串匹配的误报降级。
+
+    为什么要做这一步：词库精度升级只影响「新发现」，已经躺在库里的
+    2,512 个资产仍然占着候选池与富化队列。默认只报告不写库（--apply 才改）。
+    """
+    from sqlalchemy import select
+
+    from .discover.keywords import get_library
+    from .domain import utcnow
+    from .normalize import collapse_host, is_shared_infra
+    from .models import TIER_DISMISSED
+
+    init_db()
+    lib = get_library()
+    with session_scope() as session:
+        rows = list(
+            session.scalars(
+                select(Asset).where(Asset.kind == "domain").order_by(Asset.score.desc())
+            ).all()
+        )
+        existing = {a.normalized for a in rows}
+
+        stats = {"total": len(rows), "no_keyword": 0, "shared_infra": 0, "subdomain_of_asset": 0,
+                 "kept": 0}
+        samples: dict[str, list[str]] = {"no_keyword": [], "shared_infra": [], "subdomain_of_asset": []}
+        plan: list[tuple[int, str]] = []
+        for asset in rows:
+            value = (asset.normalized or asset.value).lower()
+            if is_shared_infra(value):
+                stats["shared_infra"] += 1
+                plan.append((asset.id, "共享基础设施：平台分配的随机主机名，不构成目标"))
+                samples["shared_infra"].append(value)
+                continue
+            # 只对「靠词库命中进来的」做复核。DNS 探测与人工导入本来就可能
+            # 不含关键词（随机域名），拿词库去否定它们会误杀真线索。
+            if asset.discovery_source not in ("ct_poll", "certstream"):
+                stats["kept"] += 1
+                continue
+            if not lib.match_domain(value).hits:
+                stats["no_keyword"] += 1
+                plan.append((asset.id, "词库精度升级：旧版子串匹配误报，不含任何有效词根"))
+                samples["no_keyword"].append(value)
+                continue
+            apex = collapse_host(value)
+            if apex and apex != value and apex in existing:
+                stats["subdomain_of_asset"] += 1
+                plan.append((asset.id, f"同一注册域已有资产：{apex}"))
+                samples["subdomain_of_asset"].append(value)
+                continue
+            stats["kept"] += 1
+
+        if args.apply:
+            touched = 0
+            for asset_id, reason in plan:
+                asset = session.get(Asset, asset_id)
+                if asset is None or asset.tier == TIER_DISMISSED:
+                    continue
+                asset.tier = TIER_DISMISSED
+                asset.dismiss_reason = reason[:200]
+                asset.last_seen = utcnow()
+                # 子域降级前，先把主机名记到主资产上——证据不能因为归并而丢
+                if reason.startswith("同一注册域"):
+                    apex = collapse_host((asset.normalized or asset.value).lower())
+                    host_asset = session.scalar(
+                        select(Asset).where(Asset.kind == "domain", Asset.normalized == apex)
+                    )
+                    if host_asset is not None:
+                        meta = dict(host_asset.meta or {})
+                        hosts = meta.get("hosts") or []
+                        value = (asset.normalized or asset.value).lower()
+                        if value not in hosts and len(hosts) < 30:
+                            meta["hosts"] = hosts + [value]
+                            host_asset.meta = meta
+                touched += 1
+            stats["applied"] = touched
+
+    for key in ("no_keyword", "shared_infra", "subdomain_of_asset"):
+        stats[f"{key}_sample"] = samples[key][:8]
+    print(json.dumps({"ok": True, "dry_run": not args.apply, **stats}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_discover(args) -> int:
     """发现引擎的运维入口。
 
@@ -262,6 +345,9 @@ def cmd_discover(args) -> int:
             return 2
         print(json.dumps(get_engine().inject(values, note=args.note or ""), ensure_ascii=False))
         return 0
+
+    if args.action == "reconcile":
+        return _reconcile(args)
 
     if args.action == "search":
         terms = list(args.values or [])
@@ -358,6 +444,108 @@ def cmd_enrich(args) -> int:
         result = enrich_asset(args.asset_id, with_sandbox=args.sandbox)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok", True) else 1
+
+
+def cmd_icp(args) -> int:
+    """批量备案回填。
+
+    为什么单独做一条命令
+    --------------------
+    ICP 查询慢（验证码识别 1-30 秒不等）且对频率敏感，塞进每轮调度会把
+    整条富化队列拖住。正确的做法是离线补历史：服务照常跑，这条命令在
+    后台按分数从高到低把存量补齐，结果直接进缓存，服务下次研判自动复用。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from sqlalchemy import select
+
+    from .domain import utcnow
+    from .enrich.icp import get_icp
+    from .normalize import collapse_host, registrable_domain
+
+    init_db()
+    if not settings.icp_ready:
+        print(json.dumps({"ok": False, "error": "未配置 SILVER_ICP_API，先起 ICP_Query 再填地址"},
+                         ensure_ascii=False, indent=2))
+        return 2
+
+    tiers = tuple(args.tier.split(",")) if args.tier else tuple(settings.icp_tier_set)
+    with session_scope() as session:
+        stmt = (
+            select(Asset)
+            .where(Asset.kind.in_(("domain", "url")), Asset.icp_status == args.status)
+            .order_by(Asset.score.desc())
+            .limit(args.limit)
+        )
+        if tiers:
+            stmt = stmt.where(Asset.tier.in_(tiers))
+        rows = list(session.scalars(stmt).all())
+        pairs = [(a.id, collapse_host(a.normalized or a.value)) for a in rows]
+        # 一次性把「注册域 → 资产 id」建好：按域名再回表扫全库是 O(n²)，
+        # 两千多个资产就要几十万次行读，实战里会卡住。
+        by_domain: dict[str, list[int]] = {}
+        for asset in session.scalars(
+            select(Asset).where(Asset.kind.in_(("domain", "url")))
+        ).all():
+            key = collapse_host(asset.normalized or asset.value)
+            if key:
+                by_domain.setdefault(key, []).append(asset.id)
+
+    targets = list(dict.fromkeys(d for _id, d in pairs if d))
+    if not targets:
+        print(json.dumps({"ok": True, "targets": 0, "note": "没有待查目标"}, ensure_ascii=False))
+        return 0
+
+    client = get_icp()
+    started = time.time()
+    done = 0
+    tally: dict[str, int] = {}
+    listed: list[dict[str, str]] = []
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "targets": len(targets),
+                          "sample": targets[:10]}, ensure_ascii=False, indent=2))
+        return 0
+
+    def work(domain: str):
+        return domain, client.lookup(domain, use_cache=not args.refresh)
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [pool.submit(work, d) for d in targets]
+        for fut in as_completed(futures):
+            domain, res = fut.result()
+            done += 1
+            tally[res.status] = tally.get(res.status, 0) + 1
+            if res.violation == "listed":
+                listed.append({"domain": domain, "title": res.violation_title})
+            # 一个注册域可能对应多个主机资产，全部同步，避免下次重复查
+            if res.status != "unknown" and args.status == "unknown":
+                ids = by_domain.get(domain) or []
+                if ids:
+                    with session_scope() as session:
+                        for asset in session.scalars(
+                            select(Asset).where(Asset.id.in_(ids))
+                        ).all():
+                            asset.icp_status = res.status
+                            asset.icp_license = res.license or asset.icp_license
+                            asset.icp_entity = res.entity or asset.icp_entity
+                            asset.icp_checked_at = utcnow()
+                            if res.violation in ("listed", "clean"):
+                                asset.icp_violation = res.violation
+                                asset.icp_violation_title = res.violation_title
+            if done % 25 == 0:
+                elapsed = time.time() - started
+                print(f"  {done}/{len(targets)}  {elapsed:.0f}s  "
+                      f"{done / max(elapsed, 1) * 60:.0f}/min  {tally}", file=sys.stderr)
+
+    print(json.dumps({
+        "ok": True,
+        "targets": len(targets),
+        "elapsed_seconds": round(time.time() - started, 1),
+        "results": tally,
+        "listed": listed[:50],
+        "stats": client.stats,
+    }, ensure_ascii=False, indent=2))
+    return 0
 
 
 # ---------------------------------------------------------------- 证据与副本
@@ -593,13 +781,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("discover", help="发现引擎：CT 监控 / 词库 / 注入 / 历史补漏")
     p.add_argument(
         "action",
-        choices=["run", "status", "words", "inject", "search"],
-        help="run 常驻运行，status 看吞吐，words 看词库覆盖，inject 导入清单，search 翻 crt.sh 历史",
+        choices=["run", "status", "words", "inject", "search", "reconcile"],
+        help="run 常驻运行，status 看吞吐，words 看词库覆盖，inject 导入清单，"
+             "search 翻 crt.sh 历史，reconcile 按新词库复算存量",
     )
     p.add_argument("values", nargs="*", help="inject 的域名，或 search 的词根")
     p.add_argument("--file", help="从文件批量导入（每行一个域名，# 开头为注释）")
     p.add_argument("--note", help="导入备注，会写进发现流水")
     p.add_argument("--minutes", type=float, default=0, help="run 的时长（分钟），0 为常驻")
+    p.add_argument("--apply", action="store_true", help="reconcile 时真正写库（默认只报告）")
     p.set_defaults(func=cmd_discover)
 
     # ------------------------------------------------------------ 流水线与图
@@ -620,6 +810,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sandbox", action="store_true", help="允许进沙箱跑 APK")
     p.add_argument("--probe", action="store_true", help="跑一次真实网页抓取")
     p.set_defaults(func=cmd_enrich)
+
+    p = sub.add_parser("icp", help="批量备案回填（离线补历史，不阻塞调度）")
+    p.add_argument("--limit", type=int, default=2000)
+    p.add_argument("--tier", help="只查这些分级，逗号分隔，默认读 SILVER_ICP_TIERS")
+    p.add_argument("--status", default="unknown", help="只查该备案状态的资产（默认 unknown）")
+    p.add_argument("--workers", type=int, default=4, help="并发数；总速率仍受 SILVER_ICP_RPM 限制")
+    p.add_argument("--refresh", action="store_true", help="忽略缓存重新查")
+    p.add_argument("--dry-run", action="store_true", help="只列出将查询的域名")
+    p.set_defaults(func=cmd_icp)
 
     # ------------------------------------------------------------ 证据与副本
     p = sub.add_parser("log", help="事件日志：校验哈希链 / 看末尾")

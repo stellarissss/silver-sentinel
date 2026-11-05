@@ -27,6 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import func, or_, select
 
@@ -38,6 +39,13 @@ from .db import session_scope
 from .enrich.icp import get_icp
 from .enrich.registry import get_rdap
 from .graph.build import GraphBuilder
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
 from .graph.community import sync_campaigns
 from .intake import scan
 from .models import TIER_CANDIDATE, TIER_COLD, TIER_CONFIRMED, TIER_WATCH, Asset, TaskRun
@@ -165,6 +173,13 @@ def enrich_asset(asset_id: int, *, with_sandbox: bool = False) -> dict[str, Any]
                 from .domain import utcnow
 
                 asset.icp_checked_at = utcnow()
+            if icp_row.violation in ("listed", "clean"):
+                asset.icp_violation = icp_row.violation
+                asset.icp_violation_title = icp_row.violation_title
+                facts["icp_violation"] = icp_row.violation
+                if icp_row.violation_title:
+                    facts["icp_violation_title"] = icp_row.violation_title
+            out["icp"] = icp_row.as_dict()
         # 富化后重新分级：新证据可能把它从候选提到 watch
         decision = triage.apply(asset, facts=facts)
         out["tier"] = asset.tier
@@ -344,19 +359,47 @@ def probe_web(asset_id: int) -> dict[str, Any]:
             facts["blocked_requests"] = len(obs.blocked)
         if obs.error:
             facts["web_error"] = obs.error
+        if obs.requests:
+            hosts = sorted({_host_of(r.get("url", "")) for r in obs.requests if r.get("url")})
+            facts["page_third_party_hosts"] = [h for h in hosts if h][:15]
+            posts = [r["url"] for r in obs.requests if r.get("method", "GET").upper() not in ("GET", "HEAD", "OPTIONS")]
+            if posts:
+                # 表单外传地址是最能直接指向背后主体的运行时证据
+                facts["page_post_targets"] = posts[:10]
 
         meta["facts"] = facts
         meta["web_observation"] = {
             k: payload[k]
-            for k in ("final_url", "status", "title", "apk_links", "forms", "blocked", "elapsed", "engine")
+            for k in ("final_url", "status", "title", "apk_links", "forms", "blocked",
+                      "elapsed", "engine", "screenshot_bytes", "honeypot", "egress")
         }
         asset.meta = meta
 
-        # 页面正文进证据链
+        # 三种原始形态各存一份：正文给人看，HTML 给取证，截图给「当时长什么样」
         if obs.text:
             append_evidence(
                 s, asset_id, "page_text", obs.text.encode("utf-8")[:2_000_000],
                 note=f"页面正文快照 {url}"[:200], extension=".txt",
+            )
+        if obs.html:
+            append_evidence(
+                s, asset_id, "page_html", obs.html.encode("utf-8")[:8_000_000],
+                note=f"页面 HTML 原文 {obs.final_url or url}"[:200], extension=".html",
+            )
+        if obs.screenshot:
+            append_evidence(
+                s, asset_id, "screenshot", obs.screenshot,
+                note=f"首屏截图 {obs.final_url or url}"[:200], extension=".png",
+            )
+        if obs.requests:
+            import json as _json
+
+            append_evidence(
+                s, asset_id, "network", _json.dumps(
+                    {"url": url, "final_url": obs.final_url, "requests": obs.requests[:500]},
+                    ensure_ascii=False,
+                ).encode("utf-8")[:4_000_000],
+                note=f"运行时网络请求 {len(obs.requests)} 条"[:200], extension=".json",
             )
         triage.apply(asset, facts=facts)
         tier = asset.tier

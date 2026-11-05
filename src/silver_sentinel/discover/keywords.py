@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
 
@@ -69,7 +70,9 @@ CLUSTERS: dict[str, dict] = {
             "tmall", "pinduoduo", "jingdong", "unionpay", "icbc", "ccb",
             "abchina", "boc", "psbc", "cmb", "chinaunicom", "chinamobile",
             "chinatelecom", "sinopec", "cnpc", "stategrid", "chinapost",
-            "chinalife", "cctv", "xinhua", "people", "toutiao", "meituan",
+            # "people" 是英文常用名词，oceanpeople / purepeople / valuablepeople
+            # 这类正经站会被整批误判成「冒充人民日报」，实测一天 736 次。
+            "chinalife", "cctv", "xinhua", "toutiao", "meituan",
             "didi", "xiaomi", "huawei", "tencent", "alibaba", "baidu",
         ],
     },
@@ -164,9 +167,63 @@ ACRONYMS = {
     "gk": ("国科", "authority"),
 }
 
-_MIN_PINYIN_LEN = 5   # 少于 5 个字母的拼音词做子串匹配误报太多
-_LABEL_SPLIT = re.compile(r"[-_.0-9]+")
+_MIN_PINYIN_LEN = 4   # 4 个字母以下的拼音词误报太多；配合音节对齐后可放宽到 4
+_LABEL_SPLIT = re.compile(r"[-_.]+")
 _NON_ALNUM = re.compile(r"[^a-z]")
+_ALNUM = re.compile(r"[^a-z0-9]")
+_DIGITS = re.compile(r"\d")
+
+# ---------------------------------------------------------------- 音节切分
+# 为什么需要它：域名把拼音连写，"minge"（名额）会出现在
+# nadinejasmingeissbuehler 这种德语人名里——纯子串匹配必然误报。
+# 用 pypinyin 自带的音节表做一次 DP 切分，切不开的 label 直接不做拼音匹配。
+_SYLLABLES: frozenset[str] | None = None
+_syllable_lock = threading.Lock()
+
+
+def _syllables() -> frozenset[str]:
+    global _SYLLABLES
+    if _SYLLABLES is None:
+        with _syllable_lock:
+            if _SYLLABLES is None:
+                from pypinyin.constants import PINYIN_DICT
+                from pypinyin.contrib.tone_convert import to_normal
+
+                found: set[str] = set()
+                for value in PINYIN_DICT.values():
+                    for part in value.split(","):
+                        syllable = to_normal(part.strip()).strip()
+                        if syllable and syllable.isalpha():
+                            found.add(syllable)
+                _SYLLABLES = frozenset(found)
+    return _SYLLABLES
+
+
+@lru_cache(maxsize=16384)
+def _syllable_bounds(label: str) -> tuple[int, ...] | None:
+    """返回音节结束位置的集合；无法完整切分时返回 None。"""
+    syllables = _syllables()
+    n = len(label)
+    if n == 0 or n > 60:
+        return None
+    ok = [False] * (n + 1)
+    prev = [0] * (n + 1)
+    ok[0] = True
+    for i in range(n):
+        if not ok[i]:
+            continue
+        for j in range(i + 1, min(n, i + 6) + 1):
+            if label[i:j] in syllables and not ok[j]:
+                ok[j] = True
+                prev[j] = i
+    if not ok[n]:
+        return None
+    bounds: list[int] = []
+    cur = n
+    while cur > 0:
+        bounds.append(cur)
+        cur = prev[cur]
+    return tuple(sorted(bounds))
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +287,9 @@ class KeywordLibrary:
         self._by_pinyin: list[Term] = []
         self._pinyin_index: dict[str, Term] = {}
         self._cjk_index: dict[str, Term] = {}
+        # 英文词（people / wechat / douyin…）只认整段 label，不做子串：
+        # "oceanpeople.org" 不是在冒充人民日报，只是名字里有 people。
+        self._ascii_index: dict[str, Term] = {}
         self._build()
 
     def _build(self) -> None:
@@ -247,6 +307,8 @@ class KeywordLibrary:
                     weak_only=text in WEAK_ONLY,
                 )
                 self.terms.append(term)
+                if py.isalpha() and text.isascii() and len(text) >= 3:
+                    self._ascii_index[py] = term
                 if len(py) >= _MIN_PINYIN_LEN and py not in self._pinyin_index:
                     self._pinyin_index[py] = term
                     self._by_pinyin.append(term)
@@ -286,7 +348,17 @@ class KeywordLibrary:
         return result
 
     def match_domain(self, host: str) -> MatchResult:
-        """匹配域名。域名用拼音，因此转成纯字母后做子串匹配。"""
+        """匹配域名。
+
+        三条通道，精度依次降低、误报依次升高，所以分别设卡：
+        - 缩写：整段 label 恰好是缩写（或缩写+不超过 3 位数字，如 mz999）；
+        - 英文：整段 label 恰好是英文词（people / douyin / wechat）；
+        - 拼音：label 能完整切成音节，且命中正好落在音节边界上。
+
+        早期版本把整串 label 拼起来做子串匹配，22 小时里 2,512 个资产有一半
+        是 Snowflake 的随机主机名（-mz11195 / -gk68102）和德语人名（mingeiss），
+        纯粹在浪费富化配额。
+        """
         if not host:
             return MatchResult()
         host = host.lower().strip(".")
@@ -294,31 +366,63 @@ class KeywordLibrary:
 
         labels = [seg for seg in _LABEL_SPLIT.split(host) if seg]
         body = labels[:-1] if len(labels) > 1 else labels
-        compact = _NON_ALNUM.sub("", "".join(body))
-        if not compact:
+        if not body:
             return result
 
-        if self._pinyin_re is not None:
-            seen: set[str] = set()
-            for m in self._pinyin_re.finditer(compact):
-                token = m.group(0).lower()
-                if token in seen:
-                    continue
-                seen.add(token)
-                term = self._pinyin_index.get(token)
-                if term:
-                    result.hits.append(Hit(term.text, term.cluster, term.weight, "pinyin", "domain"))
-                    result.clusters.add(term.cluster)
+        for raw_label in body:
+            label = _ALNUM.sub("", raw_label)      # 保留数字，用于判断缩写后缀
+            alpha = _DIGITS.sub("", label)        # 去数字，用于英文/拼音
+            if not alpha:
+                continue
 
-        for label in body:
-            if label in ACRONYMS:
-                text, cluster = ACRONYMS[label]
-                weight = CLUSTERS[cluster]["weight"]
-                result.hits.append(Hit(text, cluster, weight, "acronym", "domain"))
-                result.clusters.add(cluster)
+            # 1) 缩写：整段就是缩写，或缩写后紧跟不超过 3 位数字（mz999 / gk8）。
+            #    机器生成的 mz11195 / gk68102 会被数字位数挡掉。
+            if len(alpha) >= 2 and alpha in ACRONYMS:
+                suffix = label[len(alpha):]
+                if suffix == "" or (suffix.isdigit() and len(suffix) <= 3):
+                    text, cluster = ACRONYMS[alpha]
+                    weight = CLUSTERS[cluster]["weight"]
+                    result.hits.append(Hit(text, cluster, weight, "acronym", "domain"))
+                    result.clusters.add(cluster)
+
+            # 2) 英文词：整段相等才算，绝不在长单词里找子串
+            term = self._ascii_index.get(alpha)
+            if term is not None:
+                result.hits.append(Hit(term.text, term.cluster, term.weight, "pinyin", "domain"))
+                result.clusters.add(term.cluster)
+                continue
+
+            # 3) 拼音：先确认能切成音节，再要求对齐
+            self._match_pinyin(alpha, result)
+
+        # 连字符/点分出来的多段，还要拼回去再匹配一次：
+        # yanglao-jijin.xyz 这种写法，「养老基金」跨了两个 label。
+        # 有了音节对齐，拼回去也不会把随机串拼成词。
+        if len(body) > 1:
+            self._match_pinyin("".join(_DIGITS.sub("", _ALNUM.sub("", b)) for b in body), result)
 
         self._finalize(result)
         return result
+
+    def _match_pinyin(self, text: str, result: MatchResult) -> None:
+        if not text or self._pinyin_re is None:
+            return
+        bounds = _syllable_bounds(text)
+        if bounds is None:
+            return
+        starts = {0, *bounds}
+        ends = set(bounds)
+        for m in self._pinyin_re.finditer(text):
+            if m.start() not in starts or m.end() not in ends:
+                continue
+            term = self._pinyin_index.get(m.group(0).lower())
+            if term is None:
+                continue
+            hit = Hit(term.text, term.cluster, term.weight, "pinyin", "domain")
+            if any(h.term == hit.term and h.form == hit.form for h in result.hits):
+                continue
+            result.hits.append(hit)
+            result.clusters.add(term.cluster)
 
     def match_any(self, host: str = "", text: str = "") -> MatchResult:
         """域名与文本合并判定。文本里出现机构词、域名里出现拼音，都算。"""

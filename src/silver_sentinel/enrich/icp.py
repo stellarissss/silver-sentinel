@@ -57,6 +57,11 @@ class ICPResult:
     license: str = ""
     entity: str = ""
     nature: str = ""
+    # 违法违规名单：listed | clean | unknown
+    # 这是工信部自己的黑名单，比「有没有备案」更强——备案了也可能被列管。
+    violation: str = "unknown"
+    violation_title: str = ""
+    black_level: int = -1
     detail: list[dict] = field(default_factory=list)
     error: str = ""
     from_cache: bool = False
@@ -68,6 +73,9 @@ class ICPResult:
             "license": self.license,
             "entity": self.entity,
             "nature": self.nature,
+            "violation": self.violation,
+            "violation_title": self.violation_title,
+            "black_level": self.black_level,
             "error": self.error,
             "from_cache": self.from_cache,
         }
@@ -97,7 +105,7 @@ def _iter_records(payload: Any) -> list[dict]:
     if not isinstance(payload, dict):
         return []
 
-    for key in ("data", "result", "results", "list", "records", "rows", "items"):
+    for key in ("data", "result", "results", "list", "records", "rows", "items", "params"):
         node = payload.get(key)
         if isinstance(node, list):
             return [r for r in node if isinstance(r, dict)]
@@ -108,6 +116,32 @@ def _iter_records(payload: Any) -> list[dict]:
                     return [r for r in inner if isinstance(r, dict)]
             return [node]
     return []
+
+
+def _payload_error(payload: Any) -> str:
+    """接口层失败与「查无此站」必须分开。
+
+    ICP_Query 正常返回 {code:200, success:true, params:{list:[...]}}；
+    风控、验证码打挂、上游维护时会给非 200 的 code 或 success=false。
+    这类响应如果按「空列表 = 未备案」处理，会把一次接口故障变成一批
+    「未备案」结论，直接污染研判与举报材料。
+    """
+    if not isinstance(payload, dict):
+        return "响应不是 JSON 对象"
+    if payload.get("success") is False:
+        code = payload.get("code")
+        msg = str(payload.get("msg") or "接口返回 success=false")[:120]
+        return f"code={code}：{msg}" if code is not None else msg
+    code = payload.get("code")
+    if code is not None:
+        try:
+            if int(code) not in (0, 200):
+                return f"接口返回 code={code}：{str(payload.get('msg') or '')[:80]}"
+        except (TypeError, ValueError):
+            return f"接口返回非数字 code={code!r}"
+    if "params" not in payload and "data" not in payload and "result" not in payload:
+        return "响应缺少 params/data 字段"
+    return ""
 
 
 class RateLimiter:
@@ -163,6 +197,8 @@ class ICPClient:
                     license=row.license,
                     entity=row.entity,
                     nature=row.nature,
+                    violation=getattr(row, "violation", "") or "unknown",
+                    violation_title=getattr(row, "violation_title", "") or "",
                     from_cache=True,
                 )
         except Exception:  # noqa: BLE001
@@ -181,6 +217,8 @@ class ICPClient:
                     row.license = res.license
                     row.entity = res.entity
                     row.nature = res.nature
+                    row.violation = res.violation
+                    row.violation_title = res.violation_title
                     row.checked_at = datetime.utcnow()
                 else:
                     session.add(
@@ -190,6 +228,8 @@ class ICPClient:
                             license=res.license,
                             entity=res.entity,
                             nature=res.nature,
+                            violation=res.violation,
+                            violation_title=res.violation_title,
                             checked_at=datetime.utcnow(),
                         )
                     )
@@ -243,30 +283,35 @@ class ICPClient:
         url = f"{self.base}/query/web?search={urllib.parse.quote(domain)}"
         res = ICPResult(domain=domain)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=settings.icp_timeout) as r:
-                payload = json.loads(r.read() or b"null")
-            records = _iter_records(payload)
-
-            if not records:
-                res.status = "unregistered"
+            payload = self._get(url)
+            failure = _payload_error(payload)
+            if failure:
+                # 关键区别：接口说「查完了没有」和接口自己出错，是两件事。
+                # 把后者当 unregistered 会让研判凭空变严，举报材料也会失实。
+                res.error = failure
+                res.status = "unknown"
             else:
-                # 只保留与本域名直接相关的记录，避免「按主体名搜索」带回一堆无关站点
-                matched = []
-                for row in records:
-                    row_domain = _pick(row, "domain").lower()
-                    if not row_domain or domain.lower() in row_domain or row_domain in domain.lower():
-                        matched.append(row)
-                if not matched:
+                records = _iter_records(payload)
+
+                if not records:
                     res.status = "unregistered"
                 else:
-                    best = matched[0]
-                    res.status = "registered"
-                    res.license = _pick(best, "license")
-                    res.entity = _pick(best, "entity")
-                    res.nature = _pick(best, "nature")
-                    res.detail = matched[:5]
-            res.error = ""
+                    # 只保留与本域名直接相关的记录，避免「按主体名搜索」带回一堆无关站点
+                    matched = []
+                    for row in records:
+                        row_domain = _pick(row, "domain").lower()
+                        if not row_domain or domain.lower() in row_domain or row_domain in domain.lower():
+                            matched.append(row)
+                    if not matched:
+                        res.status = "unregistered"
+                    else:
+                        best = matched[0]
+                        res.status = "registered"
+                        res.license = _pick(best, "license")
+                        res.entity = _pick(best, "entity")
+                        res.nature = _pick(best, "nature")
+                        res.detail = matched[:5]
+                    res.error = ""
         except urllib.error.HTTPError as exc:
             res.error = f"HTTP {exc.code}"
             if exc.code in (401, 403, 429):
@@ -275,12 +320,64 @@ class ICPClient:
         except Exception as exc:  # noqa: BLE001
             res.error = f"{type(exc).__name__}: {str(exc)[:100]}"
 
+        if res.status == "unknown" and not res.error:
+            res.error = "响应无法判定"
+
+        if settings.icp_violation_check and res.status != "unknown" and res.error == "":
+            if self.limiter.acquire(timeout=10.0):
+                viol = self._check_violation(domain)
+                res.violation = viol.get("violation", "unknown")
+                res.violation_title = viol.get("title", "")
+                res.black_level = int(viol.get("level", -1))
+
         with self._lock:
             self.stats["queried"] += 1
             self.stats[res.status] = self.stats.get(res.status, 0) + 1
+            if res.violation == "listed":
+                self.stats["violation"] = self.stats.get("violation", 0) + 1
         if res.status != "unknown":
             self._cache_put(res)
         return res
+
+    # ------------------------------------------------------------ 违法违规名单
+    def _check_violation(self, domain: str) -> dict[str, Any]:
+        """工信部「违法违规域名」查询。
+
+        blackListLevel 语义（见 ICP_Query 文档）：2 = 暂无违法违规信息，<2 = 有。
+        title 在命中时是处置标题。两者都拿不到就保持 unknown，不猜。
+        """
+        url = f"{self.base}/query/bweb?search={urllib.parse.quote(domain)}"
+        try:
+            payload = self._get(url)
+            if _payload_error(payload):
+                return {}
+            params = payload.get("params") if isinstance(payload, dict) else None
+            if not isinstance(params, dict):
+                return {}
+            level = params.get("blackListLevel")
+            title = str(params.get("title") or "").strip()
+            try:
+                level = int(level)
+            except (TypeError, ValueError):
+                level = -1
+            if level < 0:
+                return {}
+            listed = level < 2 or bool(title)
+            return {
+                "violation": "listed" if listed else "clean",
+                "title": title[:200],
+                "level": level,
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.debug("违法违规查询失败 %s：%s", domain, exc)
+            return {}
+
+    def _get(self, url: str) -> Any:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": UA, "Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=settings.icp_timeout) as r:
+            return json.loads(r.read() or b"null")
 
     def status(self) -> dict[str, Any]:
         return {
