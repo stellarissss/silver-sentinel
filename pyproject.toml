@@ -68,6 +68,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 silver_sentinel = ["rules/*.yaml", "data/*.yaml", "web/templates/*", "web/static/*"]
+# 12377 的类别树是运行时读的，漏了会在举报第一步就 FileNotFoundError
+"silver_sentinel.report" = ["data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
