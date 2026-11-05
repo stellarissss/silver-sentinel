@@ -418,6 +418,9 @@ class Settings:
                 else ("proxy" if self.egress_isolated else ("direct-degraded" if self.opsec_allow_direct else "blocked"))
             ),
             "llm": "ready" if self.llm_ready else "off",
+            # 举报是「服务端备料 + 浏览器代填」，本机随时可生成材料；
+            # 能不能一步跳到表单，取决于用户浏览器里装没装扩展。
+            "report": "material+fill" if self.report_extension_token else "material+fill-local",
         }
 
 
