@@ -179,7 +179,12 @@ screenshot_bytes 22796  html_len 858
 EV page_text 151 / page_html 1048 / screenshot 22796 / network 183
 ```
 
-截图确认能看到 cloaking 后的真实内容。也就是说：**代码路径是通的，缺的只是一个出口**。
+截图确认能看到 cloaking 后的真实内容（`docs/screenshots/forensics-mock.png`）：
+静态 HTML 只有「活动已结束」，截图里是「国家惠民养老补贴申领中心 / 免费领取鸡蛋与米面油」。
+也就是说：**代码路径是通的，缺的只是一个出口**。
+
+> 这张图同时说明为什么必须截图：如果只存 `page_text`，对方改版后我们无法自证
+> 「当时页面确实这么写」；DOM 文本可以被辩护成解析误差，截图不能。
 
 ### 2.5 边界
 
