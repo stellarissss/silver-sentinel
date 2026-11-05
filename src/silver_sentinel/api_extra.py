@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 
@@ -44,9 +45,12 @@ from .models import (
     GraphEdge,
     GraphNode,
     KeywordHit,
+    ReportBundle,
     TaskRun,
 )
 from .pipeline import enrich_asset, get_scheduler, probe_web, run_cycle
+from .report import channels as report_channels_mod
+from .report import service as report_service
 from .sandbox.apk import get_apk_sandbox
 from .sandbox.web import get_web_sandbox
 
@@ -480,3 +484,130 @@ async def stream(request: Request, since: int = 0) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
+
+# ---------------------------------------------------------------- 半自动举报
+#
+# 服务端只准备材料，不代提交。提交动作发生在用户自己的浏览器里：
+# 扩展按 fill 载荷填字段，人过验证码、点提交，再回来登记回执。
+
+class ReportIn(BaseModel):
+    asset_id: int
+    channel: str = ""
+    harm: str = ""
+    reporter: str = ""
+    api_base: str = ""
+    # 用户可在前端改过的正文；为空则按渠道模板生成
+    body: str = ""
+
+
+class MarkIn(BaseModel):
+    status: str
+    receipt: str = ""
+    note: str = ""
+
+
+def _report_guard(request: Request) -> None:
+    """扩展取数鉴权。
+
+    设了 SILVER_REPORT_EXTENSION_TOKEN 就要求带同一令牌；没设则只放行本机，
+    避免把「给浏览器扩展取证据」的接口暴露到公网。
+    """
+    expect = settings.report_extension_token.strip()
+    if expect:
+        got = request.headers.get("x-ss-token", "")
+        if not secrets.compare_digest(got, expect):
+            raise HTTPException(status_code=401, detail="令牌无效")
+        return
+    host = (request.client.host if request.client else "") or ""
+    if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        raise HTTPException(status_code=403, detail="未配置令牌时仅允许本机访问")
+
+
+@router.get("/api/report/channels")
+def report_channels(harm: str = "") -> dict[str, Any]:
+    return {"items": report_channels_mod.catalog(harm), "harm_types": report_channels_mod.HARM_TYPES}
+
+
+@router.get("/api/report/preview")
+def report_preview(asset_id: int, channel: str = "", harm: str = "") -> dict[str, Any]:
+    with session_scope() as session:
+        try:
+            return report_service.preview(session, asset_id, channel, harm)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/api/report/build")
+def report_build(payload: ReportIn, request: Request) -> dict[str, Any]:
+    api_base = payload.api_base or str(request.base_url).rstrip("/")
+    with session_scope() as session:
+        try:
+            row = report_service.build(
+                session, payload.asset_id, payload.channel,
+                harm_override=payload.harm, reporter=payload.reporter, api_base=api_base,
+                body_override=payload.body,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return report_service.as_dict(row, full=True)
+
+
+@router.get("/api/report/bundles")
+def report_bundles(asset_id: int | None = None, limit: int = Query(default=30, le=200)) -> dict[str, Any]:
+    with session_scope() as session:
+        stmt = select(ReportBundle).order_by(ReportBundle.id.desc()).limit(limit)
+        if asset_id:
+            stmt = stmt.where(ReportBundle.asset_id == asset_id)
+        rows = list(session.scalars(stmt))
+        return {"items": [report_service.as_dict(r) for r in rows]}
+
+
+@router.get("/api/report/bundles/{code}")
+def report_bundle(code: str, full: bool = False) -> dict[str, Any]:
+    with session_scope() as session:
+        row = session.scalars(select(ReportBundle).where(ReportBundle.code == code)).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="材料不存在")
+        return report_service.as_dict(row, full=full)
+
+
+@router.get("/api/report/bundles/{code}/fill")
+def report_fill(code: str, request: Request) -> dict[str, Any]:
+    """浏览器扩展取「填什么」。"""
+    _report_guard(request)
+    with session_scope() as session:
+        row = session.scalars(select(ReportBundle).where(ReportBundle.code == code)).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="材料不存在")
+        payload = dict(row.fill or {})
+        payload["body"] = row.body
+        payload["token"] = settings.report_extension_token
+        return payload
+
+
+@router.get("/api/report/bundles/{code}/file")
+def report_file(code: str, kind: str = "zip"):
+    """材料下载。不校验令牌：code 是 12 位随机 hex，不可枚举；
+    且浏览器直接点链接下载时无法附加自定义头。"""
+    with session_scope() as session:
+        row = session.scalars(select(ReportBundle).where(ReportBundle.code == code)).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="材料不存在")
+        path = report_service.file_of(row, kind)
+        name = path.name
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="文件已清理，请重新生成材料")
+    return FileResponse(path, filename=name, media_type="application/octet-stream")
+
+
+@router.post("/api/report/bundles/{code}/mark")
+def report_mark(code: str, payload: MarkIn) -> dict[str, Any]:
+    with session_scope() as session:
+        try:
+            row = report_service.mark(session, code, payload.status, payload.receipt, payload.note)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return report_service.as_dict(row)

@@ -495,50 +495,19 @@ async function openAsset(id) {
       <div class="section-title">证据链（${(a.evidence || []).length}）</div>
       ${evidence}
 
-      <div class="section-title">处置</div>
-      <div class="row" style="flex-wrap:wrap">
-        <select id="report-channel" style="flex:1;min-width:180px">
-          <option value="12321">12321 网络不良信息举报</option>
-          <option value="12377">12377 网信办举报</option>
-          <option value="cyberpolice">公安部网络违法犯罪举报</option>
-          <option value="12315">12315 市场监管</option>
-          <option value="96110">96110 反诈专线（话术卡）</option>
-          <option value="registrar">域名注册商滥用举报</option>
-        </select>
-        <button class="btn primary sm" id="btn-gen-report">生成举报材料</button>
-      </div>
-      <div id="report-box"></div>
+      <div class="section-title">一键举报</div>
+      <div id="report-panel"><div class="empty"><span class="spinner"></span>准备中</div></div>
 
       <div class="advice">
         <h3>给家属的建议</h3>
         <ol>${(a.advice || []).map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ol>
       </div>`;
 
-    $("#btn-gen-report").addEventListener("click", () => generateReport(a.id));
+    mountReport(a.id);
     $("#drawer").classList.add("show");
     $("#drawer-mask").classList.add("show");
   } catch (e) {
     toast(e.message);
-  }
-}
-
-async function generateReport(id) {
-  const channel = $("#report-channel").value;
-  $("#report-box").innerHTML = `<div class="empty"><span class="spinner"></span>生成中</div>`;
-  try {
-    const r = await api(`/api/assets/${id}/report?channel=${channel}`, { method: "POST" });
-    $("#report-box").innerHTML = `
-      <div class="row" style="justify-content:space-between">
-        <span class="hint">已保存草稿 #${r.id}，可直接全选复制</span>
-        <button class="btn sm ghost" id="btn-copy">复制</button>
-      </div>
-      <pre class="report">${escapeHtml(r.body)}</pre>`;
-    $("#btn-copy").addEventListener("click", async () => {
-      await navigator.clipboard.writeText(r.body);
-      toast("已复制到剪贴板");
-    });
-  } catch (e) {
-    $("#report-box").innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
   }
 }
 

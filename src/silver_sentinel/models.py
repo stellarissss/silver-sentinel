@@ -183,6 +183,40 @@ class ReportDraft(Base):
     asset: Mapped[Asset] = relationship(back_populates="reports")
 
 
+class ReportBundle(Base):
+    """一次「一键举报」的完整产物。
+
+    与 ReportDraft 的区别：Draft 只是一段文字，Bundle 是可提交的证据包 +
+    浏览器扩展能照做的填表载荷。status 由人推进：draft → opened → submitted / failed。
+    """
+
+    __tablename__ = "report_bundles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="CASCADE"), index=True)
+    channel: Mapped[str] = mapped_column(String(32), index=True)
+    harm_type: Mapped[str] = mapped_column(String(24), default="")
+    harm_label: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+
+    body: Mapped[str] = mapped_column(Text, default="")
+    fill: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    pdf_path: Mapped[str] = mapped_column(Text, default="")
+    zip_path: Mapped[str] = mapped_column(Text, default="")
+    pdf_sha256: Mapped[str] = mapped_column(String(64), default="")
+    zip_sha256: Mapped[str] = mapped_column(String(64), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    receipt: Mapped[str] = mapped_column(String(200), default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+
+
 class WatchTarget(Base):
     """监控目标：关键词、品牌词、已知域名、CT 规则。"""
 

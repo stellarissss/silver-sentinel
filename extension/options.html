@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>银发哨兵 · 扩展设置</title>
+<style>
+  body{max-width:560px;margin:40px auto;padding:0 20px;font:14px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:#0c1219;color:#dbe6f2}
+  h1{font-size:18px;margin-bottom:6px}
+  p.tip{color:#7b8fa6;font-size:12.5px}
+  label{display:block;font-size:12px;color:#7b8fa6;margin:18px 0 6px}
+  input{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid #2a3b4f;
+        background:#080b10;color:#dbe6f2;font:13px/1.4 ui-monospace,Menlo,monospace}
+  button{margin-top:16px;padding:9px 18px;border-radius:8px;border:1px solid #4da3ff;
+         background:#1e5c96;color:#fff;font:13px inherit;cursor:pointer}
+  #msg{margin-top:12px;font-size:12.5px}
+  .ok{color:#4ade80}.err{color:#ff5f56}
+</style>
+</head>
+<body>
+  <h1>扩展设置</h1>
+  <p class="tip">填哨兵控制台的地址。扩展只从该地址取「填什么」，不会把任何数据发往别处。</p>
+
+  <label>哨兵地址</label>
+  <input id="api" placeholder="http://127.0.0.1:18700">
+
+  <label>访问令牌（服务端设了 SILVER_REPORT_EXTENSION_TOKEN 时必填）</label>
+  <input id="token" placeholder="留空表示本机直连">
+
+  <button id="save">保存并测试</button>
+  <div id="msg"></div>
+
+<script src="options.js"></script>
+</body>
+</html>

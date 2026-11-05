@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  body{width:340px;margin:0;font:13px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:#0c1219;color:#dbe6f2}
+  .hd{padding:12px 14px;border-bottom:1px solid #1f2d3d;display:flex;justify-content:space-between;align-items:center}
+  .hd b{font-size:13px}
+  .hd span{font-size:11px;color:#4d6076}
+  .bd{padding:12px 14px 16px}
+  label{display:block;font-size:11px;color:#7b8fa6;margin:10px 0 4px}
+  input{width:100%;box-sizing:border-box;padding:7px 9px;border-radius:7px;border:1px solid #2a3b4f;
+        background:#080b10;color:#dbe6f2;font:12px/1.4 inherit}
+  button{width:100%;margin-top:10px;padding:8px;border-radius:8px;border:1px solid #2a3b4f;
+         background:#16212e;color:#dbe6f2;font:12px inherit;cursor:pointer}
+  button.p{background:#1e5c96;border-color:#4da3ff;color:#fff}
+  .tip{font-size:11px;color:#4d6076;margin-top:10px;line-height:1.6}
+  .ok{color:#4ade80}
+  .err{color:#ff5f56}
+</style>
+</head>
+<body>
+  <div class="hd"><b>银发哨兵 · 一键举报</b><span id="state">未连接</span></div>
+  <div class="bd">
+    <label>材料编号</label>
+    <input id="code" placeholder="rbxxxxxxxxxxxx">
+    <button class="p" id="go">打开举报页并填充</button>
+    <button id="opt">设置</button>
+    <div class="tip" id="tip">在哨兵控制台的线索详情里点「生成证据包并打开举报页」，这里会自动接上。</div>
+  </div>
+<script src="popup.js"></script>
+</body>
+</html>

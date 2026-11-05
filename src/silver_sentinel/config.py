@@ -191,6 +191,19 @@ class Settings:
     confirm_requires_official: bool = True
     min_signals_for_verdict: int = 2
 
+    # ---------------------------------------------------------------- 半自动举报
+    # 举报人档案：12377 会自动带出登录账号的实名信息，这里主要是给 12321／邮件
+    # 用的署名与回执邮箱。留空则材料里写「举报人（请填写）」。
+    report_reporter: str = ""
+    report_email: str = ""
+    report_phone: str = ""
+    # 浏览器扩展访问本服务的令牌；留空表示仅允许本机回环地址取数。
+    report_extension_token: str = ""
+    # 扩展与前端打开举报页时用的服务地址（部署在服务器上时填对外地址）
+    report_api_base: str = ""
+    # 证据包里最多带几张截图（12377 附件有总量限制）
+    report_max_shots: int = 6
+
     # ---------------------------------------------------------------- 调度
     monitor_tick_seconds: int = 60
     default_watch_interval_minutes: int = 360
@@ -334,6 +347,12 @@ class Settings:
     @property
     def evidence_dir(self) -> Path:
         return self.data_dir / "evidence"
+
+    @property
+    def report_dir(self) -> Path:
+        d = self.data_dir / "report_bundles"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     @property
     def log_dir(self) -> Path:

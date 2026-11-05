@@ -461,3 +461,52 @@ pre.report {
   color: var(--text); padding: 10px; resize: vertical;
 }
 #inject-values:focus, #graph-key:focus { outline: none; border-color: var(--accent-dim); }
+
+/* ---------------------------------------------------------------- 半自动举报 */
+.harm-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: linear-gradient(90deg, rgba(255,95,86,.10), rgba(255,95,86,.02));
+  border: 1px solid rgba(255,95,86,.28);
+  border-radius: 10px; padding: 10px 13px; margin-bottom: 12px;
+}
+.harm-bar .harm-label { color: var(--red); font-weight: 600; margin-right: 8px; }
+.harm-bar .hint { display: block; margin-top: 2px; line-height: 1.5; }
+
+.chan-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.chan-card {
+  text-align: left; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px 12px; cursor: pointer; color: var(--text);
+  font-family: inherit; transition: border-color .15s, background .15s;
+}
+.chan-card:hover { border-color: var(--line-2); background: #1a2734; }
+.chan-card.active { border-color: var(--accent); background: rgba(77,163,255,.09); }
+.chan-name { font-size: 13px; font-weight: 600; }
+.chan-op { font-size: 11px; color: var(--dim); margin: 1px 0 6px; }
+.chan-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.chip {
+  font-size: 10px; line-height: 1.6; padding: 0 6px; border-radius: 4px;
+  border: 1px solid var(--line-2); color: var(--muted); white-space: nowrap;
+}
+.chip.on { border-color: rgba(74,222,128,.45); color: var(--green); background: rgba(74,222,128,.08); }
+.chip.warn { border-color: rgba(255,169,77,.45); color: var(--orange); background: rgba(255,169,77,.08); }
+.chip.dim { color: var(--dim); }
+
+.report-input {
+  width: 100%; resize: vertical; font-family: inherit; font-size: 12.5px; line-height: 1.7;
+  background: var(--bg-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 10px; padding: 11px 13px; outline: none;
+}
+.report-input:focus { border-color: var(--accent-dim); }
+.report-input.over { border-color: var(--red); }
+
+.built {
+  margin-top: 12px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel-2); padding: 12px 13px;
+}
+.built-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.built-head b { color: var(--green); }
+.built-head .mono { font-family: var(--mono); font-size: 11px; color: var(--cyan); }
+
+.guide-list { margin-top: 8px; font-size: 11.5px; color: var(--muted); line-height: 1.85; }
+.guide-list div { white-space: normal; }

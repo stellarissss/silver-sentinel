@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "银发哨兵 · 一键举报",
+  "version": "1.0.0",
+  "description": "把银发哨兵生成的举报证据自动填进 12377 / 12321 / 腾讯网址安全中心等受理表单，人只需过验证码并提交。",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "tabs", "scripting", "cookies"],
+  "host_permissions": [
+    "https://www.12377.cn/*",
+    "https://new.12377.cn/*",
+    "https://www.12321.cn/*",
+    "https://12321.cn/*",
+    "https://urlsec.qq.com/*",
+    "https://abuse.cloudflare.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.12377.cn/*",
+        "https://new.12377.cn/*",
+        "https://www.12321.cn/*",
+        "https://12321.cn/*",
+        "https://urlsec.qq.com/*",
+        "https://abuse.cloudflare.com/*"
+      ],
+      "js": ["content/filler.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://127.0.0.1/*", "http://localhost/*"],
+      "js": ["content/bridge.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": { "default_popup": "popup.html", "default_title": "银发哨兵 · 一键举报" },
+  "options_page": "options.html",
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}
