@@ -178,6 +178,12 @@ class ICPClient:
         self._lock = threading.Lock()
         self.available: bool | None = None
         self.last_error = ""
+        # 工信部有 IP 级风控：短时间十来次查询就会 403（实测 2026-11-05）。
+        # 连续失败到阈值就整体冷却，宁可这批不查，也不要把出口 IP 彻底打黑。
+        self._consecutive_failures = 0
+        self._blocked_until = 0.0
+        self._max_failures = settings.icp_max_failures
+        self._cooldown = settings.icp_cooldown_seconds
 
     # ------------------------------------------------------------ 缓存
     @staticmethod
@@ -274,6 +280,12 @@ class ICPClient:
             )
         if self.available is False:
             return ICPResult(domain=domain, status="unknown", error=self.last_error or "服务不可用")
+        if time.monotonic() < self._blocked_until:
+            return ICPResult(
+                domain=domain,
+                status="unknown",
+                error=f"接口风控冷却中，还剩 {int(self._blocked_until - time.monotonic())} 秒",
+            )
 
         if not self.limiter.acquire(timeout=20.0):
             with self._lock:
@@ -322,6 +334,23 @@ class ICPClient:
 
         if res.status == "unknown" and not res.error:
             res.error = "响应无法判定"
+
+        # 明确的风控信号（创宇盾拦截 / 403）要立刻长时间冷却：
+        # 2026-11-05 实测，40/分钟的批次跑十几条就被「当前访问已被创宇盾拦截」。
+        if res.error and ("拦截" in res.error or "403" in res.error):
+            self._blocked_until = time.monotonic() + max(self._cooldown, 3600.0)
+            self.last_error = "出口 IP 已被工信部风控拦截，冷却 1 小时以上"
+            log.warning("ICP 出口被封：%s", res.error)
+
+        # 连续 unknown 视为风控：整体冷却，避免把出口 IP 打到永久封禁
+        if res.status == "unknown":
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._max_failures:
+                self._blocked_until = time.monotonic() + self._cooldown
+                self.last_error = f"连续 {self._consecutive_failures} 次失败，冷却 {self._cooldown:.0f} 秒"
+                log.warning("ICP 连续失败，进入冷却：%s", res.error)
+        else:
+            self._consecutive_failures = 0
 
         if settings.icp_violation_check and res.status != "unknown" and res.error == "":
             if self.limiter.acquire(timeout=10.0):
@@ -386,6 +415,8 @@ class ICPClient:
             "available": self.available,
             "last_error": self.last_error,
             "rate_per_minute": settings.icp_rate_per_minute,
+            "cooldown_remaining": max(0, int(self._blocked_until - time.monotonic())),
+            "consecutive_failures": self._consecutive_failures,
             "cache_days": settings.icp_cache_days,
             "stats": self.stats,
         }

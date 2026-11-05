@@ -509,8 +509,10 @@ def cmd_icp(args) -> int:
     def work(domain: str):
         return domain, client.lookup(domain, use_cache=not args.refresh)
 
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = [pool.submit(work, d) for d in targets]
+    pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
+    futures = [pool.submit(work, d) for d in targets]
+    aborted = ""
+    try:
         for fut in as_completed(futures):
             domain, res = fut.result()
             done += 1
@@ -532,10 +534,18 @@ def cmd_icp(args) -> int:
                             if res.violation in ("listed", "clean"):
                                 asset.icp_violation = res.violation
                                 asset.icp_violation_title = res.violation_title
-            if done % 25 == 0:
+            if done % 10 == 0:
                 elapsed = time.time() - started
                 print(f"  {done}/{len(targets)}  {elapsed:.0f}s  "
                       f"{done / max(elapsed, 1) * 60:.0f}/min  {tally}", file=sys.stderr)
+            # 一旦进入风控冷却，立刻停手。继续打只会把 IP 封得更久。
+            remaining = client.status().get("cooldown_remaining", 0)
+            if remaining:
+                aborted = f"接口疑似风控，已冷却 {remaining} 秒后重试（已处理 {done} 个）"
+                print(f"\n{aborted}", file=sys.stderr)
+                break
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     print(json.dumps({
         "ok": True,
@@ -543,6 +553,7 @@ def cmd_icp(args) -> int:
         "elapsed_seconds": round(time.time() - started, 1),
         "results": tally,
         "listed": listed[:50],
+        "aborted": aborted,
         "stats": client.stats,
     }, ensure_ascii=False, indent=2))
     return 0
@@ -815,7 +826,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=2000)
     p.add_argument("--tier", help="只查这些分级，逗号分隔，默认读 SILVER_ICP_TIERS")
     p.add_argument("--status", default="unknown", help="只查该备案状态的资产（默认 unknown）")
-    p.add_argument("--workers", type=int, default=4, help="并发数；总速率仍受 SILVER_ICP_RPM 限制")
+    p.add_argument("--workers", type=int, default=2,
+                   help="并发数；工信部对突发很敏感，建议 1-2，默认 2")
     p.add_argument("--refresh", action="store_true", help="忽略缓存重新查")
     p.add_argument("--dry-run", action="store_true", help="只列出将查询的域名")
     p.set_defaults(func=cmd_icp)

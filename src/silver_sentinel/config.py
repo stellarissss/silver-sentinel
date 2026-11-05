@@ -110,10 +110,14 @@ class Settings:
     icp_api_base: str = ""
     icp_timeout: float = 20.0
     # 每分钟最多查询次数。工信部接口对频率敏感，无节制会触发封禁
-    icp_rate_per_minute: int = 10
+    # 工信部实测：40/分钟跑十几条就 403。默认压到 5，用缓存换速度。
+    icp_rate_per_minute: int = 5
     icp_cache_days: int = 30
     # 是否同时查工信部「违法违规域名」名单（多一次请求，但换来官方定性信号）
     icp_violation_check: bool = True
+    # 连续失败多少次判定为「被风控」，以及冷却时长
+    icp_max_failures: int = 4
+    icp_cooldown_seconds: float = 900.0
     # 只对这些分级的目标查询备案，避免无差别扫描
     icp_tiers: str = "candidate,watch,confirmed"
 
@@ -256,6 +260,8 @@ class Settings:
         self.icp_rate_per_minute = _int("SILVER_ICP_RPM", self.icp_rate_per_minute)
         self.icp_cache_days = _int("SILVER_ICP_CACHE_DAYS", self.icp_cache_days)
         self.icp_violation_check = _bool("SILVER_ICP_VIOLATION", self.icp_violation_check)
+        self.icp_max_failures = _int("SILVER_ICP_MAX_FAILURES", self.icp_max_failures)
+        self.icp_cooldown_seconds = _float("SILVER_ICP_COOLDOWN", self.icp_cooldown_seconds)
         self.icp_tiers = _str("SILVER_ICP_TIERS", self.icp_tiers)
 
         self.graph_enabled = _bool("SILVER_GRAPH_ENABLED", True)
