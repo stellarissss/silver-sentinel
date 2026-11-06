@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -21,13 +22,11 @@ from .config import settings
 from .db import init_db, session_scope, verify_chain
 from .domain import CATEGORY_LABELS, VERDICT_LABELS, utcnow
 from .intake import scan
-from .models import Asset, Campaign, Evidence, ReportDraft, ScanRun, SignalRow, WatchTarget
+from .models import TIER_LABELS, Asset, Campaign, Evidence, ReportDraft, ScanRun, SignalRow, WatchTarget
 from .respond import CHANNELS, advise, build, export_bundle
 from .scoring.engine import load_ruleset
 
 WEB_DIR = Path(__file__).parent / "web"
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +123,9 @@ class ScanIn(BaseModel):
 
 
 class WatchIn(BaseModel):
-    kind: str = Field(default="keyword", description="keyword|domain|brand")
-    value: str = Field(..., min_length=2)
+    kind: str = Field(default="keyword", description="keyword|domain|brand|asset")
+    value: str = Field(default="", description="目标值；kind=asset 时用 asset_id")
+    asset_id: int | None = None
     interval_minutes: int = 360
     note: str = ""
 
@@ -151,11 +151,16 @@ def _asset_row(asset: Asset) -> dict[str, Any]:
         "scan_count": asset.scan_count,
         "reviewed_by": asset.reviewed_by,
         "tier": asset.tier,
+        "tier_label": TIER_LABELS.get(asset.tier, asset.tier),
         "discovery_source": asset.discovery_source,
         "discovery_reason": asset.discovery_reason,
         "icp_status": asset.icp_status,
         "icp_entity": asset.icp_entity,
         "campaign_name": asset.campaign.name if asset.campaign else "",
+        "capture_state": asset.capture_state or "pending",
+        "capture_error": (asset.capture_error or "")[:200],
+        "last_capture_at": asset.last_capture_at.isoformat() if asset.last_capture_at else None,
+        "evidence_count": len([e for e in (asset.evidence or []) if e.deleted_at is None]),
     }
 
 
@@ -256,6 +261,20 @@ def health() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         chain = {"ok": False, "error": str(exc)}
 
+    capture: dict[str, Any] = {}
+    try:
+        from .capture import queue_summary
+
+        summary = queue_summary()
+        capture = {
+            "queued": summary["queued"],
+            "running": summary["running"],
+            "failed": summary["failed"],
+            "pending_assets": summary["pending_assets"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        capture = {"error": str(exc)[:120]}
+
     return {
         "status": "ok",
         "version": __version__,
@@ -264,6 +283,7 @@ def health() -> dict[str, Any]:
         "capabilities": settings.capability_report(),
         "discover_running": _discover_running(),
         "evidence_chain": chain,
+        "capture": capture,
         "opsec": _opsec_summary(),
         "rules": {"count": len(load_ruleset().rules), "version": load_ruleset().version},
     }
@@ -323,37 +343,131 @@ def icp_status() -> dict[str, Any]:
 
 @app.get("/api/stats")
 def stats() -> dict[str, Any]:
+    """概览口径。
+
+    历史教训：总数把 2,150 条已排除的误报算进去，界面显示 2,993，
+    而真正能处置的只有 800 多，用户看到的是「数字很大、什么都没发生」。
+    这里所有比率一律以**有效资产**为分母，已排除单独列一行并注明原因。
+    """
+    active_tiers = ("confirmed", "watch", "candidate")
     with session_scope() as session:
         total = session.scalar(select(func.count(Asset.id))) or 0
+        active = session.scalar(
+            select(func.count(Asset.id)).where(Asset.tier.in_(active_tiers))
+        ) or 0
+        dismissed = session.scalar(
+            select(func.count(Asset.id)).where(Asset.tier == "dismissed")
+        ) or 0
+
         by_verdict = dict(
-            session.execute(select(Asset.verdict, func.count(Asset.id)).group_by(Asset.verdict)).all()
+            session.execute(
+                select(Asset.verdict, func.count(Asset.id))
+                .where(Asset.tier.in_(active_tiers))
+                .group_by(Asset.verdict)
+            ).all()
         )
         by_category = dict(
-            session.execute(select(SignalRow.category, func.count(SignalRow.id)).group_by(SignalRow.category)).all()
+            session.execute(
+                select(SignalRow.category, func.count(SignalRow.id))
+                .join(Asset, Asset.id == SignalRow.asset_id)
+                .where(Asset.tier.in_(active_tiers))
+                .group_by(SignalRow.category)
+            ).all()
         )
+        by_tier = dict(
+            session.execute(select(Asset.tier, func.count(Asset.id)).group_by(Asset.tier)).all()
+        )
+
         campaigns = session.scalar(select(func.count(Campaign.id))) or 0
         reports = session.scalar(select(func.count(ReportDraft.id))) or 0
-        since = utcnow() - timedelta(days=7)
-        recent = session.scalar(select(func.count(Asset.id)).where(Asset.first_seen >= since)) or 0
+
+        now = utcnow()
+        new_24h = session.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.tier.in_(active_tiers), Asset.first_seen >= now - timedelta(hours=24)
+            )
+        ) or 0
+        new_7d = session.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.tier.in_(active_tiers), Asset.first_seen >= now - timedelta(days=7)
+            )
+        ) or 0
+
         pending = session.scalar(
-            select(func.count(Asset.id)).where(Asset.verdict.in_(["high_risk", "confirmed"]))
+            select(func.count(Asset.id)).where(
+                Asset.tier.in_(active_tiers), Asset.verdict.in_(["high_risk", "confirmed"])
+            )
+        ) or 0
+        # 待取证：有效、可访问、还没跑过页面
+        pending_capture = session.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.tier.in_(active_tiers),
+                Asset.kind.in_(("domain", "url")),
+                Asset.capture_state.in_(("pending", "failed")),
+            )
+        ) or 0
+        # 只算有效资产：分母是有效池，分子混进已排除的会让覆盖率超过 100%
+        with_evidence = session.scalar(
+            select(func.count(func.distinct(Evidence.asset_id)))
+            .join(Asset, Asset.id == Evidence.asset_id)
+            .where(
+                Evidence.kind.in_(("page_html", "screenshot")),
+                Evidence.deleted_at.is_(None),
+                Asset.tier.in_(active_tiers),
+            )
+        ) or 0
+        watch_count = session.scalar(
+            select(func.count(func.distinct(WatchTarget.asset_id))).where(
+                WatchTarget.enabled.is_(True), WatchTarget.asset_id.is_not(None)
+            )
+        ) or 0
+
+        # 最近 7 天被排除的数量，用于「数据变更公告」。之前清理 2,150 条却没有任何提示，
+        # 用户只看到有效池突然缩水，以为系统坏了。
+        dismissed_recent = session.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.tier == "dismissed", Asset.last_seen >= now - timedelta(days=7)
+            )
         ) or 0
 
         top = list(
             session.scalars(
-                select(Asset).where(Asset.score > 0).order_by(Asset.score.desc()).limit(8)
+                select(Asset)
+                .where(Asset.tier.in_(active_tiers), Asset.score > 0)
+                .order_by(Asset.score.desc())
+                .limit(8)
             )
         )
 
         return {
             "total_assets": total,
-            "by_verdict": {k: v for k, v in by_verdict.items()},
+            "active_assets": active,
+            "dismissed_assets": dismissed,
+            "by_verdict": by_verdict,
+            "by_tier": by_tier,
             "verdict_labels": VERDICT_LABELS,
             "by_category": {CATEGORY_LABELS.get(k, k): v for k, v in by_category.items()},
             "campaigns": campaigns,
             "reports": reports,
-            "recent_7d": recent,
+            "recent_7d": new_7d,
+            "new_24h": new_24h,
+            "new_7d": new_7d,
             "pending_action": pending,
+            "pending_capture": pending_capture,
+            "evidence_coverage": {
+                "with_evidence": with_evidence,
+                "active": active,
+                "ratio": round(min(1.0, with_evidence / active), 3) if active else 0.0,
+            },
+            "watch_count": watch_count,
+            # 兼容旧前端字段名（recent_7d / pending_action 保持不变）
+            "notices": [
+                {
+                    "level": "info",
+                    "text": f"近 7 天有 {dismissed_recent} 条历史线索被判定为误报并排除，"
+                            f"不计入有效线索。原因可在「线索库 → 已排除」中逐条查看。",
+                }
+            ] if dismissed_recent else [],
             "top_assets": [_asset_row(a) for a in top],
         }
 
@@ -409,25 +523,62 @@ def api_assets(
     tier: str | None = None,
     kind: str | None = None,
     source: str | None = None,
+    sort: str = "score",
+    order: str = "desc",
     limit: int = Query(default=50, le=300),
     offset: int = 0,
 ) -> dict[str, Any]:
+    """线索列表。默认只返回有效资产（不含已排除）。
+
+    之前默认返回全部，用户一进线索库就看到 2,993 条里混着 2,150 条早已
+    判定为误报的域名，既看不出重点，也解释不了「为什么这么多」。
+    """
     with session_scope() as session:
-        stmt = select(Asset).order_by(Asset.score.desc(), Asset.last_seen.desc())
+        stmt = select(Asset)
         count_stmt = select(func.count(Asset.id))
-        for condition in (
-            (Asset.verdict == verdict) if verdict else None,
-            (Asset.value.contains(q)) if q else None,
-            (Asset.tier == tier) if tier else None,
-            (Asset.kind == kind) if kind else None,
-            (Asset.discovery_source == source) if source else None,
-        ):
-            if condition is not None:
-                stmt = stmt.where(condition)
-                count_stmt = count_stmt.where(condition)
+
+        tier = (tier or "active").strip().lower()
+        conditions: list[Any] = []
+        if tier == "active":
+            conditions.append(Asset.tier.in_(("confirmed", "watch", "candidate")))
+        elif tier == "all":
+            pass
+        elif tier == "dismissed":
+            conditions.append(Asset.tier == "dismissed")
+        elif tier:
+            conditions.append(Asset.tier == tier)
+
+        if verdict:
+            conditions.append(Asset.verdict == verdict)
+        if q:
+            conditions.append(Asset.value.contains(q))
+        if kind:
+            conditions.append(Asset.kind == kind)
+        if source:
+            conditions.append(Asset.discovery_source == source)
+
+        for condition in conditions:
+            stmt = stmt.where(condition)
+            count_stmt = count_stmt.where(condition)
+
+        sort_col = {
+            "score": Asset.score,
+            "last_seen": Asset.last_seen,
+            "first_seen": Asset.first_seen,
+            "scan_count": Asset.scan_count,
+            "value": Asset.value,
+        }.get(sort, Asset.score)
+        stmt = stmt.order_by(sort_col.asc() if order == "asc" else sort_col.desc(), Asset.id.desc())
+
         rows = list(session.scalars(stmt.offset(offset).limit(limit)))
         total = session.scalar(count_stmt) or 0
-        return {"items": [_asset_row(a) for a in rows], "total": total}
+        return {
+            "items": [_asset_row(a) for a in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "tier": tier,
+        }
 
 
 @app.get("/api/assets/{asset_id}")
@@ -443,9 +594,23 @@ def api_asset(asset_id: int) -> dict[str, Any]:
             )
         )
         evidence = list(
-            session.scalars(select(Evidence).where(Evidence.asset_id == asset_id).order_by(Evidence.id))
+            session.scalars(
+                select(Evidence)
+                .where(Evidence.asset_id == asset_id, Evidence.deleted_at.is_(None))
+                .order_by(Evidence.id)
+            )
+        )
+        deleted = list(
+            session.scalars(
+                select(Evidence)
+                .where(Evidence.asset_id == asset_id, Evidence.deleted_at.is_not(None))
+                .order_by(Evidence.id.desc())
+                .limit(20)
+            )
         )
         campaign = session.get(Campaign, asset.campaign_id) if asset.campaign_id else None
+
+        from .capture import KIND_LABEL, evidence_matrix
 
         return {
             **_asset_row(asset),
@@ -469,14 +634,31 @@ def api_asset(asset_id: int) -> dict[str, Any]:
                 {
                     "id": e.id,
                     "kind": e.kind,
+                    "kind_label": KIND_LABEL.get(e.kind, e.kind),
                     "sha256": e.sha256,
                     "chain_hash": e.chain_hash,
                     "size": e.size,
+                    "mime": e.mime,
                     "note": e.note,
                     "captured_at": e.captured_at.isoformat(),
+                    # application/json 也要能预览：网络请求、证书、表单都是 JSON，
+                    # 不能预览就只能下载，看一条证据多两步。
+                    "previewable": (e.mime or "").startswith(("image/", "text/", "application/json")),
                 }
                 for e in evidence
             ],
+            "evidence_matrix": evidence_matrix(asset_id),
+            "evidence_deleted": [
+                {
+                    "id": e.id,
+                    "kind": KIND_LABEL.get(e.kind, e.kind),
+                    "deleted_at": e.deleted_at.isoformat() if e.deleted_at else None,
+                    "deleted_by": e.deleted_by,
+                    "delete_reason": e.delete_reason,
+                }
+                for e in deleted
+            ],
+            "changes": (asset.meta or {}).get("changes", []),
             "campaign": {"id": campaign.id, "name": campaign.name, "summary": campaign.summary} if campaign else None,
             "advice": advise(asset.verdict),
         }
@@ -544,8 +726,22 @@ def api_campaigns() -> dict[str, Any]:
 
 @app.get("/api/watch")
 def api_watch_list() -> dict[str, Any]:
+    """监控列表。
+
+    之前只返回目标本身，用户看不出「这条是自动纳管的还是我手动加的」「盯了几轮
+    有没有变化」。这些正是判断监控有没有用的依据，一并返回。
+    """
     with session_scope() as session:
         rows = list(session.scalars(select(WatchTarget).order_by(WatchTarget.id)))
+        asset_ids = [t.asset_id for t in rows if t.asset_id]
+        assets = {
+            a.id: a
+            for a in (
+                session.scalars(select(Asset).where(Asset.id.in_(asset_ids))).all()
+                if asset_ids
+                else []
+            )
+        }
         return {
             "items": [
                 {
@@ -555,27 +751,49 @@ def api_watch_list() -> dict[str, Any]:
                     "interval_minutes": t.interval_minutes,
                     "enabled": t.enabled,
                     "note": t.note,
+                    "asset_id": t.asset_id,
+                    "auto": bool(t.auto),
+                    "fail_count": t.fail_count or 0,
+                    "change_count": t.change_count or 0,
+                    "last_change_at": t.last_change_at.isoformat() if t.last_change_at else None,
                     "last_run_at": t.last_run_at.isoformat() if t.last_run_at else None,
                     "next_run_at": t.next_run_at.isoformat() if t.next_run_at else None,
+                    "asset_value": assets[t.asset_id].value if t.asset_id in assets else "",
+                    "asset_tier": assets[t.asset_id].tier if t.asset_id in assets else "",
+                    "asset_score": round(assets[t.asset_id].score, 1) if t.asset_id in assets else 0,
                 }
                 for t in rows
-            ]
+            ],
+            "auto": sum(1 for t in rows if t.auto),
+            "total": len(rows),
         }
 
 
 @app.post("/api/watch")
 def api_watch_add(payload: WatchIn) -> dict[str, Any]:
+    # 资产级盯防走同一条路径，但目标由 asset 派生，避免前端拼错 value
+    if payload.kind == "asset":
+        if not payload.asset_id:
+            raise HTTPException(status_code=400, detail="kind=asset 时必须提供 asset_id")
+        from .capture import ensure_watch
+
+        added = ensure_watch(payload.asset_id, force=True, by="界面")
+        return {"ok": True, "added": added, "existed": not added}
+
     if payload.kind not in {"keyword", "domain", "brand"}:
-        raise HTTPException(status_code=400, detail="kind 只能是 keyword/domain/brand")
+        raise HTTPException(status_code=400, detail="kind 只能是 keyword/domain/brand/asset")
+    value = (payload.value or "").strip()
+    if len(value) < 2:
+        raise HTTPException(status_code=400, detail="监控目标至少 2 个字符")
     with session_scope() as session:
         exists = session.scalar(
-            select(WatchTarget).where(WatchTarget.kind == payload.kind, WatchTarget.value == payload.value)
+            select(WatchTarget).where(WatchTarget.kind == payload.kind, WatchTarget.value == value)
         )
         if exists:
             return {"ok": True, "id": exists.id, "existed": True}
         target = WatchTarget(
             kind=payload.kind,
-            value=payload.value.strip(),
+            value=value,
             interval_minutes=max(15, payload.interval_minutes),
             note=payload.note,
             next_run_at=utcnow(),

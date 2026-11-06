@@ -14,8 +14,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .domain import VERDICT_LABELS, utcnow
-from .opsec import redact_obj
 from .models import Asset, Evidence, ReportDraft, SignalRow
+from .opsec import redact_obj
 
 # 渠道元数据。url 为官方入口，字段说明用于指导人工填报。
 CHANNELS: dict[str, dict[str, Any]] = {

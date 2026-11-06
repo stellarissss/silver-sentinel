@@ -15,22 +15,21 @@ from __future__ import annotations
 
 import base64
 import json
-import random
 import logging
+import random
 import threading
 import time
 import urllib.error
 import urllib.parse
-
-import httpx
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+import httpx
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.x509.oid import ExtensionOID
-
 
 log = logging.getLogger(__name__)
 

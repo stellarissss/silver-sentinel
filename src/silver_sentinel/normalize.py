@@ -55,7 +55,7 @@ _SIMPLE_TLDS = {
     "buzz", "cyou", "ltd", "store", "tech", "space", "website", "host", "press",
     "link", "pro", "biz", "me", "tv", "io", "co", "ai", "so", "ws", "mobi",
     "asia", "art", "design", "today", "life", "world", "group", "email", "digital",
-    "pub", "run", "sh", "one", "page", "news", "blog", "fit", "best", "life",
+    "pub", "run", "sh", "one", "page", "news", "blog", "fit", "best",
 }
 
 TRACKING_PARAMS = {
@@ -97,6 +97,44 @@ SHARED_INFRA_SUFFIXES = (
     ".myshopify.com", ".gitlab.io", ".bitbucket.io", ".sourceforge.io",
     ".pages.dev", ".netlify.app", ".vercel.app", ".azurestaticapps.net", ".github.io",
 )
+
+# 页面里出现率极高、和团伙归因无关的第三方域名。
+# 落地页几乎都会挂统计脚本、字体 CDN、客服组件；把它们当「新发现的域名」
+# 回灌进发现队列，只会把队列塞满 jsdelivr 和 google-analytics。
+PIVOT_NOISE_ROOTS = {
+    "google-analytics.com", "googletagmanager.com", "google.com", "gstatic.com",
+    "googleapis.com", "doubleclick.net", "googlesyndication.com", "youtube.com",
+    "cloudflare.com", "cloudflareinsights.com", "jsdelivr.net", "unpkg.com",
+    "cdnjs.com", "bootcdn.net", "staticfile.org", "cdn.bootcss.com",
+    "baidu.com", "bdstatic.com", "cnzz.com", "umeng.com", "gtimg.cn",
+    "qq.com", "weixin.qq.com", "wechat.com", "tencent.com", "alipay.com",
+    "aliyun.com", "aliyuncs.com", "w3.org", "schema.org", "jquery.com",
+    "bootstrapcdn.com", "fontawesome.com", "sentry.io", "hotjar.com",
+    "facebook.com", "twitter.com", "tiktok.com", "instagram.com",
+    "microsoft.com", "windows.net", "apple.com", "amazon.com",
+}
+
+
+def is_pivot_noise(domain: str) -> bool:
+    """这个域名值不值得回灌进发现队列。
+
+    判据只有一条：它是不是「几乎所有站点都会挂」的公共基础设施。
+    是就丢掉——回灌的目的是找同伙，不是找 CDN。
+    """
+    d = (domain or "").lower().strip(".")
+    if not d or "." not in d:
+        return True
+    if re.fullmatch(r"[\d.]+", d):
+        return True
+    for root in PIVOT_NOISE_ROOTS:
+        if d == root or d.endswith("." + root):
+            return True
+    for suffix in SHARED_INFRA_SUFFIXES:
+        bare = suffix.lstrip(".")
+        if d == bare or d.endswith(suffix):
+            return True
+    return False
+
 
 # 未备案/低成本注册常见 TLD，用作弱信号，不作单独判定
 CHEAP_TLDS = {"top", "xyz", "icu", "buzz", "cyou", "shop", "vip", "club", "online", "site", "live", "cc", "tk", "ml", "ga", "cf", "gq"}

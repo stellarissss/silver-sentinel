@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import UTC
 from pathlib import Path
 
 import yaml
@@ -128,7 +129,7 @@ def icp_lookup(domain: str) -> bool | None:
 
 def rdap_age_days(domain: str) -> int | None:
     """通过 RDAP 查域名注册时间，返回距今天数。查不到返回 None。"""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     domain = registrable_domain(normalize_domain(domain))
     if not domain:
@@ -147,8 +148,8 @@ def rdap_age_days(domain: str) -> int | None:
         except ValueError:
             continue
         if registered.tzinfo is None:
-            registered = registered.replace(tzinfo=timezone.utc)
-        return max(0, (datetime.now(timezone.utc) - registered).days)
+            registered = registered.replace(tzinfo=UTC)
+        return max(0, (datetime.now(UTC) - registered).days)
     return None
 
 

@@ -98,6 +98,13 @@ def load_ruleset(extra_path: str | Path | None = None) -> RuleSet:
 
     ingest(raw)
 
+    # 内容规则单独一份文件：它们看的是页面正文，与结构规则的生命周期不同
+    # （话术变得快，结构特征变得慢），分开放才好各自迭代。
+    content = RULES_DIR / "content.yaml"
+    if content.is_file():
+        ingest(yaml.safe_load(content.read_text(encoding="utf-8")) or {})
+        rs.sources.append(str(content))
+
     path = extra_path or os.environ.get("SILVER_RULES_PATH")
     if path and Path(path).is_file():
         ingest(yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})

@@ -181,6 +181,53 @@ def cmd_verify(args) -> int:
     return 1
 
 
+def cmd_trash(args) -> int:
+    """回收站：看被软删的证据，或按时间物理清理。
+
+    软删除只是把文件挪进 trash/ 并在库里留 tombstone。记录永远不删，
+    但文件会一直占盘，所以留一个手动清理口子——什么时候清、清多久，人说了算。
+    """
+    from sqlalchemy import select
+
+    from .evidence import purge_trash, trash_dir
+    from .models import Evidence
+
+    init_db()
+    if args.list:
+        with session_scope() as s:
+            rows = list(
+                s.scalars(
+                    select(Evidence)
+                    .where(Evidence.deleted_at.is_not(None))
+                    .order_by(Evidence.deleted_at.desc())
+                    .limit(args.limit)
+                )
+            )
+            items = [(r.id, r.kind, r.size, r.deleted_at, r.deleted_by, r.delete_reason, Path(r.path).name) for r in rows]
+        if not items:
+            print("回收站是空的。")
+            return 0
+        print(f"{BOLD}回收站{RESET}（最近 {len(items)} 条，文件在 {trash_dir()}）\n")
+        for eid, kind, size, when, by, reason, name in items:
+            stamp = when.strftime("%Y-%m-%d %H:%M") if when else "—"
+            print(f"  #{eid:<5} {kind:<14} {size / 1024:>8.1f} KB  {stamp}  {by or '—'}  {reason or '—'}")
+            print(f"         {DIM}{name}{RESET}")
+        return 0
+
+    days = args.purge_days
+    if days is None:
+        print("用法：silver-sentinel trash --list   查看回收站")
+        print("      silver-sentinel trash --purge-days 30   清掉 30 天前的文件（记录保留）")
+        return 1
+    result = purge_trash(older_than_days=days)
+    print(
+        f"{GRN}已清理回收站{RESET}：删除 {result['removed']} 个文件，"
+        f"释放 {result['freed_bytes'] / 1024 / 1024:.1f} MB"
+        f"（只删 {days} 天前的文件；数据库里的删除记录永久保留）"
+    )
+    return 0
+
+
 def cmd_rules(args) -> int:
     rs = load_ruleset()
     print(f"规则集 v{rs.version}，共 {len(rs.rules)} 条\n")
@@ -243,8 +290,8 @@ def _reconcile(args) -> int:
 
     from .discover.keywords import get_library
     from .domain import utcnow
-    from .normalize import collapse_host, is_shared_infra
     from .models import TIER_DISMISSED
+    from .normalize import collapse_host, is_shared_infra
 
     init_db()
     lib = get_library()
@@ -477,7 +524,7 @@ def cmd_icp(args) -> int:
 
     from .domain import utcnow
     from .enrich.icp import get_icp
-    from .normalize import collapse_host, registrable_domain
+    from .normalize import collapse_host
 
     init_db()
     if not settings.icp_ready:
@@ -624,7 +671,7 @@ def cmd_replica(args) -> int:
 
 def cmd_vault(args) -> int:
     """加密证据仓：初始化、固化、拉取、校验、导出账本。"""
-    from .vault import VaultError, get_vault
+    from .vault import get_vault
 
     init_db()
     vault = get_vault()
@@ -803,6 +850,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("verify-chain", help="校验证据链完整性")
     p.add_argument("--asset", type=int)
     p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("trash", help="回收站：列出 / 物理清理（记录永久保留）")
+    p.add_argument("--list", action="store_true", help="只看不删")
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--purge-days", type=int, default=None, help="清理多少天前的文件（必须显式指定）")
+    p.set_defaults(func=cmd_trash)
 
     # ------------------------------------------------------------ 发现
     p = sub.add_parser("discover", help="发现引擎：CT 监控 / 词库 / 注入 / 历史补漏")

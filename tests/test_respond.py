@@ -53,7 +53,7 @@ def test_bundle_covers_multiple_channels(fresh_db):
 
 
 def test_every_channel_is_documented(fresh_db):
-    for key, meta in CHANNELS.items():
+    for meta in CHANNELS.values():
         assert meta["name"]
         assert meta["best_for"]
         assert meta["fields"]

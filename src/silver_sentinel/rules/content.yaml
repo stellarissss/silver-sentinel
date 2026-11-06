@@ -1,0 +1,202 @@
+# 银发哨兵 · 内容规则（页面正文/话术）
+#
+# 与 builtin.yaml 的分工：
+# - builtin 看的是「结构特征」：域名年龄、备案、分发渠道、证书、包名；
+# - 这里看的是「页面到底说了什么」。91% 的资产曾经判「证据不足」，
+#   根因就是只有结构没有内容。
+#
+# 每条规则的 detail 都会显示在界面上，用户看到的是「系统在这里读到了这句话」，
+# 而不是一个黑箱分数。
+
+version: 1
+
+rules:
+  # ---------------------------------------------------------------- 政策伪装
+  - id: CT-001
+    category: impersonation
+    title: 冒充国家项目/惠民政策
+    weight: 26
+    confidence: 0.82
+    when:
+      any:
+        - text_all: ["惠民", "补贴"]
+        - text_all: ["乡村振兴", "补贴"]
+        - text_all: ["国家项目", "领取"]
+        - text_all: ["民族资产解冻"]
+        - text_all: ["共同富裕", "名额"]
+        - text_all: ["第三次分配", "登记"]
+        - text_all: ["退役军人", "补助"]
+    detail: 以国家政策名义设置「领取/申领/登记」入口，正规政策不会通过陌生链接发放。
+    cite: 公安部涉老诈骗专项通报；12377 涉养老诈骗举报专区分类说明
+
+  - id: CT-002
+    category: financial
+    title: 承诺固定收益或拉人头奖励
+    weight: 30
+    confidence: 0.86
+    when:
+      any:
+        - text_any: ["每日收益", "日收益率", "静态收益", "动态收益", "保本保息"]
+        - text_any: ["签到返利", "消费全返", "购物全返", "消费返利"]
+        - text_any: ["拉人头", "直推奖", "见点奖", "对碰奖", "团队长"]
+        - text_any: ["下线", "发展会员", "层级奖励"]
+    detail: 以「固定收益 + 拉人奖励」为核心的资金盘结构，收益来自后来者本金。
+    cite: 《防范和处置非法集资条例》；公安部「1040 工程」「云数贸」类案件通报
+
+  - id: CT-003
+    category: impersonation
+    title: 冒用政府机构或国企名义
+    weight: 24
+    confidence: 0.8
+    when:
+      any:
+        - text_any: ["民政部指定", "老龄委指定", "卫健委指定", "国家指定"]
+        - text_any: ["退役军人事务部", "全国老龄工作委员会", "中国老龄协会"]
+        - text_any: ["国家开发银行", "农业发展银行", "社保基金", "全国社保"]
+        - text_any: ["央企背景", "国企直营", "国家控股"]
+    detail: 直接声称由某机构指定或背书，属于可核查的虚假陈述。
+    cite: 各机构公开声明；《广告法》第二十八条虚假广告
+
+  - id: CT-004
+    category: distribution
+    title: 页面诱导下载安装包
+    weight: 22
+    confidence: 0.85
+    when:
+      any:
+        - text_any: ["浏览器打不开", "请用浏览器打开", "请下载APP", "请下载客户端"]
+        - text_any: ["扫码安装", "点击安装", "安卓版下载", "苹果版下载"]
+        - text_all: ["下载", "邀请码"]
+    detail: 正规服务极少要求先装包再使用；「浏览器打不开」是规避应用商店审核的常用话术。
+    cite: 工信部反诈专班「涉诈高风险 APP」提示
+
+  - id: CT-005
+    category: financial
+    title: 页面出现收款账户或钱包地址
+    weight: 28
+    confidence: 0.75
+    when:
+      any:
+        - text_regex: "(?<![0-9])(62|60|58|55|54|53|52|51|50|49|48|47|46|45|44|43|42|41|40)\\d{14,17}(?![0-9])"
+        - text_regex: "(?i)(TRC20|ERC20|USDT|USDC)[^\\n]{0,20}(T[1-9A-HJ-NP-Za-km-z]{33}|0x[a-fA-F0-9]{40})"
+        - text_all: ["转账", "收款账户"]
+        - text_any: ["汇款至", "打款到", "充值到以下账户"]
+    detail: 页面直接给出个人银行卡或虚拟币地址，是资金归集的直接证据。
+    cite: 公安部「断卡」行动通报；虚拟货币交易炒作风险提示
+
+  - id: CT-006
+    category: distribution
+    title: 引导至私域继续沟通
+    weight: 18
+    confidence: 0.78
+    when:
+      any:
+        - text_any: ["加微信", "复制微信号", "添加微信", "加我微信", "企业微信"]
+        - text_any: ["QQ群", "加群", "群号", "Telegram", "电报群", "钉钉群"]
+        - text_all: ["客服", "微信"]
+    detail: 把公域流量导入不可审计的私域，是规避平台监管的固定动作。
+    cite: 中央网信办「清朗」行动；涉老诈骗案件共性手法
+
+  - id: CT-007
+    category: financial
+    title: 收集身份证/银行卡/验证码
+    weight: 32
+    confidence: 0.88
+    when:
+      any:
+        - text_all: ["身份证", "银行卡"]
+        - text_all: ["验证码", "填写"]
+        - text_any: ["人脸识别认证", "手持身份证", "紧急联系人"]
+        - text_all: ["开户", "银行卡号"]
+    detail: 在非持牌平台收集身份证、银行卡与验证码，可直接用于盗刷或洗钱。
+    cite: 《个人信息保护法》第六条最小必要原则；公安部「净网」行动
+
+  - id: CT-008
+    category: persuasion
+    title: 免费礼品引流话术
+    weight: 20
+    confidence: 0.8
+    when:
+      any:
+        - text_any: ["免费领鸡蛋", "领鸡蛋", "送鸡蛋", "免费领取", "到场即送"]
+        - text_any: ["健康讲座", "专家义诊", "免费体检", "免费旅游", "康养旅游"]
+        - text_all: ["免费", "名额"]
+    detail: 「免费礼品 + 讲座」是涉老会销的标准引流组合，后续必然转向推销或投资。
+    cite: 央视网涉老诈骗典型案例；多地市场监管部门消费警示
+
+  - id: CT-009
+    category: persuasion
+    title: 保健品/疗效夸大宣传
+    weight: 20
+    confidence: 0.82
+    when:
+      any:
+        - text_any: ["包治百病", "根治", "特效药", "神药", "祖传秘方", "药到病除"]
+        - text_any: ["细胞修复", "干细胞治疗", "量子科技", "磁疗", "抗衰"]
+        - text_all: ["保健品", "治疗"]
+    detail: 普通食品或保健品宣称治疗功效，属违法广告，也是高价收割的前置话术。
+    cite: 《食品安全法》第七十三条；《广告法》第十七条
+
+  - id: CT-010
+    category: persuasion
+    title: 制造稀缺与时间压力
+    weight: 14
+    confidence: 0.7
+    when:
+      any:
+        - text_any: ["名额有限", "仅限今天", "最后一天", "限时领取", "先到先得"]
+        - text_regex: "(仅限|只剩|限前)\\s*\\d{1,4}\\s*(名|人|位)"
+    detail: 压缩决策时间，让受害者来不及与家人商量。单独不足以定性，但与其他信号同时出现时显著提高可信度。
+    cite: 消费者权益保护组织对会销话术的归纳
+
+  - id: CT-011
+    category: impersonation
+    title: 展示伪造公文/证件
+    weight: 26
+    confidence: 0.72
+    when:
+      any:
+        - text_any: ["红头文件", "加盖公章", "批文", "任命书", "工作证", "授权书"]
+        - text_all: ["国务院", "文件"]
+        - text_all: ["财政部", "批复"]
+    detail: 页面展示公文、批文或工作证照片，需与发文机关公开渠道核对。
+    cite: 《刑法》第二百八十条伪造国家机关公文、证件、印章罪
+
+  - id: CT-012
+    category: financial
+    title: 养老投资/以房养老话术
+    weight: 24
+    confidence: 0.78
+    when:
+      any:
+        - text_any: ["以房养老", "养老公寓", "养老床位", "床位预订", "旅居养老"]
+        - text_all: ["康养基地", "返利"]
+        - text_all: ["养老", "高回报"]
+        - text_all: ["公寓", "托管"]
+    detail: 以养老名义收取床位费、押金或房产抵押，是涉老非法集资的高发形态。
+    cite: 银保监会《关于警惕「以房养老」骗局的风险提示》；民政部养老机构预收费管理提示
+
+  - id: CT-013
+    category: persuasion
+    title: 冒充官方客服/退费
+    weight: 22
+    confidence: 0.76
+    when:
+      any:
+        - text_all: ["退款", "客服"]
+        - text_any: ["百万保障", "自动扣费", "取消会员", "关闭服务"]
+        - text_all: ["屏幕共享", "远程协助"]
+    detail: 「取消自动扣费/退费」是当前最高发的电诈入口，常要求屏幕共享。
+    cite: 国家反诈中心 2026 年高发诈骗类型提示
+
+  - id: CT-014
+    category: persuasion
+    title: 情感关怀与孤独感切入
+    weight: 14
+    confidence: 0.65
+    when:
+      any:
+        - text_any: ["像家人一样", "比子女还亲", "陪您聊天", "认干爹", "认干妈"]
+        - text_all: ["独居老人", "陪伴"]
+    detail: 先用情感陪伴建立信任，再提出资金要求，是「杀猪盘」变体对老人的典型打法。
+    cite: 多地警方涉老诈骗预警

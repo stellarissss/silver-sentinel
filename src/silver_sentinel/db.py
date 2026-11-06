@@ -83,10 +83,26 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("icp_violation_title", "VARCHAR(200) DEFAULT ''"),
         ("icp_checked_at", "DATETIME"),
         ("enrich_count", "INTEGER DEFAULT 0"),
+        ("last_capture_at", "DATETIME"),
+        ("capture_state", "VARCHAR(16) DEFAULT 'pending'"),
+        ("capture_error", "TEXT DEFAULT ''"),
     ],
     "icp_cache": [
         ("violation", "VARCHAR(16) DEFAULT 'unknown'"),
         ("violation_title", "VARCHAR(200) DEFAULT ''"),
+    ],
+    "evidence": [
+        ("mime", "VARCHAR(80) DEFAULT ''"),
+        ("deleted_at", "DATETIME"),
+        ("deleted_by", "VARCHAR(80) DEFAULT ''"),
+        ("delete_reason", "TEXT DEFAULT ''"),
+    ],
+    "watch_targets": [
+        ("asset_id", "INTEGER"),
+        ("auto", "BOOLEAN DEFAULT 0"),
+        ("fail_count", "INTEGER DEFAULT 0"),
+        ("change_count", "INTEGER DEFAULT 0"),
+        ("last_change_at", "DATETIME"),
     ],
 }
 
@@ -94,12 +110,15 @@ _ADDED_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_assets_tier ON assets (tier)",
     "CREATE INDEX IF NOT EXISTS ix_assets_discovery_source ON assets (discovery_source)",
     "CREATE INDEX IF NOT EXISTS ix_assets_tier_score ON assets (tier, score)",
+    "CREATE INDEX IF NOT EXISTS ix_assets_capture_state ON assets (capture_state)",
     "CREATE INDEX IF NOT EXISTS ix_discovery_events_normalized ON discovery_events (normalized)",
     "CREATE INDEX IF NOT EXISTS ix_discovery_events_asset_id ON discovery_events (asset_id)",
     "CREATE INDEX IF NOT EXISTS ix_graph_edges_src ON graph_edges (src)",
     "CREATE INDEX IF NOT EXISTS ix_graph_edges_dst ON graph_edges (dst)",
     "CREATE INDEX IF NOT EXISTS ix_graph_edges_rel ON graph_edges (rel)",
     "CREATE INDEX IF NOT EXISTS ix_graph_nodes_type ON graph_nodes (type)",
+    "CREATE INDEX IF NOT EXISTS ix_evidence_deleted_at ON evidence (deleted_at)",
+    "CREATE INDEX IF NOT EXISTS ix_watch_targets_asset_id ON watch_targets (asset_id)",
 ]
 
 
@@ -157,10 +176,18 @@ def verify_chain(session: Session, asset_id: int | None = None) -> dict:
     for row in session.scalars(stmt):
         expected = compute_chain_hash(prev, row.sha256, row.captured_at.isoformat())
         if row.prev_hash != prev or row.chain_hash != expected:
+            # 区分「被改过」和「压根没写过链」：早期手工导入的数据链是空的，
+            # 直接报「断点」会让人以为有人动过证据。
+            reason = (
+                "该条证据没有链哈希（早期导入或人工写入）"
+                if not row.chain_hash
+                else "链哈希不匹配，内容可能被改动"
+            )
             return {
                 "ok": False,
                 "checked": checked,
                 "broken_at": row.id,
+                "reason": reason,
                 "expected_prev": prev,
                 "actual_prev": row.prev_hash,
             }

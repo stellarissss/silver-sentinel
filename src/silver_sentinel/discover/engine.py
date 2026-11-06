@@ -30,19 +30,19 @@ import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from sqlalchemy import select
 
 from ..config import settings
-from ..normalize import collapse_host
 from ..core.bus import bus
 from ..core.eventlog import emit
 from ..db import session_scope
 from ..domain import utcnow
-from ..models import TIER_CANDIDATE, TIER_COLD, Asset, DiscoveryEvent, KeywordHit, TaskRun
+from ..models import TIER_CANDIDATE, TIER_COLD, Asset, DiscoveryEvent, KeywordHit
+from ..normalize import collapse_host
 from .ct import CertObservation, CertStreamClient, CTLogFollower, CtrlShSearch
 from .dnsprobe import DNSProbe, SeedGenerator
 from .keywords import get_library
@@ -349,7 +349,6 @@ class DiscoveryEngine:
             emit("discover.flush_failed", count=len(rows), error=str(exc)[:200])
 
     def _persist(self, session, rows: list[tuple]) -> int:
-        now = time.time()
         created = 0
         assets: list[dict[str, Any]] = []
         for obs, kind, value, score, terms, host in rows:
@@ -466,10 +465,6 @@ class DiscoveryEngine:
                     skipped += 1
                     continue
                 match = self.lib.match_domain(value)
-                obs = CertObservation(
-                    domain=value, all_domains=[value], issuer="", not_before="",
-                    fingerprint="", log_url=source, entry_index=0, source=source,
-                )
                 note_text = note or "人工导入"
                 existing = session.scalar(
                     select(Asset.id).where(Asset.kind == "domain", Asset.normalized == value)

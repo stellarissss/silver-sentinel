@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "silver-sentinel"
-version = "1.4.2"
+version = "1.5.0"
 description = "银发哨兵：涉老诈骗的持续发现、动态取证、图谱归因与处置闭环"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -82,4 +82,6 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-ignore = ["E501", "B008"]
+# UP042（str+Enum → StrEnum）不改：`f"{AssetKind.URL}"` 在 str+Enum 下是
+# "AssetKind.URL"、在 StrEnum 下是 "url"，会悄悄改掉日志与导出文件的文本。
+ignore = ["E501", "B008", "UP042"]

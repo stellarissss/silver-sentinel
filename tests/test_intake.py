@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from sqlalchemy import select
 
 from silver_sentinel.db import session_scope, verify_chain

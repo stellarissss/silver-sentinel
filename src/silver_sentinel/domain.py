@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -21,7 +21,7 @@ def utcnow() -> datetime:
     证据链的 isoformat 校验会永远失败。全链路统一为 naive UTC 最省事，
     展示层负责补 'Z' 再交给浏览器本地化。
     """
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class AssetKind(str, Enum):

@@ -54,6 +54,29 @@ _APK_LINK = re.compile(r"https?://[^\s\"'<>]+\.apk(?:\?[^\s\"'<>]*)?", re.IGNORE
 _INTERESTING_EXT = (".apk", ".ipa", ".exe", ".zip", ".rar", ".dmg")
 
 
+def _shrink_image(data: bytes, *, max_height: int = 6000, max_bytes: int = 1_400_000) -> bytes:
+    """把全页截图裁到可接受的高度与体积。失败时原样返回，不能让截图问题拖垮取证。"""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        im = Image.open(BytesIO(data))
+        if im.height > max_height:
+            im = im.crop((0, 0, im.width, max_height))
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        for quality in (68, 55, 42):
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
+            out = buf.getvalue()
+            if len(out) <= max_bytes:
+                return out
+        return out
+    except Exception:  # noqa: BLE001
+        return data
+
+
 def _is_private_host(host: str) -> bool:
     if not host:
         return True
@@ -85,7 +108,10 @@ class WebObservation:
     # 页面明天改版就再也拿不回来了，必须原样固化。
     html: str = ""
     screenshot: bytes = b""
+    # 全页截图：首屏只能看到「活动已结束」之类的幌子，整页才露馅
+    screenshot_full: bytes = b""
     html_len: int = 0
+    tls: dict[str, Any] = field(default_factory=dict)
     redirects: list[dict[str, Any]] = field(default_factory=list)
     requests: list[dict[str, Any]] = field(default_factory=list)
     forms: list[dict[str, Any]] = field(default_factory=list)
@@ -108,6 +134,8 @@ class WebObservation:
             "text": self.text[:20000],
             "html_len": self.html_len,
             "screenshot_bytes": len(self.screenshot),
+            "screenshot_full_bytes": len(self.screenshot_full),
+            "tls": self.tls,
             "redirects": self.redirects[:30],
             "requests": self.requests[:200],
             "forms": self.forms[:20],
@@ -184,9 +212,19 @@ class WebSandbox:
             return obs
 
         proxy_url = guard.proxy_for(url)
-        # 浏览器执行是最强的指纹（WebRTC / Canvas / TLS），没有隔离出口就不跑。
-        if settings.opsec_require_proxy_for_sandbox and kind == "suspect" and not proxy_url:
-            obs.error = "沙箱要求隔离出口：未配置代理，已拒绝运行（避免暴露采集机 IP 与内网地址）"
+        # 出口模式以 Guard 为准：它已经吸收了界面配置与 fail-closed 策略，
+        # 这里再读一次配置容易出现「门禁说能走、Guard 说不能」的分裂。
+        egress_mode = guard.mode
+
+        if egress_mode == "off":
+            obs.error = "出口模式为「关闭」，已跳过本次页面执行"
+            self.stats["blocked_egress"] = self.stats.get("blocked_egress", 0) + 1
+            return obs
+        # 只有在「要求代理」的模式下，缺代理才拒绝。
+        # auto/direct 是明确允许直连的降级路径——否则线上没有代理就永远取不到证，
+        # 界面会一直显示 0 条证据，等于功能没做。
+        if settings.opsec_require_proxy_for_sandbox and egress_mode == "proxy" and not proxy_url:
+            obs.error = "出口模式为「仅代理」但未配置代理，已拒绝运行"
             self.stats["blocked_egress"] = self.stats.get("blocked_egress", 0) + 1
             return obs
         obs.egress = "proxy" if proxy_url else "direct"
@@ -302,6 +340,27 @@ class WebSandbox:
                 obs.screenshot = page.screenshot(full_page=False, type="png", animations="disabled")
             except Exception as exc:  # noqa: BLE001
                 log.debug("截图失败：%s", exc)
+            # 全页截图：首屏常被伪装成「活动已结束」，整页才看得到表单和二维码。
+            # 限高 + JPEG，避免超长落地页把 2G 内存打满。
+            try:
+                raw = page.screenshot(full_page=True, type="jpeg", quality=68, animations="disabled")
+                obs.screenshot_full = _shrink_image(raw, max_height=6000)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("全页截图失败：%s", exc)
+
+            # TLS 证书：签发者与有效期是「同一团伙批量签发」的重要关联依据
+            try:
+                details = response.security_details() if response else None
+                if details:
+                    obs.tls = {
+                        "subject": details.get("subjectName", ""),
+                        "issuer": details.get("issuer", ""),
+                        "valid_from": details.get("validFrom", ""),
+                        "valid_to": details.get("validTo", ""),
+                        "protocol": details.get("protocol", ""),
+                    }
+            except Exception:  # noqa: BLE001
+                obs.tls = {}
             # 表单：只看 action 与字段名，不看用户填什么（也没有用户）
             try:
                 obs.forms = page.evaluate(

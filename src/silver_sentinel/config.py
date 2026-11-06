@@ -143,6 +143,16 @@ class Settings:
     # adb/emulator 设备串号（可选）
     android_serial: str = ""
 
+    # ---------------------------------------------------------------- 取证队列
+    # 每个周期跑几个页面。2G 内存跑 Chromium 必须串行，单次 30–45 秒，
+    # 2 个一周期约 90 秒，正好跟上 60 秒 tick 的节奏。
+    capture_enabled: bool = True
+    capture_batch: int = 2
+    # 每轮补多少条「有效但没取过证」的资产进队列
+    capture_backfill_limit: int = 12
+    # 队列空闲时的轮询间隔
+    capture_interval_seconds: int = 45
+
     # ---------------------------------------------------------------- 出站防护（OPSEC）
     # 默认开启：拦内网/元数据、去标识 UA、导出脱敏。是否需要代理才允许访问可疑目标，
     # 由 allow_direct 控制；生产环境应设为 0（fail-closed）。
@@ -306,6 +316,11 @@ class Settings:
         self.mobsf_api_key = _str("SILVER_MOBSF_KEY", "")
         self.android_serial = _str("SILVER_ANDROID_SERIAL", "")
 
+        self.capture_enabled = _bool("SILVER_CAPTURE_ENABLED", True)
+        self.capture_batch = max(1, _int("SILVER_CAPTURE_BATCH", self.capture_batch))
+        self.capture_backfill_limit = max(0, _int("SILVER_CAPTURE_BACKFILL", self.capture_backfill_limit))
+        self.capture_interval_seconds = max(10, _int("SILVER_CAPTURE_INTERVAL", self.capture_interval_seconds))
+
         self.opsec_enabled = _bool("SILVER_OPSEC_ENABLED", True)
         self.opsec_allow_direct = _bool("SILVER_OPSEC_ALLOW_DIRECT", True)
         self.opsec_proxies = _str("SILVER_OPSEC_PROXIES", "")
@@ -405,20 +420,32 @@ class Settings:
 
     def capability_report(self) -> dict[str, bool | str]:
         """给运维页面看的「哪些能力真的开着」。坦承降级比假装可用重要。"""
+        # 运行时配置（前端可改）优先。这里不能顶层 import，会循环。
+        try:
+            from .runtime_settings import egress_config, llm_config
+
+            egress = egress_config()
+            llm_cfg = llm_config()
+        except Exception:  # noqa: BLE001
+            egress = {
+                "effective": "proxy" if self.opsec_proxies.strip() else "direct",
+                "isolated": bool(self.opsec_proxies.strip()),
+                "mode": "auto",
+            }
+            llm_cfg = {"ready": self.llm_ready, "model": self.llm_model}
+
+        egress_ok = egress["effective"] != "off" and (
+            egress["isolated"] or egress["effective"] == "direct"
+        )
         return {
             "network": self.allow_network,
             "ct_stream": self.ct_stream_enabled and self.allow_network,
             "icp": self.icp_ready,
             "graph": "neo4j" if self.neo4j_ready else ("builtin" if self.graph_enabled else "off"),
-            # 配了浏览器但没有隔离出口，实际一次也跑不起来（fail-closed），
-            # 报 true 就是自欺：运维页必须显示「有能力但被出口卡住」。
-            "sandbox_web": (
-                self.sandbox_enabled
-                and self.sandbox_browser_enabled
-                and (self.egress_isolated or self.opsec_allow_direct)
-            ),
+            # 有浏览器但出口被关掉，实际一次也跑不起来。报 true 就是自欺。
+            "sandbox_web": bool(self.sandbox_enabled and self.sandbox_browser_enabled and egress_ok),
             "sandbox_web_blocked_by": (
-                "" if (self.egress_isolated or self.opsec_allow_direct) else "no-proxy"
+                "" if egress_ok else ("egress-off" if egress["effective"] == "off" else "no-proxy")
             )
             if (self.sandbox_enabled and self.sandbox_browser_enabled)
             else "",
@@ -428,9 +455,13 @@ class Settings:
             "egress": (
                 "off"
                 if not self.opsec_enabled
-                else ("proxy" if self.egress_isolated else ("direct-degraded" if self.opsec_allow_direct else "blocked"))
+                else (
+                    "proxy" if egress["isolated"]
+                    else ("blocked" if egress["effective"] == "off" else "direct-degraded")
+                )
             ),
-            "llm": "ready" if self.llm_ready else "off",
+            "llm": "ready" if llm_cfg["ready"] else "off",
+            "llm_model": llm_cfg.get("model", ""),
             # 举报是「服务端备料 + 浏览器代填」，本机随时可生成材料；
             # 能不能一步跳到表单，取决于用户浏览器里装没装扩展。
             "report": "material+fill" if self.report_extension_token else "material+fill-local",

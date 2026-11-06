@@ -20,7 +20,6 @@ from silver_sentinel.evidence import append
 from silver_sentinel.models import Asset, SignalRow
 from silver_sentinel.report import channels, harmtype, narrative, service
 
-
 PAGE_TEXT = (
     "国家惠民养老补贴申领中心 关于开展2026年度高龄老人养老补贴申领工作的通知 "
     "凡年满65周岁的城乡居民，均可申领本年度养老补贴，标准为每人每月800元，一次性补发12个月共9600元。"

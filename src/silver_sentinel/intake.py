@@ -15,13 +15,16 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from . import triage
 from .analyzers import llm as llm_analyzer
 from .analyzers.cluster import cluster
-from .collectors import crtsh, reputation, typosquat
 from .collectors import apk as apk_collector
+from .collectors import crtsh, reputation, typosquat
 from .config import settings
 from .db import session_scope
+from .discover.keywords import get_library
 from .domain import Assessment, AssetKind, Signal, utcnow
+from .enrich.icp import get_icp
 from .evidence import append as append_evidence
 from .evidence import append_file
 from .models import Asset, SignalRow
@@ -38,9 +41,6 @@ from .normalize import (
     tld_of,
 )
 from .scoring.engine import assess, load_ruleset, priority_of
-from . import triage
-from .discover.keywords import get_library
-from .enrich.icp import get_icp
 
 log = logging.getLogger(__name__)
 
@@ -108,23 +108,37 @@ def _collect_url_facts(
     if not settings.allow_network:
         return facts, meta
 
-    age = reputation.rdap_age_days(domain)
-    if age is not None:
-        facts["domain_age_days"] = age
-        meta["domain_age_days"] = age
+    # 每个情报源单独兜底：代理挂了、接口限流、DNS 超时，都不能让整次研判失败。
+    # 情报是「尽力而为」，规则才是「确定的」。
+    try:
+        age = reputation.rdap_age_days(domain)
+        if age is not None:
+            facts["domain_age_days"] = age
+            meta["domain_age_days"] = age
+    except Exception:  # noqa: BLE001
+        log.debug("RDAP 查询失败", exc_info=True)
 
-    ip_list = typosquat.resolve(host)
-    if ip_list:
-        meta["ips"] = ip_list
+    try:
+        ip_list = typosquat.resolve(host)
+        if ip_list:
+            meta["ips"] = ip_list
+    except Exception:  # noqa: BLE001
+        log.debug("DNS 解析失败", exc_info=True)
 
-    uh = reputation.urlhaus_lookup(host)
-    facts["urlhaus_listed"] = bool(uh and uh.get("listed"))
-    if uh:
-        meta["urlhaus"] = uh
+    try:
+        uh = reputation.urlhaus_lookup(host)
+        facts["urlhaus_listed"] = bool(uh and uh.get("listed"))
+        if uh:
+            meta["urlhaus"] = uh
+    except Exception:  # noqa: BLE001
+        log.debug("URLhaus 查询失败", exc_info=True)
 
-    phish = reputation.openphish_listed(url)
-    if phish is not None:
-        facts["openphish_listed"] = phish
+    try:
+        phish = reputation.openphish_listed(url)
+        if phish is not None:
+            facts["openphish_listed"] = phish
+    except Exception:  # noqa: BLE001
+        log.debug("OpenPhish 查询失败", exc_info=True)
 
     if not quick:
         try:
@@ -321,20 +335,30 @@ def scan(
             )
         assessment.notes.append(f"匹配到公开通报条目：{entry['name']}，须人工核对包名/域名后再定性")
 
-    # ---- LLM（失败即弃权）
-    if run_llm and settings.llm_ready:
-        payload = {
-            "asset": {"kind": kind, "value": display_value[:300]},
-            "facts": {k: v for k, v in facts.items() if v not in (None, "", [], 0)},
-            "signals": [
-                {"id": s.rule_id, "title": s.title, "weight": s.weight, "detail": s.detail}
-                for s in assessment.top_signals[:12]
-            ],
-            "rule_score": assessment.score,
-            "rule_verdict": assessment.verdict,
-            "text_excerpt": corpus[:3000],
-        }
-        assessment.llm = llm_analyzer.analyze(payload)
+    # ---- LLM：只做灰区，不做全量
+    # 全量调用既慢又贵，而高分（≥70）和低分（<25）本来就不需要模型：
+    # 前者证据已经足够，后者连证据都没有，问了也只能得到「不确定」。
+    from . import runtime_settings
+
+    llm_cfg = runtime_settings.llm_config()
+    if llm_cfg["ready"]:
+        in_gray = llm_cfg["gray_low"] <= assessment.score <= llm_cfg["gray_high"]
+        has_content = bool(facts.get("page_text_len")) or len(corpus) > 600
+        forced = bool(manual.get("force_llm"))
+        if forced or (in_gray and has_content):
+            payload = {
+                "asset": {"kind": kind, "value": display_value[:300]},
+                "facts": {k: v for k, v in facts.items() if v not in (None, "", [], 0)},
+                "signals": [
+                    {"id": s.rule_id, "title": s.title, "weight": s.weight, "detail": s.detail}
+                    for s in assessment.top_signals[:12]
+                ],
+                "rule_score": assessment.score,
+                "rule_verdict": assessment.verdict,
+                "text_excerpt": corpus[:6000],
+                "note": "reasoning 中请用 [E:证据编号] 标注引用；无编号视为未引用。",
+            }
+            assessment.llm = llm_analyzer.analyze(payload)
 
     # ---- 富化：ICP 备案（只对值得查的目标，接口有严格频率限制）
     icp_result = None
@@ -425,6 +449,16 @@ def scan(
     )
 
     session.flush()
+
+    # ---- 自动纳管：分级到 watch/confirmed 就该进监控队列。
+    # 以前 WatchTarget 只能手动建，所以「监控」页永远是空的。
+    if asset.tier in ("watch", "confirmed"):
+        try:
+            from .capture import ensure_watch
+
+            ensure_watch(asset.id)
+        except Exception:  # noqa: BLE001
+            log.debug("自动纳管失败", exc_info=True)
 
     if do_cluster:
         try:

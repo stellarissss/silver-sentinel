@@ -18,6 +18,7 @@
     watch: "监控",
     ops: "运维",
     rules: "规则库",
+    settings: "设置",
   };
 
   // 别名：人说「资产」「列表」「首页」，系统里叫「线索库」「概览」
@@ -31,6 +32,7 @@
     watch: "监控 盯防 关键词 watch",
     ops: "运维 状态 任务 日志 能力",
     rules: "规则 判定 权重 rule",
+    settings: "设置 配置 密钥 key api 出口 代理 配额 llm deepseek",
   };
 
   /* ---------------------------------------------------------- 主题 */
@@ -60,6 +62,29 @@
       root.setAttribute("data-theme", e.matches ? "dark" : "light");
     });
   } catch (e) {}
+
+  /* ---------------------------------------------------------- 侧栏折叠 */
+  // 窄屏（<=1180px）时 CSS 已经强制成图标条，这里只管宽屏的手动收起
+  const SIDE_KEY = "ss-side";
+
+  function applySide(mini) {
+    root.setAttribute("data-side", mini ? "mini" : "full");
+    try { localStorage.setItem(SIDE_KEY, mini ? "mini" : "full"); } catch (e) {}
+    const btn = $("#btn-side");
+    if (btn) {
+      const label = mini ? "展开侧栏（Ctrl+B）" : "收起侧栏（Ctrl+B）";
+      btn.title = label;
+      btn.setAttribute("aria-label", label);
+      btn.setAttribute("aria-expanded", mini ? "false" : "true");
+    }
+  }
+
+  let sideMini = false;
+  try { sideMini = localStorage.getItem(SIDE_KEY) === "mini"; } catch (e) {}
+  applySide(sideMini);
+
+  const sideBtn = $("#btn-side");
+  if (sideBtn) sideBtn.addEventListener("click", () => applySide(root.getAttribute("data-side") !== "mini"));
 
   /* ---------------------------------------------------------- 请求进度线 */
   const line = $("#topline");
@@ -168,8 +193,10 @@
   }
 
   document.addEventListener("click", (ev) => {
-    const th = ev.target.closest("#asset-table thead th, .table-wrap thead th");
+    const th = ev.target.closest(".table-wrap thead th");
     if (!th) return;
+    // data-sort 的表头由页面自己走服务端排序，本地 DOM 排序会让分页结果错位
+    if (th.dataset.sort) return;
     const table = th.closest("table");
     const tbody = table && table.tBodies[0];
     if (!tbody) return;
@@ -241,7 +268,10 @@
       label: "刷新当前视图",
       hint: "动作",
       key: "刷新 重载 更新 refresh reload",
-      run: () => { window.loadHealth && window.loadHealth(); window.switchView(window.state ? window.state.view : "overview"); },
+      run: () => {
+        window.loadHealth && window.loadHealth();
+        window.switchView(window.ssState ? window.ssState.view : "overview");
+      },
     });
     return out;
   }
@@ -344,6 +374,11 @@
   document.addEventListener("keydown", (e) => {
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || "").toUpperCase());
 
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
+      e.preventDefault();
+      applySide(root.getAttribute("data-side") !== "mini");
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
       cmdk && cmdk.classList.contains("show") ? closeCmdk() : openCmdk();
@@ -364,7 +399,8 @@
         return;
       }
       if (window.__ssG) {
-        const map = { o: "overview", d: "discover", s: "scan", a: "assets", g: "graph", c: "campaigns", w: "watch", p: "ops", r: "rules" };
+        const map = { o: "overview", d: "discover", s: "scan", a: "assets", g: "graph",
+          c: "campaigns", w: "watch", p: "ops", r: "rules", e: "settings" };
         const v = map[e.key];
         window.__ssG = false;
         if (v) { e.preventDefault(); window.switchView(v); }
@@ -401,7 +437,7 @@
   function paintSkeleton() {
     const kpis = $("#kpis");
     if (kpis && !kpis.children.length) {
-      kpis.innerHTML = Array.from({ length: 5 }, () => `
+      kpis.innerHTML = Array.from({ length: 6 }, () => `
         <div class="kpi">
           <div class="skel" style="width:54%;height:30px"></div>
           <div class="skel" style="width:38%;height:10px;margin-top:11px"></div>

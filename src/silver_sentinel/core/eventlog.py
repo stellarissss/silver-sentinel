@@ -69,7 +69,7 @@ class Event:
         )
 
     @classmethod
-    def from_line(cls, line: str) -> "Event | None":
+    def from_line(cls, line: str) -> Event | None:
         line = line.strip()
         if not line:
             return None

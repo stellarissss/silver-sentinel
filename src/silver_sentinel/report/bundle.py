@@ -143,7 +143,7 @@ def pdf_html(ctx: Ctx, channel: Any, body: str, shots: list[tuple[str, bytes, st
     )
 
     shot_html = []
-    for i, (name, data, mime) in enumerate(shots[:6], 1):
+    for i, (_name, data, mime) in enumerate(shots[:6], 1):
         b64 = base64.b64encode(data).decode()
         shot_html.append(
             f"<div class='shot'><img src='data:{mime};base64,{b64}'/>"
@@ -307,7 +307,7 @@ def build(
             f"被举报对象：{ctx.asset.value}\n\n"
             "核验方法：sha256sum -c manifest.sha256\n"
             "manifest.json 记录每个文件的 SHA-256 与证据链首尾哈希。\n"
-        ).encode("utf-8")
+        ).encode()
         zf.writestr("README.txt", readme)
         manifest["files"].append({"name": "README.txt", "sha256": _sha(readme), "size": len(readme)})
 

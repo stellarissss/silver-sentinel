@@ -16,6 +16,7 @@ async function loadDiscover() {
     renderDiscoverKpis(status, kpi);
     renderSources(status);
     renderKeywordHits();
+    loadFunnel($("#funnel"));
     await loadDiscoverFeed();
     startDiscoverPolling();
   } catch (e) {
@@ -593,17 +594,214 @@ async function openAssetByValue(key) {
 
 async function loadOps() {
   try {
-    const [status, tasks, events] = await Promise.all([
+    const [status, tasks, events, queue, funnel] = await Promise.all([
       api("/api/ops/status"),
       api("/api/ops/tasks?limit=20"),
       api("/api/ops/events?limit=40"),
+      api("/api/capture/queue").catch(() => null),
+      api("/api/funnel").catch(() => null),
     ]);
     renderCapabilities(status.capabilities || {});
     renderRuntime(status);
     renderTasks(tasks.items || []);
     renderEventTail(events.items || []);
+    renderOpsKpis(queue, funnel, status);
+    renderCaptureQueue(queue);
+    renderFunnel($("#funnel-ops"), funnel);
   } catch (e) {
     toast(`运维数据加载失败：${e.message}`);
+  }
+}
+
+/* 运维 KPI：把「机器有没有在干活」压缩成五行数字 */
+function renderOpsKpis(queue, funnel, status) {
+  const el = $("#ops-kpis");
+  if (!el) return;
+  const q = queue || {};
+  const done = q.done || 0;
+  const failed = q.failed || 0;
+  const okRate = done + failed ? (done / (done + failed)) * 100 : 0;
+  const cov = (funnel && funnel.coverage) || {};
+  const items = [
+    { num: q.pending_assets || 0, lab: "待取证资产", hint: "有效且未打开过页面", cls: "" },
+    { num: q.queued || 0, lab: "队列中", hint: q.oldest_queued ? `最久等待 ${fmtTime(q.oldest_queued)}` : "空闲", cls: "" },
+    { num: done, lab: "已取证", hint: "本次进程内完成", cls: "good" },
+    { num: failed, lab: "取证失败", hint: failed ? "看下面的失败原因" : "无", cls: failed ? "danger" : "" },
+    { num: done + failed ? `${okRate.toFixed(0)}%` : "—", lab: "取证成功率", hint: "完成 / (完成+失败)", cls: "" },
+    { num: `${((cov.ratio || 0) * 100).toFixed(0)}%`, lab: "证据覆盖率", hint: `${cov.captured || 0}/${cov.active || 0} 条有效线索有页面证据`, cls: "" },
+  ];
+  el.innerHTML = items.map(i => `
+    <div class="kpi ${i.cls}">
+      <div class="num">${escapeHtml(String(i.num))}</div>
+      <div class="lab">${escapeHtml(i.lab)}</div>
+      <div class="kpi-hint">${escapeHtml(i.hint)}</div>
+    </div>`).join("");
+}
+
+function renderCaptureQueue(queue) {
+  const el = $("#capture-queue");
+  if (!el) return;
+  if (!queue) { el.innerHTML = `<div class="empty">读取失败</div>`; return; }
+  const rows = [
+    ["排队中", queue.queued || 0],
+    ["执行中", queue.running || 0],
+    ["已完成", queue.done || 0],
+    ["失败", queue.failed || 0],
+    ["跳过（不支持取证的类型）", queue.skipped || 0],
+    ["有效但未取证资产", queue.pending_assets || 0],
+  ];
+  const fails = queue.recent_failures || [];
+  el.innerHTML = rows.map(([k, v]) => `
+      <div class="status-line"><b>${escapeHtml(k)}</b><span>${fmtNum(v)}</span></div>`).join("")
+    + (fails.length ? `
+      <div class="section-title">最近失败</div>
+      ${fails.map(f => `<div class="status-line">
+        <span class="dotmark bad"></span>
+        <b>资产 #${f.asset_id}</b>
+        <span>${escapeHtml(String(f.error || "").slice(0, 70))}（第 ${f.attempts} 次）</span>
+      </div>`).join("")}` : "");
+}
+
+/* 五段漏斗：每一段都写绝对值和转化率，谁掉得最狠一眼能看出来 */
+function renderFunnel(el, data) {
+  if (!el) return;
+  const steps = (data && data.steps) || [];
+  if (!steps.length) {
+    el.innerHTML = `<div class="empty">发现引擎未启动，暂无漏斗数据。</div>`;
+    return;
+  }
+  const max = Math.max(...steps.map((s) => s.value || 0), 1);
+  el.innerHTML = steps.map((s, i) => {
+    const value = s.value || 0;
+    const width = value ? Math.max(2, (value / max) * 100).toFixed(1) : "0";
+    const rate = i === 0
+      ? "起点"
+      : (s.rate ? `转化 ${(s.rate * 100).toFixed(1)}%` : "—");
+    return `
+      <div class="funnel-row">
+        <div class="fs-label">${escapeHtml(s.label)}</div>
+        <div class="fs-track"><i style="width:${width}%"></i></div>
+        <div class="fs-num">${fmtNum(value)}</div>
+        <div class="fs-rate">${rate}</div>
+      </div>`;
+  }).join("")
+    + `<div class="funnel-foot">近 24 小时：新增线索 <b>${fmtNum(data.admitted_24h)}</b> 条 · 发现事件 <b>${fmtNum(data.events_24h)}</b> 条</div>`;
+}
+
+async function loadFunnel(el) {
+  if (!el) return;
+  try {
+    renderFunnel(el, await api("/api/funnel"));
+  } catch (e) {
+    el.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/* ================= 设置 ================= */
+
+const SETTINGS = { data: null };
+
+async function loadSettings() {
+  try {
+    const data = await api("/api/settings");
+    SETTINGS.data = data;
+    fillSettings(data);
+  } catch (e) {
+    toast(`设置读取失败：${e.message}`);
+  }
+}
+
+function fillSettings(d) {
+  const llm = d.llm || {};
+  const eg = d.egress || {};
+  const cap = d.capture || {};
+
+  const set = (sel, val) => { const el = $(sel); if (el) el.value = val; };
+  set("#set-llm-base", llm.base_url || "");
+  set("#set-llm-model", llm.model || "");
+  set("#set-llm-low", llm.gray_low ?? 25);
+  set("#set-llm-high", llm.gray_high ?? 70);
+
+  const key = $("#set-llm-key");
+  if (key) {
+    key.value = "";
+    key.placeholder = llm.has_key
+      ? `当前 ${llm.api_key_masked}，留空表示不修改`
+      : "sk-…（填写后保存即生效）";
+  }
+
+  const enabled = $("#set-llm-enabled");
+  if (enabled) enabled.checked = !!llm.enabled;
+
+  const preset = $("#set-llm-preset");
+  if (preset) {
+    preset.innerHTML = (llm.presets || [])
+      .map(p => `<option value="${escapeHtml(p.model)}">${escapeHtml(p.label)}</option>`)
+      .join("") + `<option value="">自定义</option>`;
+    preset.value = (llm.presets || []).some(p => p.model === llm.model) ? llm.model : "";
+    preset.onchange = () => {
+      const hit = (llm.presets || []).find(p => p.model === preset.value);
+      if (!hit) return;
+      set("#set-llm-model", hit.model);
+      set("#set-llm-base", hit.base_url);
+    };
+  }
+
+  const state = $("#llm-state");
+  if (state) {
+    state.textContent = llm.ready ? `已就绪 · ${llm.model}` : (llm.has_key ? "已填密钥但模型未就绪" : "未配置密钥");
+  }
+
+  document.querySelectorAll('input[name="egress-mode"]').forEach(r => {
+    r.checked = r.value === (eg.mode || "auto");
+  });
+
+  const px = $("#set-egress-proxies");
+  if (px) {
+    px.value = "";
+    px.placeholder = (eg.proxies_masked || []).length
+      ? `当前已配置 ${eg.proxy_count} 条（已隐藏凭据）：\n${eg.proxies_masked.join("\n")}\n留空表示不修改`
+      : "socks5h://user:pass@host:1080\n每行一个，或逗号分隔";
+  }
+
+  const egState = $("#egress-state");
+  if (egState) {
+    const modeLabel = { auto: "自动", proxy: "仅代理", direct: "强制直连", off: "已关闭" }[eg.mode] || eg.mode;
+    egState.textContent = `${modeLabel} · 当前生效：${eg.effective === "proxy" ? "代理" : eg.effective === "off" ? "不出网" : "直连"}`;
+  }
+
+  renderEgressWarning(eg);
+
+  set("#set-apk-max", cap.apk_max_mb ?? 50);
+  set("#set-apk-daily", cap.apk_daily_mb ?? 300);
+  set("#set-apk-tiers", cap.apk_tiers || "watch,confirmed");
+
+  // 保存后统一回填，避免前端自己猜服务端把值规范化成了什么
+  const refill = (data) => { SETTINGS.data = data; fillSettings(data); };
+  window.ssRefillSettings = refill;
+}
+
+function renderEgressWarning(eg) {
+  const el = $("#egress-warning");
+  if (!el) return;
+  const mode = eg.mode || "auto";
+  const count = eg.proxy_count || 0;
+  if (mode === "proxy" && count === 0) {
+    el.className = "note-line warn-text";
+    el.textContent = "已选「仅代理」但没有可用代理：所有取证都会被拒绝。要么填代理，要么改成「自动」。";
+  } else if (mode === "direct" || (mode === "auto" && count === 0)) {
+    el.className = "note-line warn-text";
+    el.textContent = "当前会以本机 IP 直接访问可疑站点，对方日志里能看到你的地址。正式运行建议配一条境外 SOCKS5。";
+  } else if (mode === "off") {
+    el.className = "note-line";
+    el.textContent = "取证已关闭：不会再打开任何页面，「待取证」会一直累积。";
+  } else {
+    el.className = "note-line";
+    el.textContent = `出口正常：${count} 条代理可用，取证会轮换使用。`;
+  }
+  // 配了代理但没被判定为隔离，才值得提醒；没配代理的情况上面已经说清楚了
+  if (count > 0 && eg.isolated === false && mode !== "off") {
+    el.textContent += " 注意：代理已配置但未判定为隔离出口，确认代理确实生效再上生产。";
   }
 }
 
@@ -614,26 +812,54 @@ const CAP_LABEL = {
   graph: "关系图谱",
   sandbox_web: "网页沙箱",
   sandbox_apk: "APK 沙箱",
+  egress: "取证出口",
   replica: "异地副本",
-  llm: "LLM 研判",
+  vault: "加密保险库",
+  llm: "AI 研判",
+  report: "举报材料",
 };
+
+/* 固定顺序 + 固定 11 格。
+   后端会多返回 sandbox_web_blocked_by / llm_model 两个附属字段，
+   它们不是独立能力，硬塞成格子会多出一个空位，看起来像界面坏了。 */
+const CAP_ORDER = ["network", "ct_stream", "icp", "graph", "sandbox_web", "sandbox_apk",
+  "egress", "replica", "vault", "llm", "report"];
+
+const CAP_TEXT = {
+  "direct-degraded": "直连（未隔离）",
+  blocked: "被关闭",
+  off: "未启用",
+  "static-only": "仅静态解析",
+  "material+fill-local": "本机生成",
+  "material+fill": "可自动填表",
+  unconfigured: "未配置",
+};
+
+function capState(value) {
+  if (value === true || value === "ready" || value === "builtin" || value === "neo4j") return "ok";
+  if (value === "static-only" || value === "off" || value === false || value === "unconfigured") return "off";
+  if (value === "direct-degraded" || value === "blocked" || value === "material+fill-local") return "warn";
+  if (value === "mobsf" || value === "emulator" || value === "material+fill") return "ok";
+  return "warn";
+}
 
 function renderCapabilities(caps) {
   const el = $("#capability-grid");
   if (!el) return;
-  el.innerHTML = Object.entries(caps)
-    .map(([k, v]) => {
-      let state = "off";
-      let text = String(v);
-      if (v === true || v === "ready" || v === "builtin" || v === "neo4j") state = "ok";
-      else if (v === "static-only" || v === "off" || v === false) state = "off";
-      el.dataset.x = "";
-      return `<div class="cap ${state}">
-        <span class="cap-name">${escapeHtml(CAP_LABEL[k] || k)}</span>
-        <span class="cap-state">${escapeHtml(text)}</span>
+
+  el.innerHTML = CAP_ORDER.map((key) => {
+    const raw = caps[key];
+    let text = CAP_TEXT[raw] !== undefined ? CAP_TEXT[raw] : String(raw);
+    if (key === "llm" && raw === "ready" && caps.llm_model) text = `就绪 · ${caps.llm_model}`;
+    if (key === "sandbox_web" && caps.sandbox_web_blocked_by) {
+      text += `（${CAP_TEXT[caps.sandbox_web_blocked_by] || caps.sandbox_web_blocked_by}）`;
+    }
+    if (raw === true) text = "可用";
+    return `<div class="cap">
+        <span class="cap-name">${escapeHtml(CAP_LABEL[key] || key)}</span>
+        <span class="cap-state ${capState(raw)}">${escapeHtml(text)}</span>
       </div>`;
-    })
-    .join("");
+  }).join("");
 }
 
 function renderRuntime(status) {
@@ -818,11 +1044,12 @@ document.addEventListener("DOMContentLoaded", () => {
         const r = await api("/api/ops/verify");
         const el = r.eventlog || {};
         const ec = r.evidence_chain || {};
-        toast(
-          el.ok && ec.ok
-            ? `校验通过：事件 ${el.checked} 条，证据 ${ec.checked} 条`
-            : `校验失败：${el.reason || ec.reason || "存在断点"}`
-        );
+        if (el.ok && ec.ok) {
+          toast(`校验通过：事件 ${el.checked} 条，证据 ${ec.checked} 条`);
+        } else {
+          const bad = !el.ok ? el : ec;
+          toast(`校验失败：第 ${bad.broken_at ?? "?"} 条 — ${bad.reason || "存在断点"}`);
+        }
       } catch (e) {
         toast(e.message);
       }
@@ -833,7 +1060,180 @@ document.addEventListener("DOMContentLoaded", () => {
   if (feed) {
     feed.addEventListener("click", (ev) => {
       const row = ev.target.closest("[data-asset]");
-      if (row) openDrawer(Number(row.dataset.asset));
+      if (row) window.openAsset(Number(row.dataset.asset));
+    });
+  }
+
+  /* ---- 取证 ---- */
+  const runCapture = $("#btn-run-capture");
+  if (runCapture) {
+    runCapture.addEventListener("click", async () => {
+      runCapture.disabled = true;
+      toast("正在取证，两个目标通常需要 10–40 秒…");
+      try {
+        const r = await api("/api/capture/run?limit=2", { method: "POST" });
+        toast(r.ok ? `完成 ${r.ok} 个，失败 ${r.failed || 0} 个` : `没有可执行的任务（排队 ${r.queued ?? 0}）`);
+        loadOps();
+      } catch (e) {
+        toast(`取证失败：${e.message}`);
+      } finally {
+        runCapture.disabled = false;
+      }
+    });
+  }
+
+  /* ---- 监控批量同步 ---- */
+  const sync = $("#btn-watch-sync");
+  if (sync) {
+    sync.addEventListener("click", async () => {
+      try {
+        const r = await api("/api/watch/sync", { method: "POST", body: JSON.stringify({ limit: 120 }) });
+        toast(`检查 ${r.considered} 个高危目标，新增 ${r.added}，清理 ${r.removed}`);
+        window.loadWatch && window.loadWatch();
+      } catch (e) {
+        toast(e.message);
+      }
+    });
+  }
+
+  /* ---- 团伙重建 ---- */
+  const rebuild = $("#btn-campaign-rebuild");
+  if (rebuild) {
+    rebuild.addEventListener("click", async () => {
+      rebuild.disabled = true;
+      toast("正在重新归并…");
+      try {
+        const r = await api("/api/graph/rebuild", { method: "POST" });
+        toast(`已归并：${r.edges} 条边，${(r.campaigns || {}).communities || 0} 个簇`);
+        window.switchView("campaigns");
+      } catch (e) {
+        toast(`归并失败：${e.message}`);
+      } finally {
+        rebuild.disabled = false;
+      }
+    });
+  }
+
+  /* ---- 设置：AI ---- */
+  const llmSave = $("#btn-llm-save");
+  if (llmSave) {
+    llmSave.addEventListener("click", async () => {
+      llmSave.disabled = true;
+      try {
+        const data = await api("/api/settings/llm", {
+          method: "POST",
+          body: JSON.stringify({
+            base_url: ($("#set-llm-base") || {}).value || "",
+            api_key: ($("#set-llm-key") || {}).value || "",
+            model: ($("#set-llm-model") || {}).value || "",
+            enabled: !!($("#set-llm-enabled") || {}).checked,
+            gray_low: Number(($("#set-llm-low") || {}).value || 0),
+            gray_high: Number(($("#set-llm-high") || {}).value || 100),
+          }),
+        });
+        if (window.ssRefillSettings) window.ssRefillSettings(data);
+        window.loadHealth && window.loadHealth();
+        toast("已保存，下一次研判即生效");
+      } catch (e) {
+        toast(`保存失败：${e.message}`);
+      } finally {
+        llmSave.disabled = false;
+      }
+    });
+  }
+
+  const llmTest = $("#btn-llm-test");
+  if (llmTest) {
+    llmTest.addEventListener("click", async () => {
+      const out = $("#llm-test-result");
+      if (out) out.textContent = "测试中…";
+      llmTest.disabled = true;
+      try {
+        const r = await api("/api/settings/llm/test", {
+          method: "POST",
+          body: JSON.stringify({
+            base_url: ($("#set-llm-base") || {}).value || "",
+            api_key: ($("#set-llm-key") || {}).value || "",
+            model: ($("#set-llm-model") || {}).value || "",
+          }),
+        });
+        if (out) {
+          out.textContent = r.ok
+            ? `连通正常 · ${r.model || ""} · ${Math.round((r.elapsed || 0) * 1000)}ms · 回复「${r.reply || ""}」`
+            : `失败：${r.error || "未知原因"}`;
+          out.className = r.ok ? "hint ok-text" : "hint warn-text";
+        }
+      } catch (e) {
+        if (out) { out.textContent = `失败：${e.message}`; out.className = "hint warn-text"; }
+      } finally {
+        llmTest.disabled = false;
+      }
+    });
+  }
+
+  /* ---- 设置：出口 ---- */
+  const egSave = $("#btn-egress-save");
+  if (egSave) {
+    egSave.addEventListener("click", async () => {
+      const picked = document.querySelector('input[name="egress-mode"]:checked');
+      egSave.disabled = true;
+      try {
+        const data = await api("/api/settings/egress", {
+          method: "POST",
+          body: JSON.stringify({
+            mode: picked ? picked.value : "auto",
+            proxies: ($("#set-egress-proxies") || {}).value || "",
+          }),
+        });
+        if (window.ssRefillSettings) window.ssRefillSettings(data);
+        window.loadHealth && window.loadHealth();
+        toast("出口设置已生效（不用重启）");
+      } catch (e) {
+        toast(`保存失败：${e.message}`);
+      } finally {
+        egSave.disabled = false;
+      }
+    });
+  }
+
+  const egClear = $("#btn-egress-clear");
+  if (egClear) {
+    egClear.addEventListener("click", async () => {
+      if (!window.confirm("清空全部代理？清空后「仅代理」模式会拒绝取证。")) return;
+      try {
+        const data = await api("/api/settings/egress", {
+          method: "POST",
+          body: JSON.stringify({ mode: (document.querySelector('input[name="egress-mode"]:checked') || {}).value || "auto", proxies: "-" }),
+        });
+        if (window.ssRefillSettings) window.ssRefillSettings(data);
+        toast("已清空代理");
+      } catch (e) {
+        toast(e.message);
+      }
+    });
+  }
+
+  /* ---- 设置：APK 配额 ---- */
+  const capSave = $("#btn-capture-save");
+  if (capSave) {
+    capSave.addEventListener("click", async () => {
+      capSave.disabled = true;
+      try {
+        const data = await api("/api/settings/capture", {
+          method: "POST",
+          body: JSON.stringify({
+            apk_max_mb: Number(($("#set-apk-max") || {}).value || 50),
+            apk_daily_mb: Number(($("#set-apk-daily") || {}).value || 300),
+            apk_tiers: ($("#set-apk-tiers") || {}).value || "",
+          }),
+        });
+        if (window.ssRefillSettings) window.ssRefillSettings(data);
+        toast("配额已保存");
+      } catch (e) {
+        toast(`保存失败：${e.message}`);
+      } finally {
+        capSave.disabled = false;
+      }
     });
   }
 

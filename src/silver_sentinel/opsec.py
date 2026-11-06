@@ -37,8 +37,9 @@ import socket
 import threading
 import time
 import urllib.parse
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any
 
 from .config import settings
 
@@ -229,6 +230,15 @@ class Guard:
     own_ips: set[str] = field(default_factory=set)
     extra_identifiers: set[str] = field(default_factory=set)
 
+    def __post_init__(self) -> None:
+        # 没走运行时时用的出口模式：允许直连就是 auto，否则按「仅代理」fail-closed
+        self._egress_mode = "auto" if self.allow_direct else "proxy"
+        self._runtime_proxies: tuple[str, ...] | None = None
+
+    @property
+    def mode(self) -> str:
+        return getattr(self, "_egress_mode", "proxy")
+
     # ------------------------------------------------------ 分类
     def _internal_hosts(self) -> set[str]:
         hosts = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
@@ -288,6 +298,7 @@ class Guard:
     # ------------------------------------------------------ 出站
     def preflight(self, url: str) -> str:
         """返回分类；不允许出站时抛 EgressBlocked。"""
+        self.sync_runtime()
         if not self.enabled:
             # 即便关掉 OPSEC，内网与元数据也必须拦——这是 SSRF 底线
             kind = self.classify(url)
@@ -298,13 +309,49 @@ class Guard:
         kind = self.classify(url)
         if kind == "blocked":
             raise EgressBlocked(url, "命中禁访清单或内网地址")
-        if kind == "suspect" and not self.proxies and not self.allow_direct:
-            raise EgressBlocked(url, "未配置出站代理，拒绝直连可疑目标")
+        if kind == "suspect":
+            mode = self._egress_mode
+            if mode == "off":
+                raise EgressBlocked(url, "出口已关闭（设置里把出口模式改回 auto 或 direct）")
+            if mode == "proxy" and not self.proxies:
+                raise EgressBlocked(url, "出口模式为「仅代理」，但未配置可用代理")
+            if not self.proxies and not self.allow_direct:
+                raise EgressBlocked(url, "未配置出站代理，拒绝直连可疑目标")
         return kind
 
+    def sync_runtime(self) -> None:
+        """把前端改过的代理配置同步到进程内。
+
+        每次出站前对一下配置指纹，变了就重建池子。这样保存设置后
+        下一次取证立即生效，不需要重启进程。
+        """
+        try:
+            from .runtime_settings import egress_config
+
+            cfg = egress_config()
+        except Exception:  # 数据库未就绪时保持原样
+            return
+        if not cfg.get("configured"):
+            # 界面上没人选过出口模式：尊重构造时的配置（fail-closed 不能被默认值改掉）
+            return
+        urls = tuple(cfg["proxies"])
+        if urls != getattr(self, "_runtime_proxies", None):
+            self.proxies = ProxyPool(urls)
+            self._runtime_proxies = urls
+            self._proxy_cursor_reset()
+        self._egress_mode = cfg["effective"]
+        self.allow_direct = cfg["effective"] != "proxy"
+
+    def _proxy_cursor_reset(self) -> None:
+        # ProxyPool 已重建，游标自然归零；这里留钩子便于将来换实现
+        return None
+
     def proxy_for(self, url: str) -> str | None:
+        self.sync_runtime()
         kind = self.classify(url)
         if kind == "internal":
+            return None
+        if getattr(self, "_egress_mode", "auto") == "direct":
             return None
         if not self.proxies:
             return None

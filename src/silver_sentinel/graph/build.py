@@ -12,14 +12,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from sqlalchemy import select
 
 from ..db import session_scope
 from ..models import Asset, Evidence
 from ..normalize import extract_indicators, is_shared_infra
-from .schema import CLUSTER_RELATIONS, node_key
+from .schema import node_key
 from .store import GraphStore, get_graph
 
 log = logging.getLogger(__name__)

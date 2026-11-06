@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from silver_sentinel.collectors.apk import analyze, parse_manifest
 from tests.conftest import build_apk, build_manifest
 

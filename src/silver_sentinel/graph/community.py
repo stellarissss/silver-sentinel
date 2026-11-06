@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,9 +26,9 @@ from sqlalchemy import select
 
 from ..config import settings
 from ..db import session_scope
-from ..models import TIER_CONFIRMED, TIER_WATCH, Asset, Campaign
 from ..domain import utcnow
-from .schema import CLUSTER_RELATIONS, parse_key
+from ..models import TIER_CONFIRMED, TIER_WATCH, Asset, Campaign
+from .schema import parse_key
 from .store import GraphStore, get_graph
 
 log = logging.getLogger(__name__)

@@ -43,6 +43,15 @@ TIER_COLD = "cold"
 
 TIER_ORDER = [TIER_CONFIRMED, TIER_WATCH, TIER_CANDIDATE, TIER_COLD, TIER_DISMISSED]
 
+# 界面用词：分级是内部术语，用户看的是「已确认 / 观察中 / 候选 / 冷存 / 已排除」
+TIER_LABELS = {
+    TIER_CONFIRMED: "已确认",
+    TIER_WATCH: "观察中",
+    TIER_CANDIDATE: "候选",
+    TIER_COLD: "冷存",
+    TIER_DISMISSED: "已排除",
+}
+
 
 class Base(DeclarativeBase):
     pass
@@ -63,7 +72,7 @@ class Campaign(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
-    assets: Mapped[list["Asset"]] = relationship(back_populates="campaign")
+    assets: Mapped[list[Asset]] = relationship(back_populates="campaign")
 
 
 class Asset(Base):
@@ -103,19 +112,24 @@ class Asset(Base):
     scan_count: Mapped[int] = mapped_column(Integer, default=0)
     enrich_count: Mapped[int] = mapped_column(Integer, default=0)
 
+    # ---- 取证状态：界面据此显示「已取证 / 待取证 / 取证失败 + 原因」
+    last_capture_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    capture_state: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    capture_error: Mapped[str] = mapped_column(Text, default="")
+
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     notes: Mapped[str] = mapped_column(Text, default="")
     reviewed_by: Mapped[str] = mapped_column(String(80), default="")
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     campaign: Mapped[Campaign | None] = relationship(back_populates="assets")
-    signals: Mapped[list["SignalRow"]] = relationship(
+    signals: Mapped[list[SignalRow]] = relationship(
         back_populates="asset", cascade="all, delete-orphan", order_by="SignalRow.weight.desc()"
     )
-    evidence: Mapped[list["Evidence"]] = relationship(
+    evidence: Mapped[list[Evidence]] = relationship(
         back_populates="asset", cascade="all, delete-orphan", order_by="Evidence.id"
     )
-    reports: Mapped[list["ReportDraft"]] = relationship(
+    reports: Mapped[list[ReportDraft]] = relationship(
         back_populates="asset", cascade="all, delete-orphan", order_by="ReportDraft.id.desc()"
     )
 
@@ -147,7 +161,11 @@ class SignalRow(Base):
 
 
 class Evidence(Base):
-    """原始证据 + 哈希链。文件本体放 data/evidence，库里只存摘要与相对路径。"""
+    """原始证据 + 哈希链。文件本体放 data/evidence，库里只存摘要与相对路径。
+
+    删除是软删除：文件移进 trash/，链上留一条 tombstone（deleted_at + reason），
+    verify 仍然通过。这样「删掉不该删的东西」永远可恢复，也不会让证据链出现空洞。
+    """
 
     __tablename__ = "evidence"
 
@@ -159,8 +177,14 @@ class Evidence(Base):
     chain_hash: Mapped[str] = mapped_column(String(64), default="")
     size: Mapped[int] = mapped_column(Integer, default=0)
     path: Mapped[str] = mapped_column(Text, default="")
+    mime: Mapped[str] = mapped_column(String(80), default="")
     note: Mapped[str] = mapped_column(Text, default="")
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    # ---- 软删除
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    deleted_by: Mapped[str] = mapped_column(String(80), default="")
+    delete_reason: Mapped[str] = mapped_column(Text, default="")
 
     asset: Mapped[Asset] = relationship(back_populates="evidence")
 
@@ -218,21 +242,95 @@ class ReportBundle(Base):
 
 
 class WatchTarget(Base):
-    """监控目标：关键词、品牌词、已知域名、CT 规则。"""
+    """监控目标：关键词、品牌词、已知域名、CT 规则，或某个具体资产。
+
+    asset_id 非空表示「资产级盯防」：自动由分级产出，用来做周期复访与变更检测。
+    kind 为 keyword / brand / domain 的则是「发现源」，用于扩量。
+    """
 
     __tablename__ = "watch_targets"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    kind: Mapped[str] = mapped_column(String(16))          # keyword | domain | brand | cert | wallet
+    kind: Mapped[str] = mapped_column(String(16))          # keyword | domain | brand | cert | wallet | asset
     value: Mapped[str] = mapped_column(String(200))
+    asset_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     interval_minutes: Mapped[int] = mapped_column(Integer, default=360)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     note: Mapped[str] = mapped_column(Text, default="")
+    # 自动纳管的目标要能区分来源，否则人工目标被淘汰逻辑误删
+    auto: Mapped[bool] = mapped_column(Boolean, default=False)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    change_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_change_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (UniqueConstraint("kind", "value", name="uq_watch_kind_value"),)
+
+
+class CaptureTask(Base):
+    """取证队列。
+
+    为什么不直接同步调用：一次页面执行要 10–40 秒，混在研判周期里会把
+    tick 拖长、把新线索排在老的后面。队列化之后可以按优先级派发，
+    失败还能退避重试，不会因为一次超时就永久放弃。
+    """
+
+    __tablename__ = "capture_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="CASCADE"), index=True)
+    state: Mapped[str] = mapped_column(String(16), default="queued", index=True)  # queued|running|done|failed|skipped
+    priority: Mapped[int] = mapped_column(Integer, default=100)   # 越小越先
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    reason: Mapped[str] = mapped_column(String(64), default="")
+    next_run_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    __table_args__ = (Index("ix_capture_state_next", "state", "next_run_at"),)
+
+
+class AssetSnapshot(Base):
+    """一次取证的指纹，用于「改版 / 换域 / 换包 / 下线」的变更检测。
+
+    只保留最近若干条；判定变更是「与上一次比」，不需要完整历史。
+    """
+
+    __tablename__ = "asset_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id", ondelete="CASCADE"), index=True)
+    html_simhash: Mapped[str] = mapped_column(String(32), default="")
+    shot_dhash: Mapped[str] = mapped_column(String(32), default="")
+    cert_fp: Mapped[str] = mapped_column(String(80), default="")
+    ips: Mapped[str] = mapped_column(String(400), default="")
+    apk_sha256: Mapped[str] = mapped_column(String(64), default="")
+    http_status: Mapped[int] = mapped_column(Integer, default=0)
+    final_url: Mapped[str] = mapped_column(Text, default="")
+    title: Mapped[str] = mapped_column(String(300), default="")
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+    __table_args__ = (Index("ix_snapshot_asset_time", "asset_id", "captured_at"),)
+
+
+class AppSetting(Base):
+    """运行时可改的配置（目前主要是 LLM 与出口代理）。
+
+    密钥只在这里存一份，接口返回一律掩码；前端可以改、可以测，但读不到原文。
+    这样换 key 不用登服务器改 .env，也不用把密钥写进前端代码。
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_by: Mapped[str] = mapped_column(String(80), default="")
 
 
 class ScanRun(Base):

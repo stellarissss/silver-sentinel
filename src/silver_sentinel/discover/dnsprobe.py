@@ -22,10 +22,11 @@ import logging
 import random
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import dns.exception
 import dns.resolver
@@ -45,6 +46,34 @@ RESOLVERS = ["223.5.5.5", "119.29.29.29", "180.76.76.76", "1.1.1.1", "8.8.8.8"]
 # 组合词根时只取这些簇，且每个簇限制数量，防止组合爆炸
 _SEED_CLUSTERS = ("authority", "scam_signature", "inducement")
 _MAX_SEEDS_PER_CLUSTER = 60
+
+# 自动淘汰：长期命中但从没被判成可疑的词，不再拿去探测。
+# 注意只影响「探测与组合」，不影响匹配——历史资产仍要能被重新识别。
+_SUPPRESS_CACHE: tuple[float, set[str]] = (0.0, set())
+_SUPPRESS_TTL = 3600
+
+
+def _suppressed_terms() -> set[str]:
+    global _SUPPRESS_CACHE
+    now = time.time()
+    ts, cached = _SUPPRESS_CACHE
+    if now - ts < _SUPPRESS_TTL:
+        return cached
+    out: set[str] = set()
+    try:
+        from sqlalchemy import select
+
+        from ..db import session_scope
+        from ..models import KeywordHit
+
+        with session_scope() as s:
+            for row in s.scalars(select(KeywordHit).where(KeywordHit.hits >= 25)):
+                if (row.dismissed or 0) / max(1, row.hits) >= 0.8:
+                    out.add(row.term)
+    except Exception:  # noqa: BLE001
+        pass
+    _SUPPRESS_CACHE = (now, out)
+    return out
 
 
 @dataclass(slots=True)
@@ -284,6 +313,7 @@ class SeedGenerator:
 
         lib = get_library()
         seen: set[str] = set()
+        suppressed = _suppressed_terms()
 
         primary: list[tuple[str, str]] = []
         secondary: list[tuple[str, str]] = []
@@ -294,6 +324,9 @@ class SeedGenerator:
             for term in terms[:_MAX_SEEDS_PER_CLUSTER]:
                 py = term.pinyin
                 if len(py) < 4 or py in seen:
+                    continue
+                if term.text in suppressed:
+                    # 长期误报的词不再拿去探测：省 DNS 配额，也少一批噪声
                     continue
                 seen.add(py)
                 primary.append((py, term.text))
@@ -315,6 +348,56 @@ class SeedGenerator:
                     continue
                 seen.add(combo)
                 secondary.append((combo, f"{a}+{t}"))
+
+        # 地区 + 主题：骗子极爱用「河北惠民」「河南养老」这种地名背书。
+        # 地区拼音单独匹配会误报（hebei 出现在大量正常域名里），但作为
+        # 组合词根去 DNS 探测是安全的——探不到就没有成本。
+        from .keywords import COMBINE_SUFFIXES, REGIONS
+
+        regions = ["".join(lazy_pinyin(r)) for r in REGIONS][:48]
+        theme_terms = [
+            p
+            for c, ts in CLUSTERS.items()
+            if c in ("policy_theme", "elder_care", "project_scam")
+            for p in ts
+        ][:40]
+        for idx, region in enumerate(regions):
+            if len(region) < 4:
+                continue
+            # 每个省只取 6 个主题，轮换起点不同，避免全国都用同一批词
+            window = theme_terms[idx % 7: idx % 7 + 6]
+            for term in window:
+                pt = "".join(lazy_pinyin(term))
+                if len(pt) < 4:
+                    continue
+                combo = region + pt
+                if len(combo) > 26 or combo in seen:
+                    continue
+                seen.add(combo)
+                secondary.append((combo, f"{region}+{term}"))
+
+        # 主题 + 通用后缀：「××惠民」「××民生」是最常见的招牌写法
+        suffixes = ["".join(lazy_pinyin(s)) for s in COMBINE_SUFFIXES][:20]
+        for idx, term in enumerate(theme_terms[:12]):
+            pt = "".join(lazy_pinyin(term))
+            if len(pt) < 4:
+                continue
+            for suffix in suffixes[idx % 5: idx % 5 + 5]:
+                combo = pt + suffix
+                if len(combo) > 26 or combo in seen:
+                    continue
+                seen.add(combo)
+                secondary.append((combo, f"{term}+{suffix}"))
+
+        # 数字变体：guohui2026 / guohui88 / guohuivip。
+        # 团伙换域时经常只在后面加个年份或吉祥数字，成本最低。
+        for seed, origin in list(primary)[:100]:
+            for tail in ("2026", "88", "vip"):
+                combo = seed + tail
+                if combo in seen:
+                    continue
+                seen.add(combo)
+                secondary.append((combo, f"{origin}（数字变体）"))
 
         # 去重并保持顺序
         self.seeds = list(dict.fromkeys(primary + secondary))

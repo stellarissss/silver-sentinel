@@ -84,7 +84,7 @@ def test_find_leaks_blocks_export() -> None:
     payload = {"note": "由 203.0.113.9 采集", "nested": [{"host": "collector-01"}]}
     findings = guard.find_leaks(payload)
     assert len(findings) == 2
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         guard.assert_clean(payload)
 
 
@@ -146,12 +146,13 @@ def _prepare(path, *, monkeypatch, key_b64: str, node: str):
 
 
 def test_two_nodes_share_evidence(tmp_path, monkeypatch) -> None:
+    from sqlalchemy import func, select
+
     from silver_sentinel import evidence as evidence_mod
     from silver_sentinel.config import settings
     from silver_sentinel.db import session_scope
     from silver_sentinel.models import Asset, Evidence
     from silver_sentinel.vault import Vault
-    from sqlalchemy import func, select
 
     key_b64 = base64.b64encode(os.urandom(32)).decode()
     remote = tmp_path / "remote"

@@ -15,16 +15,15 @@ from pathlib import Path
 
 import pytest
 
-from silver_sentinel.core.eventlog import EventLog, GENESIS
+from silver_sentinel.core.eventlog import EventLog
 from silver_sentinel.discover.dnsprobe import SeedGenerator
 from silver_sentinel.discover.keywords import KeywordLibrary, get_library
-from silver_sentinel.enrich.icp import ICPResult, _iter_records, _pick
+from silver_sentinel.enrich.icp import ICPResult, _iter_records
 from silver_sentinel.enrich.registry import RegistryInfo, _parse_dt
 from silver_sentinel.graph.schema import RELATION_WEIGHTS, edge_weight, node_key, parse_key
 from silver_sentinel.models import TIER_CANDIDATE, TIER_COLD, TIER_CONFIRMED, TIER_WATCH, Asset
 from silver_sentinel.sandbox.web import _is_private_host
 from silver_sentinel.triage import decide
-
 
 # ---------------------------------------------------------------- 事件日志
 
@@ -347,7 +346,7 @@ def test_cursor_advances_by_returned_entries_not_requested_range(tmp_path, monke
 
     assert calls[0][0] == 1_000, "第一次应从游标位置开始"
     # 相邻两次请求必须首尾相接（上一次 start + 实际返回 40），不能出现跳过
-    for prev, nxt in zip(calls, calls[1:]):
+    for prev, nxt in zip(calls, calls[1:], strict=False):
         assert nxt[0] == prev[0] + 40, f"游标跳了：{prev} → {nxt}"
     assert follower.index < 10_000, "游标不能一步跳到区间末端"
 
@@ -458,9 +457,9 @@ def test_shared_infra_domains_are_recognised():
 
 def test_shared_infra_has_no_cert_edge(fresh_db):
     """共享基础设施上的域名不建 HAS_CERT / RESOLVES_TO 边，避免把整朵云判成一伙。"""
+    from silver_sentinel.db import session_scope
     from silver_sentinel.graph.build import GraphBuilder
     from silver_sentinel.graph.store import get_graph, reset_graph
-    from silver_sentinel.db import session_scope
 
     reset_graph()
     with session_scope() as s:

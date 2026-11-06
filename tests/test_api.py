@@ -79,8 +79,14 @@ def test_assets_listing_and_filter(fresh_db):
             "/api/scan",
             json={"kind": "text", "value": "民族资产解冻", "text": "民族资产解冻 追梦人 云数贸", "run_llm": False},
         )
-        all_items = c.get("/api/assets").json()["items"]
-        assert len(all_items) >= 2
+        # 默认只回有效线索（已确认/观察中/候选），误报与冷存单独看
+        active = c.get("/api/assets").json()
+        assert active["tier"] == "active"
+        assert all(a["tier"] in ("confirmed", "watch", "candidate") for a in active["items"])
+
+        everything = c.get("/api/assets?tier=all").json()
+        assert len(everything["items"]) >= 2
+        assert everything["total"] >= 2
 
         confirmed = c.get("/api/assets?verdict=confirmed").json()["items"]
         assert all(a["verdict"] == "confirmed" for a in confirmed)

@@ -26,10 +26,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 
 from . import triage
 from .config import settings
@@ -39,6 +40,13 @@ from .db import session_scope
 from .enrich.icp import get_icp
 from .enrich.registry import get_rdap
 from .graph.build import GraphBuilder
+from .graph.community import sync_campaigns
+from .intake import scan
+from .models import TIER_CANDIDATE, TIER_CONFIRMED, TIER_WATCH, Asset, TaskRun
+from .normalize import registrable_domain
+from .sandbox.apk import get_apk_sandbox
+
+log = logging.getLogger(__name__)
 
 
 def _host_of(url: str) -> str:
@@ -46,14 +54,6 @@ def _host_of(url: str) -> str:
         return (urlsplit(url).hostname or "").lower()
     except ValueError:
         return ""
-from .graph.community import sync_campaigns
-from .intake import scan
-from .models import TIER_CANDIDATE, TIER_COLD, TIER_CONFIRMED, TIER_WATCH, Asset, TaskRun
-from .normalize import registrable_domain
-from .sandbox.apk import get_apk_sandbox
-from .sandbox.web import get_web_sandbox
-
-log = logging.getLogger(__name__)
 
 ACTIVE_TIERS = (TIER_CONFIRMED, TIER_WATCH, TIER_CANDIDATE)
 
@@ -66,6 +66,9 @@ class CycleStats:
     campaigns: dict[str, Any] = field(default_factory=dict)
     decayed: int = 0
     errors: int = 0
+    captured: int = 0
+    capture_failed: int = 0
+    capture_backfilled: int = 0
     elapsed: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
@@ -76,6 +79,9 @@ class CycleStats:
             "campaigns": self.campaigns,
             "decayed": self.decayed,
             "errors": self.errors,
+            "captured": self.captured,
+            "capture_failed": self.capture_failed,
+            "capture_backfilled": self.capture_backfilled,
             "elapsed": round(self.elapsed, 1),
         }
 
@@ -113,7 +119,6 @@ def enrich_asset(asset_id: int, *, with_sandbox: bool = False) -> dict[str, Any]
         if asset is None:
             return {"ok": False, "reason": "资产不存在"}
         kind = asset.kind
-        value = asset.value
         normalized = asset.normalized
         meta = dict(asset.meta or {})
         facts = dict(meta.get("facts") or {})
@@ -190,16 +195,37 @@ def enrich_asset(asset_id: int, *, with_sandbox: bool = False) -> dict[str, Any]
 
 
 def _scan_one(asset_id: int) -> dict[str, Any]:
+    from .models import Evidence as _Evidence
+
     with session_scope() as s:
         asset = s.get(Asset, asset_id)
         if asset is None:
             return {"ok": False, "asset_id": asset_id, "reason": "不存在"}
         kind, value = asset.kind, asset.value
         meta = dict(asset.meta or {})
+        # 有页面正文就拿来做语料：只按域名重扫，等于每次都在忽略已经取到的证据
+        text = ""
+        row = s.scalar(
+            select(_Evidence)
+            .where(_Evidence.asset_id == asset_id, _Evidence.kind == "page_text",
+                   _Evidence.deleted_at.is_(None))
+            .order_by(_Evidence.id.desc())
+            .limit(1)
+        )
+        if row is not None:
+            path = Path(row.path)
+            if not path.is_absolute():
+                path = settings.data_dir / path
+            try:
+                if path.exists():
+                    text = path.read_text(encoding="utf-8", errors="replace")[:60_000]
+            except OSError:
+                text = ""
 
     try:
         result = scan(
-            kind, value, meta=meta, run_llm=False, do_cluster=False, trigger="pipeline", quick=True
+            kind, value, text=text or None, meta=meta,
+            run_llm=False, do_cluster=False, trigger="pipeline", quick=True,
         )
         return {"ok": True, "asset_id": asset_id, "score": result.assessment.score,
                 "verdict": result.assessment.verdict, "tier": result.asset.get("tier")}
@@ -288,7 +314,22 @@ def run_cycle(*, scan_limit: int | None = None, enrich_limit: int = 40, rebuild_
                         stats.errors += 1
                         log.debug("富化失败 %s: %s", futures[fut], exc)
 
-        # 3) 建图 + 找团伙
+        # 3) 取证：先把「有效但没取过证」的补进队列，再跑一小批。
+        #    放在建图之前，是因为取证会产出新域名与新证书，建图能用上。
+        if settings.capture_enabled:
+            try:
+                from .capture import backfill as capture_backfill
+                from .capture import run_batch as run_capture_batch
+
+                stats.capture_backfilled = capture_backfill(limit=settings.capture_backfill_limit)
+                cap = run_capture_batch(limit=settings.capture_batch)
+                stats.captured = cap.get("ok", 0)
+                stats.capture_failed = max(0, cap.get("ran", 0) - cap.get("ok", 0))
+            except Exception as exc:  # noqa: BLE001
+                stats.errors += 1
+                log.warning("取证批次失败：%s", exc)
+
+        # 4) 建图 + 找团伙
         if rebuild_graph and settings.graph_enabled:
             try:
                 builder = GraphBuilder()
@@ -299,7 +340,7 @@ def run_cycle(*, scan_limit: int | None = None, enrich_limit: int = 40, rebuild_
                 stats.errors += 1
                 log.warning("建图失败：%s", exc)
 
-        # 4) 衰减
+        # 5) 衰减
         if stats.scanned > 0:
             stats.decayed = triage.decay().get("moved", 0)
 
@@ -320,93 +361,14 @@ def run_cycle(*, scan_limit: int | None = None, enrich_limit: int = 40, rebuild_
 
 
 def probe_web(asset_id: int) -> dict[str, Any]:
-    """对 URL/域名资产做一次真实页面执行，把结果固化成证据。"""
-    from .evidence import append as append_evidence
+    """对 URL/域名资产做一次真实页面执行，把结果固化成证据。
 
-    with session_scope() as s:
-        asset = s.get(Asset, asset_id)
-        if asset is None:
-            return {"ok": False, "reason": "资产不存在"}
-        url = asset.value
-        kind = asset.kind
-        meta = dict(asset.meta or {})
+    实现在 capture 模块，这里是手动入口的薄封装——自动链路走队列，
+    手动点「立即取证」走同步调用，两条路径共用同一套采集与落盘逻辑。
+    """
+    from .capture import capture_asset
 
-    if kind == "domain":
-        url = f"http://{url}/"
-    if not url.startswith(("http://", "https://")):
-        return {"ok": False, "reason": "不是可访问的 URL"}
-
-    obs = get_web_sandbox().observe(url)
-    payload = obs.as_dict()
-
-    with session_scope() as s:
-        asset = s.get(Asset, asset_id)
-        if asset is None:
-            return {"ok": False, "reason": "资产消失"}
-        facts = dict((asset.meta or {}).get("facts") or {})
-        if obs.title:
-            facts["page_title"] = obs.title[:200]
-        if obs.text:
-            facts["page_text_len"] = len(obs.text)
-        facts["web_engine"] = obs.engine
-        facts["web_status"] = obs.status
-        if obs.final_url and obs.final_url != url:
-            facts["final_url"] = obs.final_url[:500]
-        if obs.apk_links:
-            facts["apk_links"] = obs.apk_links[:10]
-            facts["forces_apk_download"] = True
-        if obs.blocked:
-            facts["blocked_requests"] = len(obs.blocked)
-        if obs.error:
-            facts["web_error"] = obs.error
-        if obs.requests:
-            hosts = sorted({_host_of(r.get("url", "")) for r in obs.requests if r.get("url")})
-            facts["page_third_party_hosts"] = [h for h in hosts if h][:15]
-            posts = [r["url"] for r in obs.requests if r.get("method", "GET").upper() not in ("GET", "HEAD", "OPTIONS")]
-            if posts:
-                # 表单外传地址是最能直接指向背后主体的运行时证据
-                facts["page_post_targets"] = posts[:10]
-
-        meta["facts"] = facts
-        meta["web_observation"] = {
-            k: payload[k]
-            for k in ("final_url", "status", "title", "apk_links", "forms", "blocked",
-                      "elapsed", "engine", "screenshot_bytes", "honeypot", "egress")
-        }
-        asset.meta = meta
-
-        # 三种原始形态各存一份：正文给人看，HTML 给取证，截图给「当时长什么样」
-        if obs.text:
-            append_evidence(
-                s, asset_id, "page_text", obs.text.encode("utf-8")[:2_000_000],
-                note=f"页面正文快照 {url}"[:200], extension=".txt",
-            )
-        if obs.html:
-            append_evidence(
-                s, asset_id, "page_html", obs.html.encode("utf-8")[:8_000_000],
-                note=f"页面 HTML 原文 {obs.final_url or url}"[:200], extension=".html",
-            )
-        if obs.screenshot:
-            append_evidence(
-                s, asset_id, "screenshot", obs.screenshot,
-                note=f"首屏截图 {obs.final_url or url}"[:200], extension=".png",
-            )
-        if obs.requests:
-            import json as _json
-
-            append_evidence(
-                s, asset_id, "network", _json.dumps(
-                    {"url": url, "final_url": obs.final_url, "requests": obs.requests[:500]},
-                    ensure_ascii=False,
-                ).encode("utf-8")[:4_000_000],
-                note=f"运行时网络请求 {len(obs.requests)} 条"[:200], extension=".json",
-            )
-        triage.apply(asset, facts=facts)
-        tier = asset.tier
-
-    bus.publish("web_probe", {"asset_id": asset_id, "url": url, "status": obs.status,
-                              "error": obs.error, "apk_links": len(obs.apk_links)})
-    return {"ok": not obs.error, "asset_id": asset_id, "tier": tier, **payload}
+    return capture_asset(asset_id)
 
 
 # ---------------------------------------------------------------- 后台调度

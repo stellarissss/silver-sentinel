@@ -31,7 +31,10 @@ def test_session_roundtrip():
 def test_session_rejects_tampering():
     token = webauth.issue()
     head, _, sig = token.partition(".")
-    assert not webauth.verify(f"{head}.{sig[:-1]}0")
+    # 必须真的换掉最后一个字符：签名是 base64 字母表，直接写死替换成 "0"
+    # 有 1/64 的概率恰好等于原字符，那时候 token 没变，断言就假失败了
+    tail = "1" if sig[-1] != "1" else "2"
+    assert not webauth.verify(f"{head}.{sig[:-1]}{tail}")
     assert not webauth.verify(f"{head}x.{sig}")
     assert not webauth.verify("")
     assert not webauth.verify(None)
@@ -80,7 +83,7 @@ def test_failure_throttle():
 def test_old_failures_expire(monkeypatch):
     key = "5.6.7.8"
     base = time.time()
-    for i in range(webauth._FAIL_LIMIT):
+    for _ in range(webauth._FAIL_LIMIT):
         webauth._fails.setdefault(key, []).append(base - webauth._FAIL_WINDOW - 5)
     assert not webauth.too_many_failures(key)
 

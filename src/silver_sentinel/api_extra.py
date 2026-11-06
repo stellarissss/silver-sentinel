@@ -15,12 +15,14 @@ import asyncio
 import json
 import secrets
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
+from starlette.background import BackgroundTask
 
 from . import __version__
 from .config import settings
@@ -29,6 +31,7 @@ from .core.eventlog import get_log
 from .core.replica import get_replica
 from .db import session_scope
 from .discover.engine import get_engine
+from .domain import utcnow
 from .graph.community import CommunityFinder, sync_campaigns
 from .graph.schema import NODE_TYPES
 from .graph.store import get_graph
@@ -37,16 +40,14 @@ from .models import (
     TIER_COLD,
     TIER_CONFIRMED,
     TIER_DISMISSED,
-    TIER_ORDER,
     TIER_WATCH,
     Asset,
     Campaign,
     DiscoveryEvent,
-    GraphEdge,
-    GraphNode,
     KeywordHit,
     ReportBundle,
     TaskRun,
+    WatchTarget,
 )
 from .pipeline import enrich_asset, get_scheduler, probe_web, run_cycle
 from .report import channels as report_channels_mod
@@ -315,7 +316,39 @@ def asset_tier(asset_id: int, payload: TierIn) -> dict[str, Any]:
             asset.dismiss_reason = ""
         if payload.reason:
             asset.discovery_reason = payload.reason[:500]
-        session.commit()
+
+        # 词库命中率统计：人工排除是唯一可靠的「这条词是误报」信号。
+        # 没有这个回写，词库就永远不知道自己哪条规则在制造噪声。
+        if payload.tier in (TIER_DISMISSED, TIER_CONFIRMED):
+            from .models import KeywordHit
+
+            terms = (asset.meta or {}).get("facts", {}).get("keyword_terms") or []
+            for term in list(terms)[:8]:
+                row = s.get(KeywordHit, str(term)[:120])
+                if row is None:
+                    continue
+                if payload.tier == TIER_DISMISSED:
+                    row.dismissed = (row.dismissed or 0) + 1
+                else:
+                    row.confirmed = (row.confirmed or 0) + 1
+        # 人工排除 = 停止盯防。自动纳管的盯防目标要跟着等级走，
+        # 否则回收站里的东西还会被调度器每小时复访一次，白烧带宽。
+        target = s.scalar(
+            select(WatchTarget)
+            .where(WatchTarget.asset_id == asset_id, WatchTarget.auto.is_(True))
+            .limit(1)
+        )
+        if target is not None:
+            if payload.tier == TIER_DISMISSED:
+                target.enabled = False
+                target.next_run_at = None
+            elif not target.enabled:
+                target.enabled = True
+                target.next_run_at = utcnow()
+                target.fail_count = 0
+
+        # session_scope 退出时自己提交，这里只需把它刷出去供下面读回
+        s.flush()
         value = asset.value
     bus.publish("tier_changed", {"asset_id": asset_id, "value": value, "from": old, "to": payload.tier})
     return {"ok": True, "asset_id": asset_id, "from": old, "to": payload.tier}
@@ -405,7 +438,6 @@ def ops_events(limit: int = Query(default=60, le=500)) -> dict[str, Any]:
 def ops_verify(deep: bool = True) -> dict[str, Any]:
     from .db import verify_chain as verify_evidence
 
-    ev = verify_evidence.__wrapped__ if hasattr(verify_evidence, "__wrapped__") else None
     with session_scope() as s:
         chain = verify_evidence(s)
     return {"eventlog": get_log().verify(deep=deep), "evidence_chain": chain}
@@ -623,3 +655,329 @@ def report_mark(code: str, payload: MarkIn) -> dict[str, Any]:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return report_service.as_dict(row)
+
+
+# ---------------------------------------------------------------- 风险指数
+
+@router.get("/api/risk")
+def risk_index() -> dict[str, Any]:
+    """四项加权的风险指数，每项都能展开看构成。"""
+    from .risk import compute
+
+    return compute()
+
+
+# ---------------------------------------------------------------- 取证队列
+
+@router.get("/api/capture/queue")
+def capture_queue() -> dict[str, Any]:
+    from .capture import queue_summary
+
+    return queue_summary()
+
+
+@router.post("/api/capture/run")
+def capture_run(limit: int = Query(default=2, ge=1, le=10)) -> dict[str, Any]:
+    from .capture import backfill, run_batch
+
+    backfill(limit=settings.capture_backfill_limit)
+    return run_batch(limit=limit)
+
+
+@router.post("/api/assets/{asset_id}/capture")
+def asset_capture(asset_id: int) -> dict[str, Any]:
+    """手动「立即取证」。同步执行，返回这次落了哪些证据。"""
+    from .capture import capture_asset, enqueue
+
+    if not (settings.sandbox_enabled and settings.sandbox_browser_enabled):
+        raise HTTPException(400, "网页沙箱未启用")
+    enqueue(asset_id, reason="manual", priority=5)
+    result = capture_asset(asset_id)
+    return result
+
+
+# ---------------------------------------------------------------- 证据
+
+@router.get("/api/evidence/{evidence_id}/download")
+def evidence_download(evidence_id: int):
+    from .models import Evidence
+
+    with session_scope() as session:
+        row = session.get(Evidence, evidence_id)
+        if row is None or row.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="证据不存在或已删除")
+        path = Path(row.path)
+        if not path.is_absolute():
+            path = settings.data_dir / path
+        name = f"{row.kind}-{row.id}{path.suffix or '.bin'}"
+        mime = row.mime or "application/octet-stream"
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="文件已丢失（可能被清理）")
+    return FileResponse(path, filename=name, media_type=mime)
+
+
+@router.get("/api/evidence/{evidence_id}/preview")
+def evidence_preview(evidence_id: int):
+    """内联预览：图片直接显示，文本按纯文本返回。"""
+    from fastapi.responses import PlainTextResponse, Response
+
+    from .models import Evidence
+
+    with session_scope() as session:
+        row = session.get(Evidence, evidence_id)
+        if row is None or row.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="证据不存在或已删除")
+        path = Path(row.path)
+        if not path.is_absolute():
+            path = settings.data_dir / path
+        mime = row.mime or ""
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="文件已丢失")
+    if mime.startswith("image/"):
+        return Response(path.read_bytes(), media_type=mime)
+    if mime.startswith("text/") or mime == "application/json":
+        text = path.read_text(encoding="utf-8", errors="replace")[:200_000]
+        return PlainTextResponse(text)
+    raise HTTPException(status_code=415, detail="该类型不支持在线预览，请下载")
+
+
+@router.delete("/api/evidence/{evidence_id}")
+def evidence_delete(evidence_id: int, reason: str = "", request: Request = None) -> dict[str, Any]:
+    """软删除。文件进回收站，链上留 tombstone。"""
+    from .evidence import soft_delete
+
+    by = "web"
+    if request is not None:
+        try:
+            by = f"web@{request.client.host}" if request.client else "web"
+        except Exception:  # noqa: BLE001
+            by = "web"
+    with session_scope() as session:
+        result = soft_delete(session, evidence_id, by=by, reason=reason)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "删除失败"))
+    return result
+
+
+@router.post("/api/evidence/{evidence_id}/restore")
+def evidence_restore(evidence_id: int) -> dict[str, Any]:
+    from .evidence import restore
+
+    with session_scope() as session:
+        result = restore(session, evidence_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "恢复失败"))
+    return result
+
+
+@router.get("/api/assets/{asset_id}/evidence.zip")
+def asset_evidence_zip(asset_id: int):
+    """整套证据打包下载。
+
+    走临时文件 + FileResponse，避免把一个几十 MB 的 zip 整个读进内存再吐出去。
+    下载完成后由后台任务删掉临时文件。
+    """
+    from fastapi.responses import FileResponse
+
+    from .capture import asset_zip_file
+
+    try:
+        path = asset_zip_file(asset_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=f"evidence-{asset_id}.zip",
+        background=BackgroundTask(lambda p: p.unlink(missing_ok=True) if p.exists() else None, path),
+    )
+
+
+@router.get("/api/assets/{asset_id}/evidence")
+def asset_evidence(asset_id: int) -> dict[str, Any]:
+    from .capture import evidence_matrix
+
+    return evidence_matrix(asset_id)
+
+
+# ---------------------------------------------------------------- 设置（LLM / 出口）
+
+class LLMIn(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    enabled: bool = True
+    gray_low: float | None = None
+    gray_high: float | None = None
+
+
+class EgressIn(BaseModel):
+    mode: str = "auto"
+    proxies: str = ""
+
+
+class CaptureIn(BaseModel):
+    apk_max_mb: int | None = None
+    apk_daily_mb: int | None = None
+    apk_tiers: str | None = None
+
+
+@router.get("/api/settings")
+def settings_read() -> dict[str, Any]:
+    from . import runtime_settings
+
+    return runtime_settings.llm_public()
+
+
+@router.post("/api/settings/llm")
+def settings_llm(payload: LLMIn) -> dict[str, Any]:
+    from . import runtime_settings
+
+    values: dict[str, str] = {
+        runtime_settings.LLM_BASE_URL: payload.base_url.strip(),
+        runtime_settings.LLM_MODEL: payload.model.strip(),
+        runtime_settings.LLM_ENABLED: "1" if payload.enabled else "0",
+    }
+    # 留空表示「不改」，避免前端把掩码当新密钥写回去
+    if payload.api_key.strip():
+        values[runtime_settings.LLM_API_KEY] = payload.api_key.strip()
+    if payload.gray_low is not None:
+        values[runtime_settings.LLM_GRAY_LOW] = str(payload.gray_low)
+    if payload.gray_high is not None:
+        values[runtime_settings.LLM_GRAY_HIGH] = str(payload.gray_high)
+    runtime_settings.set_many(values, by="web")
+    return runtime_settings.llm_public()
+
+
+@router.post("/api/settings/egress")
+def settings_egress(payload: EgressIn) -> dict[str, Any]:
+    from . import runtime_settings
+
+    mode = payload.mode if payload.mode in {"auto", "proxy", "direct", "off"} else "auto"
+    raw = payload.proxies.strip()
+    values: dict[str, str] = {runtime_settings.EGRESS_MODE: mode}
+    # 留空表示「保持现有代理」——否则每次改模式都会把凭据清掉；
+    # 单个 "-" 是显式清空，前端有个专门的按钮走这条路径。
+    if raw == "-":
+        values[runtime_settings.EGRESS_PROXIES] = ""
+    elif raw:
+        values[runtime_settings.EGRESS_PROXIES] = raw
+    runtime_settings.set_many(values, by="web")
+    return runtime_settings.llm_public()
+
+
+@router.post("/api/settings/capture")
+def settings_capture(payload: CaptureIn) -> dict[str, Any]:
+    from . import runtime_settings
+
+    values: dict[str, str] = {}
+    if payload.apk_max_mb is not None:
+        values[runtime_settings.CAPTURE_APK_MAX_MB] = str(max(1, payload.apk_max_mb))
+    if payload.apk_daily_mb is not None:
+        values[runtime_settings.CAPTURE_APK_DAILY_MB] = str(max(10, payload.apk_daily_mb))
+    if payload.apk_tiers is not None:
+        values[runtime_settings.CAPTURE_AUTO_APK_TIERS] = payload.apk_tiers
+    if values:
+        runtime_settings.set_many(values, by="web")
+    return runtime_settings.llm_public()
+
+
+@router.post("/api/settings/llm/test")
+def settings_llm_test(payload: LLMIn) -> dict[str, Any]:
+    from .analyzers import llm as llm_analyzer
+
+    return llm_analyzer.test_connection(
+        base_url=payload.base_url.strip(), api_key=payload.api_key.strip(), model=payload.model.strip()
+    )
+
+
+# ---------------------------------------------------------------- 漏斗与监控
+
+@router.get("/api/funnel")
+def funnel() -> dict[str, Any]:
+    """五段漏斗：看见 → 命中 → 去重 → 快筛 → 入池。
+
+    运维页之前只有总数，看不出「卡在哪」。这里把每一段的绝对值和转化率
+    都摊开，配合每小时一行，能直接判断是词库太窄还是阈值太高。
+    """
+    from .models import Evidence as _Evidence
+
+    engine = get_engine()
+    stats = engine.status()
+    with session_scope() as session:
+        from datetime import timedelta
+
+        cutoff = utcnow() - timedelta(hours=24)
+        admitted_24h = session.scalar(
+            select(func.count(Asset.id)).where(Asset.first_seen >= cutoff)
+        ) or 0
+        events_24h = session.scalar(
+            select(func.count(DiscoveryEvent.id)).where(DiscoveryEvent.created_at >= cutoff)
+        ) or 0
+        # 覆盖率必须分子分母同口径：只算有效资产里有多少已经看过页面。
+        # 之前分子把已排除资产也算进来，出现过 200% 这种自相矛盾的数字。
+        captured = session.scalar(
+            select(func.count(func.distinct(_Evidence.asset_id)))
+            .join(Asset, Asset.id == _Evidence.asset_id)
+            .where(
+                _Evidence.kind.in_(("page_html", "screenshot")),
+                _Evidence.deleted_at.is_(None),
+                Asset.tier.in_(("confirmed", "watch", "candidate")),
+            )
+        ) or 0
+        active = session.scalar(
+            select(func.count(Asset.id)).where(Asset.tier.in_(("confirmed", "watch", "candidate")))
+        ) or 0
+
+    live = stats.get("stats") or stats
+    seen = live.get("seen", 0) or 0
+    matched = live.get("matched", 0) or 0
+    duplicated = live.get("duplicated", 0) or 0
+    queued = live.get("queued", 0) or 0
+    cold = live.get("cold", 0) or 0
+
+    steps = [
+        {"key": "seen", "label": "已解析证书", "value": seen},
+        {"key": "matched", "label": "命中词根", "value": matched},
+        {"key": "deduped", "label": "去重后", "value": max(0, matched - duplicated)},
+        {"key": "screened", "label": "通过快筛", "value": max(0, matched - duplicated - cold)},
+        {"key": "admitted", "label": "实际入池", "value": queued},
+    ]
+    for i, step in enumerate(steps):
+        prev = steps[i - 1]["value"] if i else step["value"]
+        step["rate"] = round(step["value"] / prev, 3) if prev else 0.0
+
+    return {
+        "steps": steps,
+        "coverage": {
+            "active": active,
+            "captured": captured,
+            "ratio": round(min(1.0, captured / active), 3) if active else 0.0,
+        },
+        "admitted_24h": admitted_24h,
+        "events_24h": events_24h,
+        "engine": stats,
+    }
+
+
+class WatchSyncIn(BaseModel):
+    limit: int = 60
+
+
+@router.post("/api/watch/sync")
+def watch_sync(payload: WatchSyncIn = WatchSyncIn()) -> dict[str, Any]:
+    """把现有的 watch/confirmed 资产批量纳入监控。"""
+    from .capture import ensure_watch, prune_watch
+
+    with session_scope() as session:
+        ids = list(
+            session.scalars(
+                select(Asset.id)
+                .where(Asset.tier.in_((TIER_CONFIRMED, TIER_WATCH)))
+                .order_by(Asset.score.desc())
+                .limit(max(1, min(500, payload.limit)))
+            )
+        )
+    added = sum(1 for aid in ids if ensure_watch(aid))
+    removed = prune_watch()
+    return {"considered": len(ids), "added": added, "removed": removed}

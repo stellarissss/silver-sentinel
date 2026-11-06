@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Iterable
+from typing import Any
 
 from sqlalchemy import func, or_, select
 
@@ -28,7 +28,7 @@ from ..config import settings
 from ..db import session_scope
 from ..domain import utcnow
 from ..models import GraphEdge, GraphNode
-from .schema import CLUSTER_RELATIONS, edge_weight, node_key, parse_key
+from .schema import CLUSTER_RELATIONS, edge_weight, node_key
 
 log = logging.getLogger(__name__)
 
