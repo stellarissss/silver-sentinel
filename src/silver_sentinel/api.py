@@ -538,15 +538,17 @@ def api_assets(
         count_stmt = select(func.count(Asset.id))
 
         tier = (tier or "active").strip().lower()
+        # 筛选条件分两拨：tier 只影响列表，不影响「另外还有多少条」
         conditions: list[Any] = []
+        tier_conditions: list[Any] = []
         if tier == "active":
-            conditions.append(Asset.tier.in_(("confirmed", "watch", "candidate")))
+            tier_conditions.append(Asset.tier.in_(("confirmed", "watch", "candidate")))
         elif tier == "all":
             pass
         elif tier == "dismissed":
-            conditions.append(Asset.tier == "dismissed")
+            tier_conditions.append(Asset.tier == "dismissed")
         elif tier:
-            conditions.append(Asset.tier == tier)
+            tier_conditions.append(Asset.tier == tier)
 
         if verdict:
             conditions.append(Asset.verdict == verdict)
@@ -557,7 +559,7 @@ def api_assets(
         if source:
             conditions.append(Asset.discovery_source == source)
 
-        for condition in conditions:
+        for condition in conditions + tier_conditions:
             stmt = stmt.where(condition)
             count_stmt = count_stmt.where(condition)
 
@@ -572,12 +574,19 @@ def api_assets(
 
         rows = list(session.scalars(stmt.offset(offset).limit(limit)))
         total = session.scalar(count_stmt) or 0
+        # 每一档各有多少条。「有效 0 条」必须能立刻解释成「另有 N 条冷存」，
+        # 否则用户只会看到一张空表，以为东西丢了。
+        counts_stmt = select(Asset.tier, func.count(Asset.id))
+        for condition in conditions:
+            counts_stmt = counts_stmt.where(condition)
+        tier_counts = {t: c for t, c in session.execute(counts_stmt.group_by(Asset.tier))}
         return {
             "items": [_asset_row(a) for a in rows],
             "total": total,
             "limit": limit,
             "offset": offset,
             "tier": tier,
+            "tier_counts": tier_counts,
         }
 
 

@@ -729,6 +729,17 @@ async function loadAssets() {
     renderAssetMeta(data);
     renderAssetPager(data);
 
+    // 统计行里的「另有 N 条冷存 / 已排除」可以直接点进去，不用猜下拉框
+    document.querySelectorAll("[data-tier-jump]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        state.assetTier = btn.dataset.tierJump;
+        state.assetOffset = 0;
+        const sel = $("#filter-tier");
+        if (sel) sel.value = state.assetTier;
+        loadAssets();
+      });
+    });
+
     if (!data.items.length) {
       box.innerHTML = state.query || state.verdict
         ? `<div class="empty">没有匹配的线索。<button class="btn ghost sm" id="btn-clear-filter">清除筛选</button></div>`
@@ -790,8 +801,15 @@ function renderAssetMeta(data) {
   const to = Math.min(data.offset + data.items.length, data.total);
   const tierLabel = { active: "有效线索", all: "全部", confirmed: "已确认", watch: "观察中",
     candidate: "候选", cold: "冷存", dismissed: "已排除" }[data.tier] || data.tier;
+  // 「有效 0 条」最容易被读成「东西丢了」。把其它档位的数字摆出来，一眼就能解释清楚。
+  const c = data.tier_counts || {};
+  const other = data.tier === "active"
+    ? (c.cold ? `<button class="ev-link" data-tier-jump="cold">另有 ${c.cold} 条冷存（评分不足，先记着）</button>` : "")
+      + (c.dismissed ? `<button class="ev-link" data-tier-jump="dismissed">已排除 ${c.dismissed}</button>` : "")
+    : "";
   el.innerHTML = `<span>${escapeHtml(tierLabel)}</span><span>共 <b>${data.total}</b> 条</span>`
-    + (data.total ? `<span>当前 ${from}–${to}</span>` : "");
+    + (data.total ? `<span>当前 ${from}–${to}</span>` : "")
+    + other;
 }
 
 function renderAssetPager(data) {
