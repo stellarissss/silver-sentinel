@@ -1,12 +1,24 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
 <title>银发哨兵 · 涉老诈骗研判台</title>
+<script>
+  // 主题要在首屏绘制前定下来，否则会闪一下白底
+  try {
+    var t = localStorage.getItem("ss-theme");
+    if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+
+<div id="topline"></div>
+
 <div class="app">
 
   <aside class="sidebar">
@@ -14,20 +26,47 @@
       <div class="brand-mark">哨</div>
       <div class="brand-text">
         <strong>银发哨兵</strong>
-        <span>Silver Sentinel v{{ version }}</span>
+        <span>SILVER SENTINEL</span>
       </div>
     </div>
 
     <nav class="nav">
-      <button class="nav-item active" data-view="overview"><span class="ico">◎</span>概览</button>
-      <button class="nav-item" data-view="discover"><span class="ico">◈</span>发现流<span class="dot" id="dot-discover"></span></button>
-      <button class="nav-item" data-view="scan"><span class="ico">⌕</span>研判台</button>
-      <button class="nav-item" data-view="assets"><span class="ico">▤</span>线索库</button>
-      <button class="nav-item" data-view="graph"><span class="ico">⬡</span>关系图谱</button>
-      <button class="nav-item" data-view="campaigns"><span class="ico">⛓</span>团伙</button>
-      <button class="nav-item" data-view="watch"><span class="ico">◉</span>监控</button>
-      <button class="nav-item" data-view="ops"><span class="ico">⚙</span>运维</button>
-      <button class="nav-item" data-view="rules"><span class="ico">≡</span>规则库</button>
+      <button class="nav-item active" data-view="overview" title="概览">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="3.5" y="3.5" width="7" height="7"/><rect x="13.5" y="3.5" width="7" height="7"/><rect x="3.5" y="13.5" width="7" height="7"/><rect x="13.5" y="13.5" width="7" height="7"/></svg></span>
+        <span>概览</span>
+      </button>
+      <button class="nav-item" data-view="discover" title="发现流">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><path d="M12 12l5-5"/></svg></span>
+        <span>发现流</span><span class="dot" id="dot-discover"></span>
+      </button>
+      <button class="nav-item" data-view="scan" title="研判台">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></svg></span>
+        <span>研判台</span>
+      </button>
+      <button class="nav-item" data-view="assets" title="线索库">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 6.5h17M3.5 12h17M3.5 17.5h11"/></svg></span>
+        <span>线索库</span>
+      </button>
+      <button class="nav-item" data-view="graph" title="关系图谱">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="6" cy="7" r="2.6"/><circle cx="18" cy="7" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M8.1 8.6l2.4 6.9M15.9 8.6l-2.4 6.9M8.6 7h6.8"/></svg></span>
+        <span>关系图谱</span>
+      </button>
+      <button class="nav-item" data-view="campaigns" title="团伙">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M9.5 14.5l5-5"/><path d="M7.8 10.2L6.2 11.8a3.6 3.6 0 105.1 5.1l1.6-1.6"/><path d="M16.2 13.8l1.6-1.6a3.6 3.6 0 10-5.1-5.1L11.1 8.7"/></svg></span>
+        <span>团伙</span>
+      </button>
+      <button class="nav-item" data-view="watch" title="监控">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2.5 12s3.6-6 9.5-6 9.5 6 9.5 6-3.6 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="2.8"/></svg></span>
+        <span>监控</span>
+      </button>
+      <button class="nav-item" data-view="ops" title="运维">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M4 7h9M17 7h3M4 17h4M12 17h8"/><circle cx="15" cy="7" r="2.2"/><circle cx="10" cy="17" r="2.2"/></svg></span>
+        <span>运维</span>
+      </button>
+      <button class="nav-item" data-view="rules" title="规则库">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4M9 12h6M9 16h6"/></svg></span>
+        <span>规则库</span>
+      </button>
     </nav>
 
     <div class="side-status" id="side-status">
@@ -36,6 +75,11 @@
       <div class="status-row"><span>证据链</span><b id="st-chain">…</b></div>
       <div class="status-row"><span>实时流</span><b id="st-stream">…</b></div>
     </div>
+
+    <div class="side-foot">
+      <span>v{{ version }}</span>
+      <span id="side-clock">--:--</span>
+    </div>
   </aside>
 
   <main class="main">
@@ -43,7 +87,18 @@
       <h1 id="page-title">概览</h1>
       <div class="topbar-right">
         <span class="hint" id="top-hint"></span>
-        <button class="btn ghost" id="btn-refresh">刷新</button>
+        <button class="btn ghost sm" id="btn-cmdk" title="搜索与跳转（Ctrl/⌘ + K）">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></svg></span>
+          搜索
+          <span class="kbd-hint">⌘K</span>
+        </button>
+        <button class="btn ghost sm" id="btn-theme" title="切换深浅主题">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M5.2 5.2l1.7 1.7M17.1 17.1l1.7 1.7M18.8 5.2l-1.7 1.7M6.9 17.1l-1.7 1.7"/></svg></span>
+        </button>
+        <button class="btn ghost sm" id="btn-refresh">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M20 11a8 8 0 10-2.6 6M20 4.5V11h-6.5"/></svg></span>
+          刷新
+        </button>
       </div>
     </header>
 
@@ -81,14 +136,14 @@
         <div class="panel">
           <div class="panel-head"><h2>情报源状态</h2></div>
           <div id="source-status" class="list compact"></div>
-          <div class="panel-head" style="margin-top:14px"><h2>词库命中排行</h2><span class="hint">用于淘汰长期误报的词</span></div>
+          <div class="panel-head" style="margin-top:18px"><h2>词库命中排行</h2><span class="hint">用于淘汰长期误报的词</span></div>
           <div id="keyword-hits" class="list compact"></div>
         </div>
       </div>
 
       <div class="panel">
         <div class="panel-head"><h2>批量注入</h2><span class="hint">举报线索、群内链接、已知样本的基础设施，一行一个</span></div>
-        <textarea id="inject-values" rows="4" placeholder="guohui-minsheng.top&#10;zhongke-kangyang.top"></textarea>
+        <textarea id="inject-values" rows="4" placeholder="guohui-minsheng.top&#10;zhongke-kangyang.top" style="width:100%"></textarea>
         <div class="row actions">
           <select id="inject-source">
             <option value="manual">人工录入</option>
@@ -155,6 +210,7 @@
 
     <!-- 研判台 -->
     <section class="view" id="view-scan">
+      <div class="scan-layout">
       <div class="panel">
         <div class="tabs" id="scan-tabs">
           <button class="tab active" data-kind="url">链接 / 网址</button>
@@ -198,7 +254,7 @@
           <div id="input-miniapp" class="input-pane">
             <label>小程序 / 公众号名称</label>
             <input id="in-miniapp" type="text" placeholder="例如：国惠民生 惠民补贴中心">
-            <div class="row">
+            <div class="row" style="margin-top:12px">
               <label class="inline">分发方式</label>
               <select id="in-channel">
                 <option value="unknown">未知</option>
@@ -215,6 +271,12 @@
             <button class="btn primary" id="btn-scan">开始研判</button>
           </div>
         </div>
+      </div>
+
+      <aside class="panel scan-side">
+        <div class="panel-head"><h2>最近研判</h2><span class="hint">按风险分</span></div>
+        <div id="scan-recent" class="list compact"></div>
+      </aside>
       </div>
 
       <div id="scan-result"></div>
@@ -255,7 +317,8 @@
             <option value="brand">品牌词（仿冒变体探测）</option>
           </select>
           <input id="watch-value" type="text" placeholder="例如：领鸡蛋 / kuaishou / guohuiminsheng">
-          <input id="watch-interval" type="number" min="15" value="360" class="narrow">
+          <input id="watch-interval" type="number" min="15" value="360" class="narrow" title="巡检间隔（分钟）">
+          <span class="inline">分钟/次</span>
           <button class="btn primary" id="btn-watch-add">添加</button>
           <button class="btn ghost" id="btn-watch-run">立即执行一轮</button>
         </div>
@@ -286,8 +349,21 @@
   </aside>
 
 </div>
+
+<!-- 命令面板 -->
+<div class="cmdk" id="cmdk">
+  <div class="cmdk-box">
+    <input class="cmdk-input" id="cmdk-input" type="text" placeholder="跳转视图、搜索线索、执行操作…" autocomplete="off">
+    <div class="cmdk-list" id="cmdk-list"></div>
+    <div class="cmdk-foot">
+      <span>↑↓ 选择</span><span>Enter 执行</span><span>Esc 关闭</span>
+    </div>
+  </div>
+</div>
+
 <script src="/static/app.js"></script>
 <script src="/static/report.js"></script>
 <script src="/static/views.js"></script>
+<script src="/static/ui.js"></script>
 </body>
 </html>

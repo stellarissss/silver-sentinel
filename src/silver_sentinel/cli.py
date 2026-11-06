@@ -193,8 +193,24 @@ def cmd_rules(args) -> int:
 def cmd_serve(args) -> int:
     import uvicorn
 
+    from . import webauth
+
     init_db()
-    uvicorn.run("silver_sentinel.api:app", host=args.host, port=args.port, reload=args.reload)
+    host = args.host or settings.web_host
+    port = args.port or settings.web_port
+
+    password = webauth.ensure_password(host)
+    if password:
+        loopback = host in ("127.0.0.1", "localhost", "::1")
+        print(f"访问口令：{password}")
+        print(f"口令文件：{webauth._password_file()}（0600）")  # noqa: SLF001
+        if not loopback:
+            print(f"控制台：http://{host}:{port}/  首次打开需输入上面的口令")
+    elif not (args.host or settings.web_host) == "127.0.0.1":
+        print("警告：对外监听但未设置口令，已拒绝启动。请设 SILVER_WEB_PASSWORD。")
+        return 1
+
+    uvicorn.run("silver_sentinel.api:app", host=host, port=port, reload=args.reload)
     return 0
 
 
@@ -869,8 +885,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_health)
 
     p = sub.add_parser("serve", help="启动 Web 控制台")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--host", default="", help="默认取 SILVER_WEB_HOST，未设则 127.0.0.1")
+    p.add_argument("--port", type=int, default=0, help="默认取 SILVER_WEB_PORT，未设则 18700")
     p.add_argument("--reload", action="store_true")
     p.set_defaults(func=cmd_serve)
 

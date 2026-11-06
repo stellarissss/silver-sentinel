@@ -196,27 +196,39 @@ function connectStream() {
 
 /* ================= 关系图谱 ================= */
 
-const NODE_COLOR = {
-  domain: "#4da3ff",
-  url: "#6ea8fe",
-  ip: "#22d3ee",
-  asn: "#2dd4bf",
-  cert: "#a78bfa",
-  apk: "#ffa94d",
-  wallet: "#ffd43b",
-  phone: "#f472b6",
-  landline: "#f9a8d4",
-  qq: "#38bdf8",
-  wechat: "#34d399",
-  email: "#94a3b8",
-  bank_card: "#fb923c",
-  entity: "#ff5f56",
-  registrar: "#8b9bb4",
-  template: "#c084fc",
-  brand: "#facc15",
-  campaign: "#ef4444",
-  keyword: "#64748b",
+// 类型只用一个色相环，饱和度与亮度统一：图上看不出「一把荧光笔」，
+// 但仍能靠色相区分。具体明度跟着主题走。
+const NODE_HUE = {
+  domain: 210, url: 218, ip: 192, asn: 176, cert: 266, apk: 28,
+  wallet: 44, phone: 330, landline: 342, qq: 202, wechat: 152,
+  email: 214, bank_card: 18, entity: 4, registrar: 212, template: 284,
+  brand: 48, campaign: 0, keyword: 212,
 };
+
+const GRAPH_TYPE_LABEL = {
+  domain: "域名", url: "网址", ip: "IP", cert: "证书", apk: "安装包",
+  wallet: "钱包", phone: "手机号", email: "邮箱", bank_card: "银行卡",
+  entity: "主体", campaign: "团伙", template: "模板",
+};
+
+function cssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+function withAlpha(color, alpha) {
+  const raw = String(color).trim().replace("#", "");
+  const full = raw.length === 3 ? raw.split("").map((c) => c + c).join("") : raw;
+  const n = parseInt(full, 16);
+  if (!isFinite(n)) return `rgba(26,26,23,${alpha})`;
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+function nodeColor(type) {
+  const h = NODE_HUE[type] ?? 212;
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  return `hsl(${h} ${dark ? 42 : 30}% ${dark ? 62 : 41}%)`;
+}
 
 const graphState = {
   nodes: [],
@@ -243,9 +255,8 @@ async function loadGraphView() {
 function buildLegend() {
   const el = $("#graph-legend");
   if (!el) return;
-  el.innerHTML = Object.entries(NODE_COLOR)
-    .slice(0, 14)
-    .map(([k, c]) => `<span class="lg"><i style="background:${c}"></i>${escapeHtml(k)}</span>`)
+  el.innerHTML = Object.keys(GRAPH_TYPE_LABEL)
+    .map((k) => `<span class="lg-row"><i style="background:${nodeColor(k)}"></i>${escapeHtml(GRAPH_TYPE_LABEL[k])}</span>`)
     .join("");
 }
 
@@ -387,45 +398,50 @@ function drawGraph() {
   ctx.translate(graphState.offsetX, graphState.offsetY);
   ctx.scale(graphState.scale, graphState.scale);
 
-  // 边
+  const ink = cssVar("--ink", "#1a1a17");
+  const surface = cssVar("--surface", "#ffffff");
+  const accent = cssVar("--accent", "#b8342a");
+
+  // 边：细线。权重只用线宽表达，不用颜色
   graphState.edges.forEach((e) => {
     const active = graphState.hover && (e.a.id === graphState.hover || e.b.id === graphState.hover);
-    ctx.strokeStyle = active ? "rgba(120,200,255,.85)" : "rgba(80,110,145,.32)";
-    ctx.lineWidth = active ? 1.6 : Math.max(0.4, (e.weight || 0.2) * 1.6);
+    ctx.strokeStyle = active ? withAlpha(accent, .55) : withAlpha(ink, .15);
+    ctx.lineWidth = active ? 1.3 : Math.max(0.4, (e.weight || 0.2) * 1.1);
     ctx.beginPath();
     ctx.moveTo(e.a.x, e.a.y);
     ctx.lineTo(e.b.x, e.b.y);
     ctx.stroke();
   });
 
-  // 节点
+  // 节点：空心圆环。填充用纸色盖住穿过它的边，看起来才干净
   graphState.nodes.forEach((p) => {
-    const color = NODE_COLOR[p.type] || "#7c8da6";
     const isHover = graphState.hover === p.id;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r + (isHover ? 3 : 0), 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.globalAlpha = isHover ? 1 : 0.85;
+    ctx.arc(p.x, p.y, p.r + (isHover ? 2 : 0), 0, Math.PI * 2);
+    ctx.fillStyle = surface;
     ctx.fill();
-    ctx.globalAlpha = 1;
-    ctx.strokeStyle = "rgba(8,12,18,.75)";
-    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = nodeColor(p.type);
+    ctx.lineWidth = isHover ? 2 : 1.4;
     ctx.stroke();
 
     if (isHover || graphState.scale > 1.05 || p.type === "campaign" || p.type === "domain") {
       const label = shortLabel(p);
-      ctx.font = `${isHover ? "600 " : ""}11px ui-monospace, monospace`;
+      ctx.font = `${isHover ? "500 " : ""}10px ui-monospace, monospace`;
       ctx.textAlign = "center";
-      const tw = ctx.measureText(label).width;
-      ctx.fillStyle = "rgba(6,10,15,.72)";
-      ctx.fillRect(p.x - tw / 2 - 3, p.y + p.r + 3, tw + 6, 14);
-      ctx.fillStyle = isHover ? "#e8f4ff" : "#9fb3c8";
-      ctx.fillText(label, p.x, p.y + p.r + 14);
+      ctx.fillStyle = isHover ? ink : withAlpha(ink, .58);
+      ctx.fillText(label, p.x, p.y + p.r + 13);
     }
   });
 
   ctx.restore();
 }
+
+// 主题一换，画布上的线色也得跟着换，否则浅底上留着一层深色描边
+window.addEventListener("ss:theme", () => {
+  try {
+    if (graphState && graphState.nodes && graphState.nodes.length) drawGraph();
+  } catch (e) {}
+});
 
 function shortLabel(node) {
   const raw = String(node.label || node.id || "");

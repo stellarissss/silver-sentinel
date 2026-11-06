@@ -9,13 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from . import __version__
+from . import __version__, webauth
 from .analyzers import llm as llm_analyzer
 from .config import settings
 from .db import init_db, session_scope, verify_chain
@@ -108,7 +108,9 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         pass
 
 
-app = FastAPI(title="银发哨兵", version=__version__, lifespan=lifespan)
+# 关掉交互式文档：这是内部系统，没必要对外暴露全部接口形状
+app = FastAPI(title="银发哨兵", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(webauth.AuthMiddleware)
 app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 
@@ -163,6 +165,76 @@ def _asset_row(asset: Asset) -> dict[str, Any]:
 from .api_extra import router as extra_router  # noqa: E402
 
 app.include_router(extra_router)
+
+
+@app.get("/api/ping")
+def ping() -> dict[str, str]:
+    """探活。放在鉴权白名单里，供外部监控用，不带任何内部信息。"""
+    return {"status": "ok"}
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request, next: str = "/") -> HTMLResponse:
+    if not webauth.auth_enabled():
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse(
+        request, "login.html",
+        {"version": __version__, "next": next or "/", "err": ""},
+    )
+
+
+def _secure_cookie(request: Request) -> bool:
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    return request.url.scheme == "https" or proto == "https"
+
+
+@app.post("/auth/login")
+async def do_login(request: Request):  # noqa: ANN201
+    from urllib.parse import parse_qs
+
+    raw = (await request.body()).decode("utf-8", "replace")
+    form = parse_qs(raw, keep_blank_values=True)
+    given = (form.get("password") or [""])[0]
+    nxt = (form.get("next") or ["/"])[0] or "/"
+    # 只允许站内跳转，避免变成开放重定向
+    if not nxt.startswith("/") or nxt.startswith("//"):
+        nxt = "/"
+
+    key = webauth.client_key(request.scope)
+    if webauth.too_many_failures(key):
+        return templates.TemplateResponse(
+            request, "login.html",
+            {"version": __version__, "next": nxt, "err": "尝试次数过多，请 10 分钟后再试"},
+            status_code=429,
+        )
+
+    if not webauth.check_password(given):
+        webauth.note_failure(key)
+        return templates.TemplateResponse(
+            request, "login.html",
+            {"version": __version__, "next": nxt, "err": "口令不正确"},
+            status_code=401,
+        )
+
+    webauth.clear_failures(key)
+    resp = RedirectResponse(nxt, status_code=303)
+    resp.set_cookie(
+        webauth.COOKIE_NAME,
+        webauth.issue(),
+        max_age=webauth.SESSION_TTL,
+        httponly=True,
+        samesite="lax",
+        secure=_secure_cookie(request),
+        path="/",
+    )
+    return resp
+
+
+@app.get("/auth/logout")
+def do_logout() -> RedirectResponse:
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(webauth.COOKIE_NAME, path="/")
+    return resp
 
 
 @app.get("/", response_class=HTMLResponse)

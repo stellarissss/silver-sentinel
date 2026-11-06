@@ -71,7 +71,7 @@ git clone https://github.com/stellarissss/silver-sentinel.git
 cd silver-sentinel
 python3 -m pip install -e ".[full]"     # 不加 [full] 也能跑，只是少了沙箱/流式/S3/Neo4j
 
-silver-sentinel serve                   # 控制台 http://127.0.0.1:8000
+silver-sentinel serve                   # 控制台 http://127.0.0.1:18700
 ```
 
 零配置即可运行：不配任何 key 时，系统只用本地规则引擎 + 内置图引擎，LLM 与沙箱环节自动弃权，并在运维页明示——不会假装可用。
@@ -80,7 +80,7 @@ silver-sentinel serve                   # 控制台 http://127.0.0.1:8000
 
 ```bash
 # 一个进程全包：发现引擎 + 周期调度 + 副本 + 控制台
-SILVER_AUTOSTART=1 silver-sentinel serve --host 0.0.0.0 --port 8000
+SILVER_AUTOSTART=1 silver-sentinel serve --host 0.0.0.0 --port 18700
 
 # 或者分开跑，各自独立重启
 silver-sentinel discover run          # 发现常驻
@@ -88,6 +88,16 @@ silver-sentinel serve                 # 控制台
 ```
 
 `SILVER_AUTOSTART_MONITOR=1` 是旧写法，两种都认。
+
+监听非回环地址时**必须**设 `SILVER_WEB_PASSWORD`，否则进程直接拒绝启动——研判台上是正在跟踪的目标清单，不该裸奔在公网上。
+
+### 部署到服务器
+
+```bash
+bash deploy/push.sh root@<服务器IP>     # 本机执行：传包 + 远端安装 + 自检
+```
+
+服务器侧由 `deploy/install.sh` 全包：系统账号、venv、systemd（程序目录只读、数据目录独立）、随机口令、健康检查、防火墙放行。幂等，可反复执行；重复升级不会重置口令。详见 [控制台与访问控制](docs/14-控制台与访问控制.md)。
 
 ### Docker
 
@@ -99,7 +109,7 @@ docker compose --profile replica up -d          # + MinIO（异地副本）
 docker compose --profile sandbox up -d          # + MobSF（APK 动态分析）
 ```
 
-默认只绑 `127.0.0.1:8000`。对外暴露请在前置反代上加鉴权，别裸奔。
+默认只绑 `127.0.0.1:18700`。对外提供服务请用 `deploy/` 下的一键脚本（自带口令与 systemd 加固），或在反代上加 TLS。
 
 ---
 
@@ -476,6 +486,7 @@ curl -N :8000/api/stream       # SSE：发现流 / 周期事件
 - [结果复盘与优化清单](docs/11-结果复盘与优化.md)
 - [ICP 备案与动态取证落地](docs/12-ICP与动态取证落地.md)
 - [半自动举报：渠道实测、证据包与浏览器扩展](docs/13-半自动举报.md)
+- [控制台重构与访问控制（v1.4）](docs/14-控制台与访问控制.md)
 
 ---
 

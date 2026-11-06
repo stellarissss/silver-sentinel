@@ -33,6 +33,20 @@ const VERDICT_LABEL = {
   benign: "已排除",
 };
 
+const KIND_LABEL = {
+  domain: "域名",
+  url: "网址",
+  apk: "安卓安装包",
+  text: "话术样本",
+  miniapp: "小程序 / 公众号",
+  account: "网络账号",
+  wechat: "微信",
+  qq: "QQ",
+  phone: "电话号码",
+  wallet: "收款地址",
+  sample: "样本",
+};
+
 const CATEGORY_LABEL = {
   distribution: "分发渠道",
   impersonation: "身份冒充",
@@ -93,10 +107,10 @@ function badge(verdict) {
 }
 
 function scoreColor(score) {
-  if (score >= 70) return "#ff5f56";
-  if (score >= 40) return "#ffa94d";
-  if (score >= 15) return "#ffd43b";
-  return "#4ade80";
+  if (score >= 70) return "var(--c-confirmed)";
+  if (score >= 40) return "var(--c-high)";
+  if (score >= 15) return "var(--c-suspicious)";
+  return "var(--c-low)";
 }
 
 /* ---------------- 路由 ---------------- */
@@ -114,6 +128,7 @@ function switchView(view, { syncHash = true } = {}) {
     overview: loadOverview,
     discover: loadDiscover,
     assets: loadAssets,
+    scan: loadScanRecent,
     graph: loadGraphView,
     campaigns: loadCampaigns,
     watch: loadWatch,
@@ -202,15 +217,16 @@ async function loadOverview() {
 }
 
 const VERDICT_COLOR = {
-  confirmed: "#ff5f56",
-  high_risk: "#ffa94d",
-  suspicious: "#ffd43b",
-  insufficient: "#5b7189",
-  low: "#4ade80",
-  benign: "#22d3ee",
+  confirmed: "var(--c-confirmed)",
+  high_risk: "var(--c-high)",
+  suspicious: "var(--c-suspicious)",
+  insufficient: "var(--c-insufficient)",
+  low: "var(--c-low)",
+  benign: "var(--c-benign)",
 };
 
-const CATEGORY_PALETTE = ["#4da3ff", "#22d3ee", "#a78bfa", "#ffa94d", "#ff5f56", "#4ade80"];
+// 维度分布不配色相：同一把墨色，只让最高的那条用朱红，避免六色打架
+const CATEGORY_PALETTE = Array(6).fill("var(--ink-2)");
 
 function renderBars(container, data, labelFn = x => x, mode = "verdict") {
   const entries = Object.entries(data || {}).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
@@ -219,17 +235,23 @@ function renderBars(container, data, labelFn = x => x, mode = "verdict") {
 
   container.innerHTML = entries.map(([k, v], i) => {
     const color = mode === "verdict"
-      ? (VERDICT_COLOR[k] || "#4da3ff")
-      : CATEGORY_PALETTE[i % CATEGORY_PALETTE.length];
+      ? (VERDICT_COLOR[k] || "var(--ink-2)")
+      : (i === 0 ? "var(--accent)" : CATEGORY_PALETTE[i % CATEGORY_PALETTE.length]);
     return `
       <div class="bar-row">
         <div class="bar-label">${escapeHtml(labelFn(k))}</div>
         <div class="bar-track">
-          <div class="bar-fill" style="width:${Math.round((v / max) * 100)}%;background:linear-gradient(90deg,${color}55,${color})"></div>
+          <div class="bar-fill" style="width:0;background:${color}" data-w="${Math.round((v / max) * 100)}"></div>
         </div>
         <div class="bar-val">${v}</div>
       </div>`;
   }).join("");
+
+  requestAnimationFrame(() => {
+    container.querySelectorAll(".bar-fill").forEach((b) => {
+      b.style.width = (b.dataset.w || 0) + "%";
+    });
+  });
 }
 
 /* ---------------- 研判 ---------------- */
@@ -332,7 +354,7 @@ function renderScanResult(data) {
   const llmHtml = llm ? `
     <div class="signal-group">
       <h3>LLM 研判 · ${escapeHtml(llm.model || "")} · 阶段「${escapeHtml(llm.stage || "未知")}」</h3>
-      <div class="signal" style="border-left-color:#22d3ee">
+      <div class="signal accent">
         <div>
           <div class="t">${escapeHtml(llm.reasoning || "（无推理内容）")}</div>
           <div class="d">手法：${escapeHtml((llm.tactics || []).join("、") || "—")}</div>
@@ -348,7 +370,7 @@ function renderScanResult(data) {
     <div class="panel">
       <div class="result-card">
         <div>
-          <div class="gauge" style="background:conic-gradient(${color} ${Math.round(a.score * 3.6)}deg, #1b2938 0deg)">
+          <div class="gauge" style="background:conic-gradient(${color} ${Math.round(a.score * 3.6)}deg, var(--rule) 0deg)">
             <div class="gauge-inner">
               <div class="gauge-num" style="color:${color}">${a.score.toFixed(0)}</div>
               <div class="gauge-lab">RISK</div>
@@ -414,6 +436,29 @@ function renderFacts(asset, a) {
     </div>`;
 }
 
+async function loadScanRecent() {
+  const box = $("#scan-recent");
+  if (!box) return;
+  try {
+    const data = await api("/api/assets?limit=8");
+    if (!data.items.length) {
+      box.innerHTML = `<div class="empty">还没有研判记录。左边输入第一条可疑链接即可。</div>`;
+      return;
+    }
+    box.innerHTML = data.items.map(a => `
+      <div class="row-item" data-asset="${a.id}">
+        <div class="row-main">
+          <strong>${escapeHtml(a.value)}</strong>
+          <span>${escapeHtml(KIND_LABEL[a.kind] || a.kind)} · ${fmtTime(a.last_seen)}</span>
+        </div>
+        <div class="score-chip"><b>${a.score}</b></div>
+      </div>`).join("");
+    $$("#scan-recent .row-item").forEach(el => el.addEventListener("click", () => openAsset(el.dataset.asset)));
+  } catch (e) {
+    box.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+  }
+}
+
 /* ---------------- 线索库 ---------------- */
 
 async function loadAssets() {
@@ -428,7 +473,7 @@ async function loadAssets() {
   }
 
   $("#asset-table").innerHTML = `
-    <table>
+    <table class="data">
       <thead><tr>
         <th class="col-verdict">判定</th><th>标识</th><th class="col-kind">类型</th>
         <th class="col-score">风险分</th><th class="col-conf">置信</th>
@@ -469,14 +514,14 @@ async function openAsset(id) {
       </div>`).join("") || `<div class="empty">无信号</div>`;
 
     const evidence = (a.evidence || []).map(e => `
-      <div class="signal" style="border-left-color:#2a3b4f">
+      <div class="signal">
         <div>
           <div class="t">${escapeHtml(e.kind)} · ${escapeHtml(e.note || "")}</div>
           <div class="d">SHA-256 ${escapeHtml(e.sha256.slice(0, 32))}… · ${e.size} 字节 · ${fmtTime(e.captured_at)}</div>
         </div>
       </div>`).join("") || `<div class="empty">无归档证据</div>`;
 
-    $("#drawer-title").textContent = a.kind.toUpperCase();
+    $("#drawer-title").textContent = KIND_LABEL[a.kind] || a.kind;
     $("#drawer-body").innerHTML = `
       <div>${badge(a.verdict)} <span class="hint">风险分 ${a.score} · 置信 ${a.confidence}</span></div>
       <div class="result-title" style="margin-top:10px">${escapeHtml(a.value)}</div>
@@ -642,3 +687,5 @@ function init() {
 
 document.addEventListener("DOMContentLoaded", init);
 window.openAsset = openAsset;
+window.switchView = switchView;
+window.loadHealth = loadHealth;

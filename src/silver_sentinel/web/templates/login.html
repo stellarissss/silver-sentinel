@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>银发哨兵 · 访问验证</title>
+<script>
+  try {
+    var t = localStorage.getItem("ss-theme");
+    if (!t) t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="gate">
+  <form class="gate-box" method="post" action="/auth/login" autocomplete="off">
+    <div class="gate-mark">哨</div>
+    <h1>银发哨兵</h1>
+    <p>涉老诈骗研判台。此系统仅对授权人员开放，入口需要访问口令。</p>
+
+    <input type="password" name="password" placeholder="访问口令" autofocus required
+           autocomplete="current-password" aria-label="访问口令">
+    <input type="hidden" name="next" value="{{ next }}">
+
+    <div class="gate-err">{{ err }}</div>
+
+    <button class="btn primary" type="submit">进入</button>
+
+    <div class="gate-foot">
+      <span>v{{ version }}</span>
+      <span>SILVER SENTINEL</span>
+    </div>
+  </form>
+</div>
+</body>
+</html>

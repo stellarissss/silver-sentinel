@@ -204,6 +204,15 @@ class Settings:
     # 证据包里最多带几张截图（12377 附件有总量限制）
     report_max_shots: int = 6
 
+    # ---------------------------------------------------------------- 控制台
+    # 访问口令。留空且只监听回环地址时不鉴权；对外监听时自动生成并落盘。
+    web_password: str = ""
+    # 即使只监听本机也强制要口令（本机多人共用一台时开）
+    web_force_auth: bool = False
+    # 绑定地址与端口。默认只给本机，对外提供服务时改成 0.0.0.0 并务必设口令。
+    web_host: str = "127.0.0.1"
+    web_port: int = 18700
+
     # ---------------------------------------------------------------- 调度
     monitor_tick_seconds: int = 60
     default_watch_interval_minutes: int = 360
@@ -239,6 +248,10 @@ class Settings:
             self.db_url = os.environ.get("SILVER_DB_URL", f"sqlite:///{self.data_dir / 'sentinel.db'}")
 
         self.allow_network = _bool("SILVER_ALLOW_NETWORK", True)
+        self.web_password = _str("SILVER_WEB_PASSWORD", "")
+        self.web_force_auth = _bool("SILVER_WEB_FORCE_AUTH", False)
+        self.web_host = _str("SILVER_WEB_HOST", "127.0.0.1")
+        self.web_port = _int("SILVER_WEB_PORT", 18700)
         self.http_timeout = _float("SILVER_HTTP_TIMEOUT", self.http_timeout)
         self.http_retries = _int("SILVER_HTTP_RETRIES", self.http_retries)
         self.rate_limit_per_sec = _float("SILVER_RATE_LIMIT", self.rate_limit_per_sec)
