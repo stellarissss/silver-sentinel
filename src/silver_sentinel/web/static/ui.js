@@ -389,4 +389,30 @@
   });
   const drawerEl = $("#drawer");
   if (drawerEl) drawerObs.observe(drawerEl, { attributes: true, attributeFilter: ["class"] });
+
+  /* ---------------------------------------------------------- 骨架屏 */
+  // 线上首屏要等 SQLite 聚合（近三千条线索）才出数，这一段页面是空的。
+  // 空屏和坏掉的页面长得一样，用户第一反应是刷新——所以先摆占位。
+  const skelRows = (n, widths) =>
+    Array.from({ length: n }, (_, i) =>
+      `<div class="skel-row"><span class="skel" style="width:${widths[i % widths.length]}"></span></div>`
+    ).join("");
+
+  function paintSkeleton() {
+    const kpis = $("#kpis");
+    if (kpis && !kpis.children.length) {
+      kpis.innerHTML = Array.from({ length: 5 }, () => `
+        <div class="kpi">
+          <div class="skel" style="width:54%;height:30px"></div>
+          <div class="skel" style="width:38%;height:10px;margin-top:11px"></div>
+        </div>`).join("");
+    }
+    ["#verdict-chart", "#category-chart"].forEach((sel) => {
+      const el = $(sel);
+      if (el && !el.children.length) el.innerHTML = skelRows(4, ["58%", "51%", "46%", "39%"]);
+    });
+    const top = $("#top-assets");
+    if (top && !top.children.length) top.innerHTML = skelRows(5, ["46%", "38%", "52%", "33%", "44%"]);
+  }
+  window.ssSkeleton = paintSkeleton;
 })();

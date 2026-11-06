@@ -670,6 +670,7 @@ function init() {
 
   bindGlobal();
   bindScan();
+  if (window.ssSkeleton) window.ssSkeleton();
   loadHealth();
   loadOverview();
 

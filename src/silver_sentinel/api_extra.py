@@ -181,6 +181,18 @@ def graph_overview(limit: int = Query(default=120, le=400)) -> dict[str, Any]:
             rows = list(
                 s.scalars(select(Asset).order_by(Asset.score.desc()).limit(limit))
             )
+        # 高分层（已确认 / 观察）通常只有个位数，只取它们的话全局视图就十来个点，
+        # 看着像图谱坏了。用候选层的高分资产补足，图才有「全局」的样子。
+        shortfall = limit - len(rows)
+        if shortfall > 0:
+            rows.extend(
+                s.scalars(
+                    select(Asset)
+                    .where(or_(Asset.tier.is_(None), Asset.tier.notin_((TIER_CONFIRMED, TIER_WATCH))))
+                    .order_by(Asset.score.desc())
+                    .limit(shortfall)
+                )
+            )
         keys = [_asset_node_key(a) for a in rows]
 
     store = get_graph()

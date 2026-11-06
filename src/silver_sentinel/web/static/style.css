@@ -1220,7 +1220,14 @@ table.data td strong, .table-wrap > table td strong { color: var(--ink); font-we
   animation: shimmer 1.4s ease infinite;
   border-radius: 1px;
   height: 12px;
+  display: block;
 }
+/* 列表占位：留出和真实行一致的高度，数据回来时不会跳一下 */
+.skel-row {
+  padding: 13px 2px;
+  border-bottom: 1px solid var(--rule);
+}
+.skel-row:last-child { border-bottom: 0; }
 
 /* ================================================================ 命令面板 */
 .cmdk {

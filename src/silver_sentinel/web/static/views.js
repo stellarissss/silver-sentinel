@@ -263,7 +263,7 @@ function buildLegend() {
 async function loadGraphOverview() {
   toast("加载全局图…");
   try {
-    const data = await api("/api/graph/overview?limit=90");
+    const data = await api("/api/graph/overview?limit=40");
     setGraphData(data);
   } catch (e) {
     toast(`图加载失败：${e.message}`);
@@ -286,19 +286,43 @@ function setGraphData(data) {
   const w = canvas.clientWidth || 900;
   const h = canvas.clientHeight || 620;
 
+  const baseR = (n) => (n.type === "campaign" ? 16 : n.type === "domain" ? 11 : 8);
+
+  // 网格初始化：按画布长宽比铺成行列，力导向只做局部微调。
+  // 早先用同心圆初始化，外圈节点一上来就被斥力顶到边界，沿四条边排成直线。
+  const N = (data.nodes || []).length;
+  const cols = Math.max(1, Math.round(Math.sqrt((N * w) / Math.max(h, 1))));
+  const rows = Math.max(1, Math.ceil(N / cols));
+  const cw = w / (cols + 1);
+  const ch = h / (rows + 1);
+
   graphState.nodes = (data.nodes || []).map((n, i) => ({
     ...n,
-    x: w / 2 + Math.cos((i / Math.max(1, data.nodes.length)) * Math.PI * 2) * (170 + (i % 7) * 26),
-    y: h / 2 + Math.sin((i / Math.max(1, data.nodes.length)) * Math.PI * 2) * (150 + (i % 5) * 22),
+    x: cw * ((i % cols) + 1) + (Math.random() - 0.5) * 16,
+    y: ch * (Math.floor(i / cols) + 1) + (Math.random() - 0.5) * 16,
     vx: 0,
     vy: 0,
-    r: n.type === "campaign" ? 13 : n.type === "domain" ? 9 : 6,
+    r: baseR(n) * (data.nodes.length > 150 ? 0.6 : data.nodes.length > 80 ? 0.76 : 1),
   }));
 
   const index = new Map(graphState.nodes.map((n) => [n.id, n]));
   graphState.edges = (data.edges || [])
     .map((e) => ({ ...e, a: index.get(e.source), b: index.get(e.target) }))
     .filter((e) => e.a && e.b);
+
+  // 度数决定谁配拥有标签。图一大就全标，会糊成一片黑框，不如只标连接最多的那些。
+  const deg = new Map();
+  graphState.edges.forEach((e) => {
+    deg.set(e.source, (deg.get(e.source) || 0) + 1);
+    deg.set(e.target, (deg.get(e.target) || 0) + 1);
+  });
+  const budget = graphState.nodes.length > 60 ? 12 : graphState.nodes.length;
+  graphState.labelSet = new Set(
+    [...graphState.nodes]
+      .sort((a, b) => (deg.get(b.id) || 0) - (deg.get(a.id) || 0))
+      .slice(0, budget)
+      .map((n) => n.id)
+  );
 
   graphState.scale = 1;
   graphState.offsetX = 0;
@@ -333,7 +357,9 @@ function simulate() {
   const h = canvas ? canvas.clientHeight : 520;
   const alpha = graphState.alpha;
 
-  // 斥力：O(n²)，节点数控制在几百以内足够
+  // 斥力：O(n²)，节点数控制在几百以内足够。
+  // 节点越多需要的分离力越大，否则两百个点会挤成中心一团。
+  const spread = Math.min(1.6, 1 + n / 200);
   for (let i = 0; i < n; i++) {
     const a = nodes[i];
     for (let j = i + 1; j < n; j++) {
@@ -342,7 +368,7 @@ function simulate() {
       let dy = a.y - b.y;
       let d2 = dx * dx + dy * dy;
       if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
-      const force = (2600 * alpha) / d2;
+      const force = (1200 * spread * alpha) / d2;
       const d = Math.sqrt(d2);
       const fx = (dx / d) * force;
       const fy = (dy / d) * force;
@@ -356,8 +382,8 @@ function simulate() {
     const dx = e.b.x - e.a.x;
     const dy = e.b.y - e.a.y;
     const d = Math.sqrt(dx * dx + dy * dy) || 1;
-    const target = 128;
-    const k = 0.02 * (e.weight || 0.3) * alpha * 3;
+    const target = n > 120 ? 72 : n > 60 ? 96 : 128;
+    const k = 0.018 * (e.weight || 0.3) * alpha * 3;
     const f = (d - target) * k;
     const fx = (dx / d) * f;
     const fy = (dy / d) * f;
@@ -367,16 +393,23 @@ function simulate() {
 
   // 向心 + 阻尼
   nodes.forEach((p) => {
-    p.vx += (w / 2 - p.x) * 0.0016 * alpha;
-    p.vy += (h / 2 - p.y) * 0.0016 * alpha;
+    p.vx += (w / 2 - p.x) * 0.009 * alpha;
+    p.vy += (h / 2 - p.y) * 0.009 * alpha;
     p.vx *= 0.86;
     p.vy *= 0.86;
     if (!p.fixed) {
       p.x += p.vx;
       p.y += p.vy;
     }
-    p.x = Math.max(30, Math.min(w - 30, p.x));
-    p.y = Math.max(30, Math.min(h - 30, p.y));
+    // 软边界：撞墙时给一个回推力，而不是硬截断。
+    // 硬截断会让两成节点沿着四条边贴成一排，图看起来像被框住了。
+    const pad = 26;
+    if (p.x < pad) p.vx += (pad - p.x) * 1.2;
+    if (p.x > w - pad) p.vx -= (p.x - (w - pad)) * 1.2;
+    if (p.y < pad) p.vy += (pad - p.y) * 1.2;
+    if (p.y > h - pad) p.vy -= (p.y - (h - pad)) * 1.2;
+    p.x = Math.max(12, Math.min(w - 12, p.x));
+    p.y = Math.max(12, Math.min(h - 12, p.y));
   });
 }
 
@@ -405,8 +438,8 @@ function drawGraph() {
   // 边：细线。权重只用线宽表达，不用颜色
   graphState.edges.forEach((e) => {
     const active = graphState.hover && (e.a.id === graphState.hover || e.b.id === graphState.hover);
-    ctx.strokeStyle = active ? withAlpha(accent, .55) : withAlpha(ink, .15);
-    ctx.lineWidth = active ? 1.3 : Math.max(0.4, (e.weight || 0.2) * 1.1);
+    ctx.strokeStyle = active ? withAlpha(accent, .55) : withAlpha(ink, .2);
+    ctx.lineWidth = active ? 1.3 : Math.max(0.7, (e.weight || 0.2) * 1.1);
     ctx.beginPath();
     ctx.moveTo(e.a.x, e.a.y);
     ctx.lineTo(e.b.x, e.b.y);
@@ -424,7 +457,7 @@ function drawGraph() {
     ctx.lineWidth = isHover ? 2 : 1.4;
     ctx.stroke();
 
-    if (isHover || graphState.scale > 1.05 || p.type === "campaign" || p.type === "domain") {
+    if (isHover || graphState.scale > 1.25 || (graphState.nodes.length <= 40 && graphState.labelSet && graphState.labelSet.has(p.id))) {
       const label = shortLabel(p);
       ctx.font = `${isHover ? "500 " : ""}10px ui-monospace, monospace`;
       ctx.textAlign = "center";
