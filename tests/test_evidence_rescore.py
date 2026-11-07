@@ -187,20 +187,44 @@ def test_off_topic_page_only_keeps_structural_signals(fresh_db):
 
 
 def test_single_brand_term_is_not_strong_keyword(fresh_db):
-    """只有品牌词命中（站群域名）时，不给「强主题词根」信号。"""
+    """只有品牌词命中（站群域名）时，不给「强主题词根」信号，只给弱品牌信号。"""
     from silver_sentinel.models import Asset
     from silver_sentinel.scoring.reassess import assess_now
 
     asset = Asset(kind="domain", value="jrs-weixin-qq.cc", normalized="jrs-weixin-qq.cc")
     assessment, _facts = assess_now(asset, text="")
-    assert "KW-001" not in {s.rule_id for s in assessment.signals}
+    ids = {s.rule_id for s in assessment.signals}
+    assert "KW-001" not in ids
+    assert "KW-003" in ids
 
 
-def test_brand_plus_role_still_triggers_keyword(fresh_db):
-    """「品牌 + 角色」的双命中仍应触发，避免把真冒充一起放过。"""
+def test_authority_term_still_triggers_strong_keyword(fresh_db):
+    """机构冒充词是强信号，不受品牌词收紧影响。"""
     from silver_sentinel.models import Asset
     from silver_sentinel.scoring.reassess import assess_now
 
-    asset = Asset(kind="domain", value="weixin-kefu.com", normalized="weixin-kefu.com")
+    asset = Asset(kind="domain", value="guohui-zhongke.cn", normalized="guohui-zhongke.cn")
     assessment, _facts = assess_now(asset, text="")
     assert "KW-001" in {s.rule_id for s in assessment.signals}
+
+
+def test_voting_saas_is_not_watch_level(fresh_db):
+    """正规 SaaS 页面（微信投票工具）不该进 watch。
+
+    它同时命中「品牌词 + 无备案 + 品牌相似域名 + 客服」，
+    旧规则会推到 56 分；收紧后应停在候选池。
+    """
+    from silver_sentinel.models import Asset
+    from silver_sentinel.scoring.reassess import assess_now
+
+    asset = Asset(kind="domain", value="weixin100.com.cn", normalized="weixin100.com.cn")
+    asset.meta = {"facts": {"brand_lookalike": "weixin"}}
+    text = (
+        "宝石投票系统的优势 免费创建微信投票 支持图文、音视频上传 实时预览 "
+        "可设置票数上限，验证码防刷，投票频率，IP限制 手机验证码 专属客服服务 "
+        "感谢您对平台的支持和信任，投票活动创建，可以咨询微信客服"
+    )
+    assessment, _facts = assess_now(asset, text=text)
+    ids = {s.rule_id for s in assessment.signals}
+    assert "PER-006" not in ids
+    assert assessment.score < 50

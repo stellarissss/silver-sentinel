@@ -342,26 +342,39 @@ rules:
   # 由 discover/keywords.py 的词库产出。分两档，互斥，避免同一件事被计两次。
   - id: KW-001
     category: impersonation
-    title: 命中强主题词根（机构冒充/骗局专属/品牌冒用）
+    title: 命中强主题词根（机构冒充/骗局专属）
     weight: 26
     confidence: 0.7
     when:
-      # 只凭一个品牌词（weixin / qq / douyin）不算强词根：
-      # 体育、影视站群会批量注册 fj-weixin-qq.cc 这类域名，字面全中但和
-      # 涉老诈骗无关。要求「高置信 + 至少两个独立命中」，或直接命中骗局专属簇。
+      # 只认「机构名」与「骗局专属词」两类。品牌词（weixin/douyin/taobao）
+      # 单独出现太常见：微信投票工具、抖音代运营、站群域名都会命中，
+      # 把它留到 KW-003 用低权重计，避免一条品牌词就把线索推进 watch。
+      any:
+        - fact: keyword_clusters
+          op: contains
+          value: scam_signature
+        - fact: keyword_clusters
+          op: contains
+          value: authority
+    detail: 域名或语料中出现「国科/中科/国惠/民族资产解冻」等强主题词根，是非官方主体冒用权威名义的典型特征。
+    cite: 词库 cluster=authority/scam_signature
+
+  - id: KW-003
+    category: impersonation
+    title: 语料提及被冒用品牌
+    weight: 12
+    confidence: 0.55
+    when:
       all:
-        - fact: keyword_hint
-          op: gte
-          value: 0.8
-        - any:
-            - fact: keyword_hits
-              op: gte
-              value: 2
-            - fact: keyword_clusters
-              op: contains
-              value: scam_signature
-    detail: 域名或语料中出现「国科/中科/国惠/民族资产解冻/被冒用品牌」等强主题词根，是非官方主体冒用权威名义的典型特征。
-    cite: 词库 cluster=authority/scam_signature/brand
+        - fact: keyword_clusters
+          op: contains
+          value: brand
+        - not:
+            fact: keyword_clusters
+            op: contains
+            value: authority
+    detail: 出现微信/抖音/支付宝等品牌词。单凭这一点不足以定性——正规服务商同样会提及，需结合域名仿冒与页面话术。
+    cite: 词库 cluster=brand
 
   - id: KW-002
     category: impersonation
@@ -589,14 +602,24 @@ rules:
     weight: 20
     confidence: 0.85
     when:
-      text_any:
-        - 身份证正反面
-        - 人脸识别
-        - 手持身份证
-        - 验证码
-        - 银行卡号
-        - 短信验证
-        - 实名认证
+      # 关键词本身不构成「索要」：投票系统会写「验证码防刷」，银行会写
+      # 「人脸识别」，这些都不是骗局。必须出现「要/给/发/上传」的动作，
+      # 或与「领取」同现——这正是公安提醒里的那句「要扫码、填身份证、
+      # 给验证码、刷脸才能领礼品」。
+      any:
+        - text_any:
+            - 提供验证码
+            - 告诉我验证码
+            - 报一下验证码
+            - 把验证码发
+            - 验证码发给
+            - 索要验证码
+        - text_all: [身份证, 领取]
+        - text_all: [手持身份证, 照片]
+        - text_all: [人脸识别, 领取]
+        - text_all: [刷脸, 领取]
+        - text_all: [银行卡号, 填写]
+        - text_all: [验证码, 领取]
     detail: 超额收集身份要素，可用于注册账号、洗钱或二次诈骗。
     cite: 武汉东西湖区公安：要扫码、填身份证、给验证码、刷脸才能领礼品，直接拒绝
 
