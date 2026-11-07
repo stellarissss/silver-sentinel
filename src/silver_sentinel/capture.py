@@ -175,6 +175,24 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
     now = utcnow()
     claimed: list[tuple[int, int]] = []
     with session_scope() as s:
+        # 进程重启会把「running」的任务留在库里。不回收的话这条资产从此
+        # 既不会被 re-enqueue（enqueue 见到 running 就跳过），也不会被执行——
+        # 界面上就是一个永远转圈的「执行中」。
+        stale = list(
+            s.scalars(
+                select(CaptureTask).where(
+                    CaptureTask.state == "running",
+                    CaptureTask.started_at < now - timedelta(minutes=15),
+                )
+            )
+        )
+        for task in stale:
+            task.state = "queued"
+            task.next_run_at = now
+            task.error = "上次执行被中断（进程重启），已重新排队"
+        if stale:
+            log.info("回收 %s 个中断的取证任务", len(stale))
+
         tasks = list(
             s.scalars(
                 select(CaptureTask)
