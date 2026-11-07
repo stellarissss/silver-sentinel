@@ -298,8 +298,24 @@ def stale_assets(limit: int = 100, hours: int = 24) -> list[int]:
     return [r[0] for r in rows]
 
 
+# 建图的节流时间戳。每轮都全量重建 3000+ 资产的边太贵——
+# 实测周期 40~60 秒一轮，社区发现日志里「新建 0，更新 0，跳过 18」重复刷屏，
+# 纯属空转。图结构的变化速度远低于取证速度，10 分钟一次足够。
+_GRAPH_BUILT_AT: float = 0.0
+
+
+def _should_rebuild_graph() -> bool:
+    import time as _time
+
+    gap = max(1, int(getattr(settings, "graph_rebuild_minutes", 10))) * 60
+    if _time.monotonic() - _GRAPH_BUILT_AT < gap:
+        return False
+    return True
+
+
 def run_cycle(*, scan_limit: int | None = None, enrich_limit: int = 40, rebuild_graph: bool = True) -> dict[str, Any]:
     """跑一轮。可被调度器反复调用，也可 CLI 手动触发。"""
+    global _GRAPH_BUILT_AT
     started = time.monotonic()
     stats = CycleStats()
     task = _task("cycle")
@@ -368,13 +384,14 @@ def run_cycle(*, scan_limit: int | None = None, enrich_limit: int = 40, rebuild_
         except Exception as exc:  # noqa: BLE001
             log.debug("LLM 补判失败：%s", exc)
 
-        # 4) 建图 + 找团伙
-        if rebuild_graph and settings.graph_enabled:
+        # 4) 建图 + 找团伙（节流：图结构变化远慢于取证，不必每轮重算）
+        if rebuild_graph and settings.graph_enabled and _should_rebuild_graph():
             try:
                 builder = GraphBuilder()
                 gstats = builder.build_all(limit=6000)
                 stats.graph_edges = gstats.get("edges", 0)
                 stats.campaigns = sync_campaigns()
+                _GRAPH_BUILT_AT = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 stats.errors += 1
                 log.warning("建图失败：%s", exc)

@@ -188,11 +188,12 @@ function scoreColor(score) {
   return "var(--c-low)";
 }
 
-// 后端存的是 pending / captured / failed 三态，界面用词要跟它对齐
+// 后端存的是 pending / captured / failed / dead 四态，界面用词要跟它对齐
 const CAPTURE_LABEL = {
   pending: "待取证",
   captured: "已取证",
   failed: "失败",
+  dead: "站点失联",
   skipped: "跳过",
 };
 

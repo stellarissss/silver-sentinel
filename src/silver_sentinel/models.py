@@ -116,6 +116,9 @@ class Asset(Base):
     last_capture_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     capture_state: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     capture_error: Mapped[str] = mapped_column(Text, default="")
+    # 下一次允许自动补队的时间。按失败性质给不同冷却（死域名 3 天、被墙 1 天、
+    # 网络抖动 10 分钟），避免 NXDOMAIN 这类永久失败按分钟循环烧浏览器。
+    capture_retry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     notes: Mapped[str] = mapped_column(Text, default="")

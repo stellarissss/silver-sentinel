@@ -143,6 +143,7 @@ silver-sentinel rescore --limit 2000              # 用已取到的正文重算�
 silver-sentinel rescore --retier --limit 6000     # 规则口径变更后连分级一起重算
 silver-sentinel dismiss 1 --reason "演示样例包"    # 人工排除，之后重评不会拉回来
 silver-sentinel health                            # 进程内能力 + 取证队列健康度
+silver-sentinel doctor                            # 存活自检（看门狗用，异常退出码 1）
 
 # 证据可靠性
 silver-sentinel log verify                        # 逐条重算哈希链
@@ -444,9 +445,17 @@ src/silver_sentinel/
 
 ```bash
 silver-sentinel ops            # 能力降级、积压、事件日志完整性
+silver-sentinel doctor         # 心跳 + 队列自检；异常退出码 1
 curl :8000/api/metrics         # Prometheus 文本格式
 curl -N :8000/api/stream       # SSE：发现流 / 周期事件
 ```
+
+### 全天候守护
+
+`install.sh` 会同时装上 `silver-sentinel-watchdog.timer`：每 2 分钟读一次
+`data/heartbeat.json`，5 分钟不更新就重启服务（一小时最多 3 次，之后熔断报错）。
+`Restart=always` 只能救进程退出，救不了「进程活着但线程卡死」——那种状态下
+`/api/ping` 一直是 200，只有心跳文件会停更。
 
 建议盯的四个指标：
 

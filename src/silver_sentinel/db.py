@@ -86,6 +86,7 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("last_capture_at", "DATETIME"),
         ("capture_state", "VARCHAR(16) DEFAULT 'pending'"),
         ("capture_error", "TEXT DEFAULT ''"),
+        ("capture_retry_at", "DATETIME"),
     ],
     "icp_cache": [
         ("violation", "VARCHAR(16) DEFAULT 'unknown'"),

@@ -78,6 +78,55 @@ KIND_LABEL.update({"assessment": "研判快照", "text": "原始文本", "qrcode
 
 PRIORITY = {TIER_CONFIRMED: 10, TIER_WATCH: 25, TIER_CANDIDATE: 60, TIER_COLD: 200}
 
+# 失败分三类，冷却时间完全不同。混在一起按「失败 3 次 → 等 6 小时」处理，
+# 结果是死域名每天被重新拉起 4 次，每次二三十秒只换来同一句 NXDOMAIN，
+# 真正活着的目标反而排在后面。线上 181 条失败里 115 条属于前两类。
+FAILURE_DEAD = "dead"          # 域名没了 / 端口拒连：永久性，隔天再看
+FAILURE_BLOCKED = "blocked"    # WAF、证书、空响应：可能是临时封锁，隔天再看
+FAILURE_TRANSIENT = "transient"  # 超时、连接重置：分钟级重试有意义
+
+_DEAD_MARKERS = (
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_NAME_RESOLUTION_FAILED",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_ADDRESS_UNREACHABLE",
+    "无法解析",
+    "无可访问地址",
+)
+_BLOCKED_MARKERS = (
+    "ERR_SSL",
+    "ERR_CERT",
+    "ERR_EMPTY_RESPONSE",
+    "ERR_HTTP2_PROTOCOL_ERROR",
+    "出站被拒",
+    "内网地址",
+)
+
+
+def classify_failure(error: str) -> str:
+    """把 Playwright 的报错归成「还值不值得再花一次浏览器」。
+
+    宁可把不确定的归到 transient（多试一次），也不要把临时故障判死：
+    判死的代价是这条线索 3 天内不再取证，而多试一次的代价只是几十秒。
+    """
+    text = (error or "").upper()
+    if not text.strip():
+        return FAILURE_TRANSIENT
+    if any(marker.upper() in text for marker in _DEAD_MARKERS):
+        return FAILURE_DEAD
+    if any(marker.upper() in text for marker in _BLOCKED_MARKERS):
+        return FAILURE_BLOCKED
+    return FAILURE_TRANSIENT
+
+
+def retry_delay(kind: str) -> timedelta:
+    """按失败性质给冷却时间。"""
+    if kind == FAILURE_DEAD:
+        return timedelta(hours=settings.capture_dead_retry_hours)
+    if kind == FAILURE_BLOCKED:
+        return timedelta(hours=settings.capture_blocked_retry_hours)
+    return timedelta(minutes=10)
+
 _MAX_HTML = 8_000_000
 _MAX_TEXT = 2_000_000
 _MAX_NETWORK = 4_000_000
@@ -135,6 +184,32 @@ def enqueue(asset_id: int, *, reason: str = "", priority: int | None = None) -> 
     return True
 
 
+def seed_retry_state() -> int:
+    """升级后第一次启动：给历史失败资产补一个冷却时间。
+
+    老版本只有「失败 3 次 → 等 6 小时」一把尺子，库里躺着 150+ 个已经判死的
+    资产。不补这一步，升级后第一轮 backfill 会把它们全部重新排队，浏览器
+    先花一个小时把死域名再跑一遍，新线索排在后面——正是要修的那个「断断续续」。
+    按存下来的错误文本分类，直接给对应冷却，老数据也能平滑过渡。
+    """
+    now = utcnow()
+    with session_scope() as s:
+        rows = list(
+            s.scalars(
+                select(Asset).where(
+                    Asset.capture_state == "failed",
+                    Asset.capture_retry_at.is_(None),
+                )
+            )
+        )
+        for asset in rows:
+            kind = classify_failure(asset.capture_error or "")
+            asset.capture_retry_at = now + retry_delay(kind)
+            if kind == FAILURE_DEAD:
+                asset.capture_state = "dead"
+        return len(rows)
+
+
 def queue_summary() -> dict[str, Any]:
     now = utcnow()
     with session_scope() as s:
@@ -175,6 +250,19 @@ def queue_summary() -> dict[str, Any]:
                 Asset.kind.in_(("domain", "url")),
             )
         ) or 0
+        # 「现在就能重试」的失败资产。冷却中的不算活——把它们算进积压会让
+        # 健康检查永远显示有活没干（starved），而实际上只是还没到点。
+        retryable_assets = s.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.capture_state.in_(("failed", "dead")),
+                Asset.tier.in_((TIER_CONFIRMED, TIER_WATCH, TIER_CANDIDATE)),
+                Asset.kind.in_(("domain", "url")),
+                or_(Asset.capture_retry_at.is_(None), Asset.capture_retry_at <= now),
+            )
+        ) or 0
+        dead_assets = s.scalar(
+            select(func.count(Asset.id)).where(Asset.capture_state == "dead")
+        ) or 0
     queued = counts.get("queued", 0)
     return {
         "queued": queued,
@@ -185,6 +273,8 @@ def queue_summary() -> dict[str, Any]:
         "failed": counts.get("failed", 0),
         "skipped": counts.get("skipped", 0),
         "pending_assets": pending_assets,
+        "retryable_assets": retryable_assets,
+        "dead_assets": dead_assets,
         "oldest_queued": oldest_due.isoformat() if oldest_due else None,
         # 队列健康度：界面上要能直接看出「是在干活、还是卡住了」
         "oldest_queued_minutes": round((now - oldest_due).total_seconds() / 60, 1) if oldest_due else 0,
@@ -263,6 +353,8 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
 
         with session_scope() as s:
             task = s.get(CaptureTask, task_id)
+            kind = "" if ok else classify_failure(error)
+            retry_at = None
             if task is not None:
                 attempts = task.attempts or 1
                 # 资产已经不在了（被合并或清理）：任务作废，不要退避重试三次
@@ -278,23 +370,37 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
                         for k in ("evidence", "apk", "changes", "egress", "status")
                         if result.get(k) is not None
                     }
+                elif kind in (FAILURE_DEAD, FAILURE_BLOCKED):
+                    # 永久性失败不做分钟级重试：十分钟后再拉起一次 Chromium
+                    # 只会得到同一句 ERR_NAME_NOT_RESOLVED，纯烧配额。
+                    # 直接落 failed，冷却期由 asset.capture_retry_at 控制。
+                    task.state = "failed"
+                    task.finished_at = utcnow()
+                    task.error = f"[{kind}] {error}"[:500]
+                    retry_at = utcnow() + retry_delay(kind)
                 elif attempts < 3:
                     # 退避重试：10 分钟 → 40 分钟 → 放弃
                     task.state = "queued"
                     task.error = error
                     task.next_run_at = utcnow() + timedelta(minutes=10 * (4 ** (attempts - 1)))
+                    retry_at = task.next_run_at
                 else:
                     task.state = "failed"
                     task.finished_at = utcnow()
                     task.error = error
+                    retry_at = utcnow() + timedelta(hours=settings.capture_retry_cooldown_hours)
             asset = s.get(Asset, asset_id)
             if asset is not None and ok:
                 asset.capture_state = "captured"
                 asset.capture_error = ""
                 asset.last_capture_at = utcnow()
-            elif asset is not None and not ok:
-                asset.capture_state = "failed"
+                asset.capture_retry_at = None
+            elif asset is not None and result.get("reason") not in ("资产不存在", "资产已删除"):
+                # dead 与 failed 分开存：界面要能区分「站点没了」和「这次没抓好」，
+                # 补队逻辑也按这两个值决定何时再试。
+                asset.capture_state = "dead" if kind == FAILURE_DEAD else "failed"
                 asset.capture_error = error
+                asset.capture_retry_at = retry_at
         results.append({"asset_id": asset_id, "ok": ok, "error": error, "detail": result})
     return {"ran": len(results), "ok": sum(1 for r in results if r["ok"]), "results": results}
 
@@ -363,6 +469,13 @@ def backfill(limit: int = 30) -> int:
             (Asset.tier == TIER_WATCH, 1),
             else_=2,
         )
+        # 冷却期未到的一律不补：dead 隔 72 小时，被墙隔 24 小时，抖动 10 分钟。
+        # 之前只有「连续 3 次失败 + 6 小时」一把尺子，死域名和真线索挤在同一个
+        # 队列里，谁也没跑快。
+        retry_ready = or_(
+            Asset.capture_retry_at.is_(None),
+            Asset.capture_retry_at <= now,
+        )
         rows = list(
             s.scalars(
                 select(Asset)
@@ -370,12 +483,13 @@ def backfill(limit: int = 30) -> int:
                     Asset.tier.in_((TIER_CONFIRMED, TIER_WATCH, TIER_CANDIDATE)),
                     Asset.kind.in_(("domain", "url")),
                     or_(
-                        Asset.capture_state.in_(("pending", "failed")),
+                        Asset.capture_state.in_(("pending", "failed", "dead")),
                         and_(
                             Asset.capture_state == "captured",
                             or_(Asset.last_capture_at.is_(None), Asset.last_capture_at < stale_before),
                         ),
                     ),
+                    retry_ready,
                     ~in_flight,
                     ~recently_dead,
                 )

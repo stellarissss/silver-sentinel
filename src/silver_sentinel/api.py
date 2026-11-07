@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -269,15 +270,30 @@ def index(request: Request) -> HTMLResponse:
 # ---------------------------------------------------------------- 接口
 
 
+# 证据链校验要逐条重算哈希，随证据条数线性变慢。控制台每 30 秒拉一次
+# /api/health，几万条证据时会把一个核对按钮变成常驻 CPU 占用。缓存 5 分钟：
+# 链断了是「已经发生」的事实，晚 5 分钟发现不影响处置。
+_CHAIN_CACHE: dict[str, Any] = {"at": 0.0, "result": {"ok": None}}
+
+
+def _cached_chain_check(session) -> dict[str, Any]:  # noqa: ANN001
+    now = time.monotonic()
+    if now - float(_CHAIN_CACHE["at"]) < 300:
+        return _CHAIN_CACHE["result"]  # type: ignore[return-value]
+    result = verify_chain(session)
+    _CHAIN_CACHE["at"] = now
+    _CHAIN_CACHE["result"] = result
+    return result
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     chain = {"ok": None}
     try:
         with session_scope() as session:
-            chain = verify_chain(session)
+            chain = _cached_chain_check(session)
     except Exception as exc:  # noqa: BLE001
         chain = {"ok": False, "error": str(exc)}
-
     capture: dict[str, Any] = {}
     try:
         from .capture import queue_summary

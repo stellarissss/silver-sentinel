@@ -313,6 +313,65 @@ def cmd_health(args) -> int:  # noqa: ARG001
     return 0
 
 
+def cmd_doctor(args) -> int:
+    """外部看门狗自检：常驻进程是不是真的还在动。
+
+    只看两件事故前兆：
+    1. `heartbeat.json` 多久没更新（supervisor 线程每分钟写一次）；
+    2. 取证队列是否 starved（有活、没到期任务、也没在跑）。
+
+    进程还活着但调度线程卡死时，HTTP 探活和界面全都正常，只有这两个指标
+    会先掉下来。退出码 1 表示该重启了，部署脚本的 timer 直接据此处理。
+    """
+    import time as _time
+
+    from .worker import capture_queue_health, heartbeat_file
+
+    result: dict = {"ok": True, "problems": []}
+    path = heartbeat_file()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        age = round(_time.time() - float(payload.get("ts") or 0), 1)
+        result["heartbeat"] = {
+            "path": str(path),
+            "age_s": age,
+            "pid": payload.get("pid"),
+            "version": payload.get("version"),
+            "threads": payload.get("threads"),
+        }
+        if age > args.max_age:
+            result["problems"].append(f"心跳文件已 {age:.0f} 秒未更新（阈值 {args.max_age}s）")
+    except FileNotFoundError:
+        result["heartbeat"] = {"path": str(path), "age_s": None}
+        result["problems"].append("没有心跳文件，服务可能从未成功启动")
+    except Exception as exc:  # noqa: BLE001
+        result["heartbeat"] = {"path": str(path), "error": str(exc)}
+        result["problems"].append(f"心跳文件读不出来：{exc}")
+
+    try:
+        # 不调 init_db：看门狗每 2 分钟跑一次，迁移语句会短暂拿写锁，
+        # 与正在取证的服务抢锁只会制造抖动。表结构由服务启动时保证。
+        queue = capture_queue_health()
+        result["capture"] = queue
+        if queue.get("starved"):
+            result["problems"].append(
+                f"有 {queue.get('pending_assets')} 个待取证资产，但队列里没有到期任务"
+            )
+        if (queue.get("worker_heartbeat_age_s") or 0) > args.max_age:
+            result["problems"].append(
+                f"取证线程心跳已停 {queue.get('worker_heartbeat_age_s')} 秒"
+            )
+    except Exception as exc:  # noqa: BLE001
+        result["capture"] = {"error": str(exc)}
+        result["problems"].append(f"读队列失败：{exc}")
+
+    result["ok"] = not result["problems"]
+    if args.quiet and result["ok"]:
+        return 0
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["ok"] else 1
+
+
 def cmd_rescore(args) -> int:
     """用已取到的证据重算评分。
 
@@ -995,6 +1054,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("health", help="运行状态")
     p.set_defaults(func=cmd_health)
+
+    p = sub.add_parser("doctor", help="存活自检（外部看门狗用，异常时退出码 1）")
+    p.add_argument("--max-age", type=int, default=300, help="心跳最大允许年龄（秒）")
+    p.add_argument("--quiet", action="store_true", help="正常时不输出")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("rescore", help="用已取证正文重算评分（可批量）")
     p.add_argument("asset_id", nargs="?", type=int, help="只重算这一个资产")

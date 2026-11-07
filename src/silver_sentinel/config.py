@@ -125,6 +125,8 @@ class Settings:
 
     # ---------------------------------------------------------------- 图
     graph_enabled: bool = True
+    # 建图间隔（分钟）。图结构变化远慢于取证，每轮全量重建纯属空转。
+    graph_rebuild_minutes: int = 10
     # 留空则用内置图引擎；填 bolt://... 则写 Neo4j
     neo4j_uri: str = ""
     neo4j_user: str = "neo4j"
@@ -160,6 +162,13 @@ class Settings:
     # 「判死」冷却：同一资产连续 3 次取证失败后，先关这么久再试。
     # 没有这道闸，死域名会永远占着队列水位，把新线索挤出去。
     capture_retry_cooldown_hours: int = 6
+    # 永久性失败（NXDOMAIN / 端口拒连 / 不可达）不必按分钟重试：每次拉起
+    # Chromium 要二三十秒，一天白烧几十分钟只换来同一句 ERR_NAME_NOT_RESOLVED。
+    # 线上 181 条失败里 64 条是 NXDOMAIN、51 条是 SSL 握手失败，全在按 6 小时
+    # 循环重试。这两类改成「隔天再看一眼」，把容量留给活着的目标。
+    capture_dead_retry_hours: int = 72
+    # 被 WAF / 证书 / 空响应挡住的目标：可能只是临时封锁，给 24 小时
+    capture_blocked_retry_hours: int = 24
 
     # ---------------------------------------------------------------- 出站防护（OPSEC）
     # 默认开启：拦内网/元数据、去标识 UA、导出脱敏。是否需要代理才允许访问可疑目标，
@@ -200,6 +209,9 @@ class Settings:
     replica_backend: str = "dir"      # dir | s3 | webdav
     replica_target: str = ""
     replica_interval: int = 300        # 秒
+    # 数据库快照保留份数。每 20 轮（约 100 分钟）一份，50G 盘上不清理
+    # 一年就是 5000 份、几十 GB——磁盘满后取证会先降级再停摆。
+    replica_db_keep: int = 12
     replica_access_key: str = ""
     replica_secret_key: str = ""
     replica_bucket: str = "silver-sentinel"
@@ -309,6 +321,9 @@ class Settings:
         self.icp_tiers = _str("SILVER_ICP_TIERS", self.icp_tiers)
 
         self.graph_enabled = _bool("SILVER_GRAPH_ENABLED", True)
+        self.graph_rebuild_minutes = max(
+            1, _int("SILVER_GRAPH_REBUILD_MINUTES", self.graph_rebuild_minutes)
+        )
         self.neo4j_uri = _str("SILVER_NEO4J_URI", "")
         self.neo4j_user = _str("SILVER_NEO4J_USER", self.neo4j_user)
         self.neo4j_password = _str("SILVER_NEO4J_PASSWORD", "")
@@ -331,6 +346,12 @@ class Settings:
         self.capture_refresh_hours = max(1, _int("SILVER_CAPTURE_REFRESH_HOURS", self.capture_refresh_hours))
         self.capture_retry_cooldown_hours = max(
             1, _int("SILVER_CAPTURE_RETRY_COOLDOWN_HOURS", self.capture_retry_cooldown_hours)
+        )
+        self.capture_dead_retry_hours = max(
+            1, _int("SILVER_CAPTURE_DEAD_RETRY_HOURS", self.capture_dead_retry_hours)
+        )
+        self.capture_blocked_retry_hours = max(
+            1, _int("SILVER_CAPTURE_BLOCKED_RETRY_HOURS", self.capture_blocked_retry_hours)
         )
         self.llm_batch = max(0, _int("SILVER_LLM_BATCH", self.llm_batch))
 
@@ -361,6 +382,7 @@ class Settings:
         self.replica_backend = _str("SILVER_REPLICA_BACKEND", self.replica_backend).lower()
         self.replica_target = _str("SILVER_REPLICA_TARGET", "")
         self.replica_interval = _int("SILVER_REPLICA_INTERVAL", self.replica_interval)
+        self.replica_db_keep = max(2, _int("SILVER_REPLICA_DB_KEEP", self.replica_db_keep))
         self.replica_access_key = _str("SILVER_REPLICA_ACCESS_KEY", "")
         self.replica_secret_key = _str("SILVER_REPLICA_SECRET_KEY", "")
         self.replica_bucket = _str("SILVER_REPLICA_BUCKET", self.replica_bucket)

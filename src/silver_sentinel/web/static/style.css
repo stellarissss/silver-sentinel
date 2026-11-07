@@ -1708,6 +1708,8 @@ td.clip { max-width: 380px; }
 .cap-dot.pending::before { background: var(--ink-4); }
 .cap-dot.failed { color: var(--danger); }
 .cap-dot.failed::before { background: var(--danger); }
+.cap-dot.dead { color: var(--ink-4); }
+.cap-dot.dead::before { background: var(--ink-4); opacity: .45; }
 .cap-dot.running::before { background: var(--warn); animation: pulseDot 1.6s var(--ease) infinite; }
 .cap-dot.skipped { color: var(--ink-4); }
 

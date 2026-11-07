@@ -268,6 +268,49 @@ systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 systemctl restart "$SERVICE"
 
+# ---------------------------------------------------------------- 看门狗
+# Restart=always 只覆盖「进程退出」。进程活着但线程卡死时，服务一直是
+# active、Web 也一直 200，只有 heartbeat.json 会停更。这条 timer 每 2 分钟
+# 读一次心跳，超时就重启，并做频率熔断。
+WATCHDOG_SRC="$(dirname "$0")/watchdog.sh"
+if [ -f "$WATCHDOG_SRC" ]; then
+  install -m 0755 "$WATCHDOG_SRC" "$APP_DIR/watchdog.sh"
+  log "写入 ${SERVICE}-watchdog 单元"
+  cat > "/etc/systemd/system/${SERVICE}-watchdog.service" <<EOF
+[Unit]
+Description=Silver Sentinel watchdog（心跳停更则重启主服务）
+After=${SERVICE}.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=$ENV_FILE
+Environment=APP_DIR=$APP_DIR VENV=$VENV_DIR SERVICE=$SERVICE DATA_DIR=$DATA_DIR
+ExecStart=$APP_DIR/watchdog.sh
+EOF
+  cat > "/etc/systemd/system/${SERVICE}-watchdog.timer" <<EOF
+[Unit]
+Description=Silver Sentinel watchdog timer
+
+[Timer]
+# 用 OnActiveSec 而不是 OnBootSec：后者是相对「系统启动」算的，
+# 在一台已经跑了几个月的机器上启用 timer 会立刻触发一次，
+# 撞上服务刚重启、心跳还没落盘的那几秒，白白多重启一次。
+OnActiveSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Unit=${SERVICE}-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now "${SERVICE}-watchdog.timer" >/dev/null 2>&1 \
+    && ok "看门狗 timer 已启用（每 2 分钟检查一次心跳）" \
+    || warn "看门狗 timer 启用失败，可手动 systemctl enable --now ${SERVICE}-watchdog.timer"
+else
+  warn "没找到 deploy/watchdog.sh，跳过看门狗安装"
+fi
+
 # ---------------------------------------------------------------- 自检
 log "等待服务就绪 ..."
 for i in $(seq 1 30); do

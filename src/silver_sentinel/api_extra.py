@@ -15,6 +15,7 @@ import asyncio
 import json
 import secrets
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -501,6 +502,17 @@ def health_self() -> dict[str, Any]:
         captured = s.scalar(
             select(func.count(Asset.id)).where(Asset.capture_state == "captured")
         ) or 0
+        # 吞吐量：只看总量会被「历史很多」骗过去。真正要回答的是
+        # 「最近一小时还在出证据吗」——假绿（指标全绿、done_total 不动）
+        # 正是靠这三个窗口暴露的。
+        now = utcnow()
+        windows = {}
+        for label, hours in (("1h", 1), ("6h", 6), ("24h", 24)):
+            cutoff = now - timedelta(hours=hours)
+            windows[label] = s.scalar(
+                select(func.count(Evidence.id)).where(Evidence.captured_at >= cutoff)
+            ) or 0
+        last_evidence = s.scalar(select(func.max(Evidence.captured_at)))
 
     usage = shutil.disk_usage(settings.data_dir)
     free_gb = round(usage.free / 1024**3, 2)
@@ -527,6 +539,13 @@ def health_self() -> dict[str, Any]:
         problems.append(f"取证队列有任务已等待 {queue['oldest_queued_minutes']} 分钟未执行")
     if (queue.get("worker_heartbeat_age_s") or 0) > 300:
         problems.append(f"取证线程心跳已停 {int(queue['worker_heartbeat_age_s'])} 秒")
+    # 假绿：所有心跳都正常，但两小时一条证据没出。要么队列全在冷却，
+    # 要么浏览器每页都在超时——两种都需要人看一眼，不能算 ok。
+    last_age = round((utcnow() - last_evidence).total_seconds(), 1) if last_evidence else None
+    if windows["1h"] == 0 and windows["6h"] > 0:
+        problems.append("最近 1 小时没有新证据（取证可能在空转）")
+    if windows["6h"] == 0 and (queue.get("pending_assets") or 0) > 0:
+        problems.append(f"6 小时无新证据，但仍有 {queue.get('pending_assets')} 个待取证资产")
 
     return {
         "ok": not problems,
@@ -536,7 +555,14 @@ def health_self() -> dict[str, Any]:
         "cycle": {"count": cycles.get("count", 0), "age_s": cycles.get("age_s"), "ok": cycles.get("ok")},
         "capture": {**queue, "worker": capture},
         "assets": {"total": stats.get("assets", 0), "captured": captured, "watch": watch},
-        "evidence": {"total": evidence_total, "active": evidence_active},
+        "evidence": {
+            "total": evidence_total,
+            "active": evidence_active,
+            "last_1h": windows["1h"],
+            "last_6h": windows["6h"],
+            "last_24h": windows["24h"],
+            "last_age_s": last_age,
+        },
         "discover": stream,
         "disk": {"free_gb": free_gb, "used_pct": round(usage.used / usage.total * 100, 1)},
         "vault": vault_info,

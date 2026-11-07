@@ -314,7 +314,37 @@ class Replica:
         if ok:
             self.state.files_synced += 1
             self.state.bytes_sent += len(data)
+            self._prune_db_snapshots()
         return ok
+
+    def _prune_db_snapshots(self) -> int:
+        """只保留最近 N 份数据库快照。
+
+        副本目录是「异地留档」，不是「永久归档」：无限追加会让磁盘在几个
+        月内吃满，而磁盘满是取证最先感知到的问题（APK 停下载 → 浏览器缓存
+        写不进去 → 取证开始失败）。保留最近 12 份（约 20 小时）足够回滚到
+        「今天早上」；更早的历史由事件日志与证据仓承担。
+        """
+        if self.backend != "dir":
+            return 0
+        db_dir = Path(self.target) / "db"
+        if not db_dir.is_dir():
+            return 0
+        snaps = sorted(
+            (p for p in db_dir.glob("sentinel-*.db") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        removed = 0
+        for old in snaps[settings.replica_db_keep :]:
+            try:
+                old.unlink()
+                removed += 1
+            except OSError as exc:
+                log.debug("清理旧快照失败 %s：%s", old, exc)
+        if removed:
+            log.info("副本快照清理：删除 %s 份旧快照，保留 %s 份", removed, settings.replica_db_keep)
+        return removed
 
     def run_once(self, *, include_db: bool = False) -> dict[str, Any]:
         if not settings.replica_enabled:

@@ -512,6 +512,7 @@ class CertStreamClient:
         self.last_error = ""
         self.total = 0
         self.failures = 0
+        self._last_data_at = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -562,6 +563,7 @@ class CertStreamClient:
                                 )
                             )
                         self.total += len(names)
+                        self._last_data_at = time.monotonic()
                         if len(buffer) >= 400 or (time.time() - last_flush) > 3:
                             self.on_batch(buffer)
                             buffer = []
@@ -581,6 +583,18 @@ class CertStreamClient:
                         log.warning("certstream 公共实例未推送任何数据，已降级为「仅 CT 轮询」")
                 self._stop.wait(backoff)
                 backoff = min(backoff * 1.8, 120.0)
+                # 熔断：公共实例常年「连得上但不推流」，每 60 秒超时一次。
+                # 判据用「最近半小时有没有收到过数据」，而不是累计条数——
+                # 一条流可能很久以前推过一条，`total>0` 会让它永远重连下去。
+                idle = time.monotonic() - self._last_data_at if self._last_data_at else None
+                if self.failures >= 6 and (idle is None or idle > 1800):
+                    log.warning(
+                        "certstream 连续 %d 次未推送数据（静默 %.0f 分钟），暂停 30 分钟后再试",
+                        self.failures, (idle or 0) / 60,
+                    )
+                    self._stop.wait(1800)
+                    self.failures = 0
+                    backoff = 2.0
 
     def status(self) -> dict[str, Any]:
         return {
@@ -588,6 +602,7 @@ class CertStreamClient:
             "connected": self.connected,
             "total": self.total,
             "failures": self.failures,
+            "idle_s": round(time.monotonic() - self._last_data_at, 1) if self._last_data_at else None,
             "error": self.last_error,
         }
 

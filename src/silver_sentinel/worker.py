@@ -19,13 +19,15 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 
 from .config import settings
 from .db import session_scope
@@ -221,6 +223,7 @@ def start_all() -> None:
 
 def _supervise() -> None:
     """心跳看门狗：线程死了重拉，心跳停了记录告警。"""
+    _write_heartbeat()
     while not _STOP.wait(60):
         for name in list(_FACTORIES):
             thread = _THREADS.get(name)
@@ -243,6 +246,54 @@ def _supervise() -> None:
             get_engine().ensure_running()
         except Exception:  # noqa: BLE001
             log.debug("发现引擎检查失败", exc_info=True)
+        _write_heartbeat()
+
+
+def heartbeat_file() -> Path:
+    return Path(settings.data_dir) / "heartbeat.json"
+
+
+def _write_heartbeat() -> None:
+    """把进程级体征写到磁盘，给外部看门狗用。
+
+    HTTP 探活只能证明「Web 还能回包」：调度线程卡在一次没有超时的请求上、
+    取证线程死锁时，`/api/ping` 照样 200，界面也照样转——线上最难发现的就是
+    这种「活着但不动」。这个文件由 supervisor 线程每分钟重写一次，外部只要
+    看 mtime 就知道进程是不是真的在跑。
+    """
+    import json
+
+    from . import __version__
+
+    beats = heartbeat_snapshot()
+    try:
+        queue = capture_queue_health()
+    except Exception as exc:  # noqa: BLE001
+        queue = {"error": str(exc)[:200]}
+    payload = {
+        "pid": os.getpid(),
+        "version": __version__,
+        "ts": time.time(),
+        "iso": utcnow().isoformat(),
+        "threads": {name: is_alive(name) for name in _FACTORIES},
+        "heartbeats": {
+            name: info.get("age_s") for name, info in beats.items()
+        },
+        "capture": {
+            "heartbeat_age_s": (beats.get("capture") or {}).get("age_s"),
+            "due": queue.get("queued_due"),
+            "pending": queue.get("pending_assets"),
+            "starved": queue.get("starved"),
+        },
+    }
+    path = heartbeat_file()
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.debug("写心跳文件失败：%s", exc)
 
 
 def stop_all() -> None:
@@ -279,6 +330,14 @@ def get_capture_worker() -> CaptureWorker:
 
 def start_background() -> None:
     """装配并启动全部后台线。重复调用无副作用。"""
+    try:
+        from .capture import seed_retry_state
+
+        seeded = seed_retry_state()
+        if seeded:
+            log.info("已为 %s 条历史失败资产补冷却时间（按失败性质分类）", seeded)
+    except Exception:  # noqa: BLE001
+        log.debug("补历史失败冷却失败", exc_info=True)
     if settings.capture_enabled:
         worker = get_capture_worker()
         register("capture", worker.run_forever)
@@ -331,6 +390,17 @@ def capture_queue_health() -> dict[str, Any]:
                 Asset.kind.in_(("domain", "url")),
             )
         ) or 0
+        # 冷却中的失败资产不是活。只有「已到重试时间」的才算积压，否则
+        # 死域名会把 starved 长期点亮，运维看到的是永远在报警。
+        retryable_assets = s.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.capture_state.in_(("failed", "dead")),
+                Asset.tier.in_((TIER_CONFIRMED, TIER_WATCH, TIER_CANDIDATE)),
+                Asset.kind.in_(("domain", "url")),
+                or_(Asset.capture_retry_at.is_(None), Asset.capture_retry_at <= now),
+            )
+        ) or 0
+        backlog = pending_assets + retryable_assets
     done = sum(1 for t in recent if t.state == "done")
     rate = round(done / len(recent), 3) if recent else None
     age_min = round((now - oldest_due).total_seconds() / 60, 1) if oldest_due else 0
@@ -343,13 +413,15 @@ def capture_queue_health() -> dict[str, Any]:
     # 「有活却没有到期任务」是一种独立故障：补队被退避任务挤死时，队列里
     # 全是等 10～40 分钟重试的任务，due=0、最老 due 也是 0，stalled 判不出来。
     # 线上就撞过：2.5 分钟零取证，健康检查却一路绿灯。
-    starved = bool(pending_assets > 0 and due_count == 0 and running == 0)
+    starved = bool(backlog > 0 and due_count == 0 and running == 0)
     return {
         "queued": queued,
         "queued_due": due_count,
         "queued_scheduled": max(0, queued - due_count),
         "running": running,
-        "pending_assets": pending_assets,
+        "pending_assets": backlog,
+        "pending_new": pending_assets,
+        "pending_retry": retryable_assets,
         "failed_total": counts.get("failed", 0),
         "done_total": counts.get("done", 0),
         "success_rate_recent": rate,
