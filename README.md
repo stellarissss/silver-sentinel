@@ -457,6 +457,18 @@ curl -N :8000/api/stream       # SSE：发现流 / 周期事件
 `Restart=always` 只能救进程退出，救不了「进程活着但线程卡死」——那种状态下
 `/api/ping` 一直是 200，只有心跳文件会停更。
 
+采集节奏相关的可调项：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `SILVER_CAPTURE_REFRESH_HOURS` | 24 | 已取证资产多久复访一次 |
+| `SILVER_CAPTURE_COLD_FILL_SECONDS` | 90 | 队列空闲时用冷档资产填谷的间隔，0 关闭 |
+| `SILVER_CAPTURE_DEAD_RETRY_HOURS` | 72 | NXDOMAIN / 拒连目标的再试间隔 |
+| `SILVER_CAPTURE_BLOCKED_RETRY_HOURS` | 24 | 被 WAF / 证书挡住的目标的再试间隔 |
+| `SILVER_SANDBOX_TIMEOUT` | 45 | 单页加载超时（秒），失败过的目标自动降到 12 秒 |
+| `SILVER_GRAPH_REBUILD_MINUTES` | 10 | 建图间隔，图结构变化远慢于取证 |
+| `SILVER_REPLICA_DB_KEEP` | 12 | 副本里保留几份数据库快照 |
+
 建议盯的四个指标：
 
 | 指标 | 健康值 | 异常含义 |
