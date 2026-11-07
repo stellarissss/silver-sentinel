@@ -90,6 +90,34 @@ def test_backoff_tasks_do_not_occupy_the_waterline(db):
         assert s.query(CaptureTask).filter(CaptureTask.asset_id == fresh.id).count() == 1
 
 
+def test_backfill_still_fills_the_queue_when_it_is_all_backoff(db):
+    """队列整条都在退避时，仍然必须补进「现在就能跑」的任务。
+
+    这是第一次修复后剩下的坑：给队列加总量上限，24 条退避任务把上限占满，
+    room 归零、due 归零，浏览器彻底空转——线上实测 2.5 分钟零取证。
+    水位只能由「到期任务数」决定。
+    """
+    from silver_sentinel.capture import backfill
+    from silver_sentinel.domain import utcnow
+    from silver_sentinel.models import CaptureTask
+
+    with db() as s:
+        for i in range(24):
+            asset = _asset(s, f"wait{i}.example.com", capture_state="failed")
+            _task(s, asset.id, state="queued", attempts=1, next_in_min=9 + i)
+        for i in range(3):
+            _asset(s, f"ready{i}.example.com", score=20.0 - i)
+
+    added = backfill(limit=8)
+    assert added >= 3, "队列全是退避任务时，必须补进可立即执行的任务"
+
+    with db() as s:
+        due = s.query(CaptureTask).filter(
+            CaptureTask.state == "queued", CaptureTask.next_run_at <= utcnow()
+        ).count()
+        assert due >= 3
+
+
 def test_assets_already_queued_are_not_reselected(db):
     """补队要能跳过老面孔，否则每轮都白取一遍同样的前 N 条。"""
     from silver_sentinel.capture import backfill

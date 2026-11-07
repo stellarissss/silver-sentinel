@@ -317,6 +317,10 @@ def backfill(limit: int = 30) -> int:
 
     所以：
     - room 只看 **due**（next_run_at <= now）的任务，退避中的不占水位；
+    - 水位就是 `target - due`，**不设总量上限**。总量上限看着稳妥，实际是
+      同一个坑的另一种挖法：退避任务把上限占满后，due 归零，队列里 24 条
+      全在等 10～40 分钟后的重试，浏览器彻底空转（线上实测 2.5 分钟零取证）。
+      行数不会因此失控——每个资产最多一条在途任务，退避任务随重试自然清空；
     - 查询里排除**已在队列中**（queued/running）的资产，否则取到的前 N 条
       全是老面孔，enqueue 全部跳过，同样补不进新的；
     - 连续 3 次失败且还没过冷却期的资产视为「判死」，不再反复重试——
@@ -333,13 +337,9 @@ def backfill(limit: int = 30) -> int:
                 CaptureTask.state == "queued", CaptureTask.next_run_at <= now
             )
         ) or 0
-        total = s.scalar(
-            select(func.count(CaptureTask.id)).where(CaptureTask.state == "queued")
-        ) or 0
 
         target = max(4, settings.capture_batch * 6)
-        cap = max(target, settings.capture_queue_cap)
-        room = min(target - due, cap - total)
+        room = target - due
 
         # 同一资产已有排队/执行中的任务就不再进队
         in_flight = exists().where(

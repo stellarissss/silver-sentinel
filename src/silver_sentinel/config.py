@@ -160,8 +160,6 @@ class Settings:
     # 「判死」冷却：同一资产连续 3 次取证失败后，先关这么久再试。
     # 没有这道闸，死域名会永远占着队列水位，把新线索挤出去。
     capture_retry_cooldown_hours: int = 6
-    # 队列总量上限（含退避中的任务）。只作防雪崩的硬闸，正常水位由 batch*6 决定。
-    capture_queue_cap: int = 24
 
     # ---------------------------------------------------------------- 出站防护（OPSEC）
     # 默认开启：拦内网/元数据、去标识 UA、导出脱敏。是否需要代理才允许访问可疑目标，
@@ -333,9 +331,6 @@ class Settings:
         self.capture_refresh_hours = max(1, _int("SILVER_CAPTURE_REFRESH_HOURS", self.capture_refresh_hours))
         self.capture_retry_cooldown_hours = max(
             1, _int("SILVER_CAPTURE_RETRY_COOLDOWN_HOURS", self.capture_retry_cooldown_hours)
-        )
-        self.capture_queue_cap = max(
-            4, _int("SILVER_CAPTURE_QUEUE_CAP", self.capture_queue_cap)
         )
         self.llm_batch = max(0, _int("SILVER_LLM_BATCH", self.llm_batch))
 

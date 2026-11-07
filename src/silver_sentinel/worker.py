@@ -30,7 +30,14 @@ from sqlalchemy import delete, func, select
 from .config import settings
 from .db import session_scope
 from .domain import utcnow
-from .models import CaptureTask, TaskRun
+from .models import (
+    TIER_CANDIDATE,
+    TIER_CONFIRMED,
+    TIER_WATCH,
+    Asset,
+    CaptureTask,
+    TaskRun,
+)
 
 log = logging.getLogger(__name__)
 
@@ -317,6 +324,13 @@ def capture_queue_health() -> dict[str, Any]:
         recent = list(
             s.scalars(select(CaptureTask).where(CaptureTask.finished_at.is_not(None)).order_by(CaptureTask.id.desc()).limit(50))
         )
+        pending_assets = s.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.capture_state == "pending",
+                Asset.tier.in_((TIER_CONFIRMED, TIER_WATCH, TIER_CANDIDATE)),
+                Asset.kind.in_(("domain", "url")),
+            )
+        ) or 0
     done = sum(1 for t in recent if t.state == "done")
     rate = round(done / len(recent), 3) if recent else None
     age_min = round((now - oldest_due).total_seconds() / 60, 1) if oldest_due else 0
@@ -325,17 +339,24 @@ def capture_queue_health() -> dict[str, Any]:
     hb = heartbeat_snapshot().get("capture") or {}
     hb_age = hb.get("age_s")
     queued = counts.get("queued", 0)
+    running = counts.get("running", 0)
+    # 「有活却没有到期任务」是一种独立故障：补队被退避任务挤死时，队列里
+    # 全是等 10～40 分钟重试的任务，due=0、最老 due 也是 0，stalled 判不出来。
+    # 线上就撞过：2.5 分钟零取证，健康检查却一路绿灯。
+    starved = bool(pending_assets > 0 and due_count == 0 and running == 0)
     return {
         "queued": queued,
         "queued_due": due_count,
         "queued_scheduled": max(0, queued - due_count),
-        "running": counts.get("running", 0),
+        "running": running,
+        "pending_assets": pending_assets,
         "failed_total": counts.get("failed", 0),
         "done_total": counts.get("done", 0),
         "success_rate_recent": rate,
         "oldest_queued_minutes": age_min,
         "worker_heartbeat_age_s": hb_age,
-        "stalled": bool((age_min and age_min > 45) or (hb_age is not None and hb_age > 300)),
+        "starved": starved,
+        "stalled": bool((age_min and age_min > 45) or (hb_age is not None and hb_age > 300) or starved),
     }
 
 
