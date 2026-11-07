@@ -140,6 +140,8 @@ silver-sentinel cycle                             # 研判→富化→建图→�
 silver-sentinel enrich 42 --probe                 # 单个目标富化并实测网页
 silver-sentinel graph rebuild                     # 重建图谱并重新归并团伙
 silver-sentinel rescore --limit 2000              # 用已取到的正文重算评分（升级后必跑）
+silver-sentinel rescore --retier --limit 6000     # 规则口径变更后连分级一起重算
+silver-sentinel dismiss 1 --reason "演示样例包"    # 人工排除，之后重评不会拉回来
 silver-sentinel health                            # 进程内能力 + 取证队列健康度
 
 # 证据可靠性
