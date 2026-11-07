@@ -383,6 +383,14 @@ def run_cycle(*, scan_limit: int | None = None, enrich_limit: int = 40, rebuild_
         if stats.scanned > 0:
             stats.decayed = triage.decay().get("moved", 0)
 
+        # 6) 自动盯防对齐分级：降回候选的目标不该继续占监控配额
+        try:
+            from .capture import prune_watch
+
+            prune_watch()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("对齐盯防失败：%s", exc)
+
         stats.elapsed = time.monotonic() - started
         _finish_task(task.id, "done", stats.as_dict())
         emit("pipeline.cycle", **stats.as_dict())

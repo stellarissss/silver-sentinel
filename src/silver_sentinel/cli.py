@@ -297,7 +297,7 @@ def cmd_rescore(args) -> int:
     if args.asset_id:
         result = rescore_by_id(args.asset_id, trigger="cli")
     else:
-        result = rescore_many(limit=args.limit, only_with_text=not args.all)
+        result = rescore_many(limit=args.limit, only_with_text=not args.all, retier=args.retier)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -966,6 +966,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("asset_id", nargs="?", type=int, help="只重算这一个资产")
     p.add_argument("--limit", type=int, default=200)
     p.add_argument("--all", action="store_true", help="连没有正文的资产也重算")
+    p.add_argument("--retier", action="store_true", help="允许降档（规则口径变更后重新定级）")
     p.set_defaults(func=cmd_rescore)
 
     p = sub.add_parser("serve", help="启动 Web 控制台")

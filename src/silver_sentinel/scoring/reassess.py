@@ -44,14 +44,21 @@ def _keyword_facts(asset: Asset, corpus: str) -> dict[str, Any]:
 
     取证后的正文往往包含「民族资产解冻」「每日返利」这类原句，
     词库本来就是为它们准备的，不匹配一次等于白抓。
+
+    主题无关的页面（体育直播、影视站群）只按域名匹配——那些站群的
+    域名里常带「weixin/qq」之类的品牌词，按正文匹配会把整类站点
+    误判成「冒充微信」。
     """
+    from .engine import detect_off_topic
+
     try:
         from ..discover.keywords import get_library
 
         host = ""
         if asset.kind in ("domain", "url"):
             host = normalize_domain(asset.value)
-        match = get_library().match_any(host, f"{asset.value} {corpus[:4000]}")
+        body = "" if detect_off_topic(corpus) else f"{asset.value} {corpus[:4000]}"
+        match = get_library().match_any(host, body)
     except Exception as exc:  # noqa: BLE001 词库坏了不能影响主判定
         log.debug("词库匹配失败：%s", exc)
         return {}
@@ -61,6 +68,9 @@ def _keyword_facts(asset: Asset, corpus: str) -> dict[str, Any]:
         "keyword_hint": round(match.score, 3),
         "keyword_terms": match.terms[:8],
         "keyword_clusters": sorted(match.clusters),
+        # 命中条数：单个品牌词（尤其是站群域名里的 weixin/qq）不足以定性，
+        # KW-001 要求「高分 + 至少两个独立命中」才算强主题词根。
+        "keyword_hits": len(match.hits),
     }
 
 
@@ -80,7 +90,6 @@ def assess_now(
         except (TypeError, ValueError):
             prev_len = 0
         merged["page_text_len"] = max(prev_len, len(text))
-        merged.update(_keyword_facts(asset, text))
         # 正文里的电话/域名/钱包地址是「同一团伙」的关联线索，顺手提出来
         indicators = extract_indicators(text)
         if indicators.get("phones"):
@@ -91,6 +100,8 @@ def assess_now(
             merged.setdefault("page_mentions", indicators["domains"][:20])
     else:
         indicators = extract_indicators(f"{asset.value} {asset.normalized}")
+    # 没有正文时也要按域名匹配一次词库：那是发现阶段唯一的语义信号
+    merged.update(_keyword_facts(asset, text))
 
     ruleset = get_ruleset()
     assessment = assess(
@@ -138,6 +149,7 @@ def rescore(
     facts: dict[str, Any] | None = None,
     text: str | None = None,
     trigger: str = "rescore",
+    allow_downgrade: bool = False,
 ) -> dict[str, Any]:
     """重算一个资产。`text=None` 时自动去证据仓取最新正文（含解密）。"""
     from .. import triage
@@ -169,7 +181,7 @@ def rescore(
     }
     asset.meta = meta
 
-    decision = triage.apply(asset, facts=merged)
+    decision = triage.apply(asset, facts=merged, allow_downgrade=allow_downgrade)
     session.flush()
 
     changed = abs(float(asset.score or 0) - before["score"]) >= 0.05 or asset.tier != before["tier"]
@@ -227,13 +239,20 @@ def rescore_many(
     limit: int = 200,
     only_with_text: bool = True,
     min_score: float = 0.0,
+    retier: bool = False,
 ) -> dict[str, Any]:
-    """批量重评。部署后跑一次，把历史上「只按域名打过分」的资产捞回来。"""
+    """批量重评。部署后跑一次，把历史上「只按域名打过分」的资产捞回来。
+
+    retier=True 允许降档：规则口径改过之后（比如修掉一类误报），
+    原先被推上 watch 的必须能落回候选，否则误判会永久留在监控队列里。
+    """
     from ..db import session_scope
-    from ..models import Evidence
+    from ..models import TIER_CANDIDATE, TIER_WATCH, Evidence
 
     with session_scope() as session:
         stmt = select(Asset.id).where(Asset.reviewed_by == "", Asset.score >= min_score)
+        if retier:
+            stmt = stmt.where(Asset.tier.in_((TIER_CANDIDATE, TIER_WATCH)))
         if only_with_text:
             stmt = stmt.where(
                 Asset.id.in_(
@@ -246,31 +265,46 @@ def rescore_many(
 
     bumped = 0
     upgraded = 0
+    downgraded = 0
     errors = 0
     detail: list[dict[str, Any]] = []
     for asset_id in ids:
         try:
-            res = rescore_by_id(asset_id, trigger="bulk")
-            if not res.get("ok"):
-                errors += 1
+            with session_scope() as session:
+                asset = session.get(Asset, asset_id)
+                if asset is None:
+                    continue
+                res = rescore(session, asset, trigger="bulk", allow_downgrade=retier)
+            if not res.get("changed"):
                 continue
-            if res["changed"]:
-                bumped += 1
-            if res["after"]["tier"] in ("watch", "confirmed") and res["before"]["tier"] not in (
-                "watch",
-                "confirmed",
-            ):
+            _ensure_watch(res)
+            bumped += 1
+            before, after = res["before"], res["after"]
+            if after["tier"] in ("watch", "confirmed") and before["tier"] not in ("watch", "confirmed"):
                 upgraded += 1
-            if res["changed"] and len(detail) < 30:
-                detail.append(res)
+            elif before["tier"] in ("watch", "confirmed") and after["tier"] not in ("watch", "confirmed"):
+                downgraded += 1
+            if len(detail) < 30:
+                detail.append({"asset_id": asset_id, **res})
         except Exception as exc:  # noqa: BLE001 单条失败不影响整批
             errors += 1
             log.debug("批量重评失败 %s: %s", asset_id, exc)
+
+    pruned = 0
+    if retier:
+        try:
+            from ..capture import prune_watch
+
+            pruned = prune_watch()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("清理自动盯防失败：%s", exc)
     return {
         "ok": True,
         "scanned": len(ids),
         "changed": bumped,
         "upgraded": upgraded,
+        "downgraded": downgraded,
+        "watch_pruned": pruned,
         "errors": errors,
         "sample": detail,
     }

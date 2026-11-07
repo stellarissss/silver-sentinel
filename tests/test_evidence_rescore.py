@@ -164,3 +164,43 @@ def test_rescore_picks_up_new_evidence(fresh_db, vault_key):
         append(s, asset_id, "page_text", "民族资产解冻 每日收益".encode(), extension=".txt")
 
     assert asset_id in pending_assets(limit=50)
+
+
+def test_off_topic_page_only_keeps_structural_signals(fresh_db):
+    """体育站群页面不该被当成涉老诈骗。
+
+    这类域名常长成 fj-weixin-qq.cc，正文里又有「比分/直播/录像」，
+    字面上会撞上词库与远程协助规则，但主题完全无关。
+    """
+    from silver_sentinel.models import Asset
+    from silver_sentinel.scoring.reassess import assess_now
+
+    asset = Asset(kind="domain", value="fj-weixin-qq.cc", normalized="fj-weixin-qq.cc")
+    text = ("足球直播 篮球直播 NBA CBA 英超 西甲 德甲 比分 赛事 录像 集锦 " * 20) + "向日葵"
+    assessment, facts = assess_now(asset, text=text)
+
+    assert facts.get("off_topic") == "sports"
+    ids = {s.rule_id for s in assessment.signals}
+    assert "PER-007" not in ids
+    assert "KW-001" not in ids
+    assert assessment.score < 45
+
+
+def test_single_brand_term_is_not_strong_keyword(fresh_db):
+    """只有品牌词命中（站群域名）时，不给「强主题词根」信号。"""
+    from silver_sentinel.models import Asset
+    from silver_sentinel.scoring.reassess import assess_now
+
+    asset = Asset(kind="domain", value="jrs-weixin-qq.cc", normalized="jrs-weixin-qq.cc")
+    assessment, _facts = assess_now(asset, text="")
+    assert "KW-001" not in {s.rule_id for s in assessment.signals}
+
+
+def test_brand_plus_role_still_triggers_keyword(fresh_db):
+    """「品牌 + 角色」的双命中仍应触发，避免把真冒充一起放过。"""
+    from silver_sentinel.models import Asset
+    from silver_sentinel.scoring.reassess import assess_now
+
+    asset = Asset(kind="domain", value="weixin-kefu.com", normalized="weixin-kefu.com")
+    assessment, _facts = assess_now(asset, text="")
+    assert "KW-001" in {s.rule_id for s in assessment.signals}

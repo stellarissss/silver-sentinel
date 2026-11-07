@@ -961,13 +961,15 @@ def ensure_watch(
 
 
 def prune_watch() -> int:
-    """把已经排除/冷存的目标移出自动监控。人工加的保持不动。"""
+    """把已经排除/冷存/降回候选的目标移出自动监控。人工加的保持不动。"""
     moved = 0
     with session_scope() as s:
         rows = list(s.scalars(select(WatchTarget).where(WatchTarget.auto.is_(True))))
         for row in rows:
             asset = s.get(Asset, row.asset_id) if row.asset_id else None
-            if asset is None or asset.tier in (TIER_DISMISSED, TIER_COLD):
+            # 分级落回候选后，自动盯防也应当撤回：否则 watchlist 会一直膨胀，
+            # 而候选项本来就走低频轮转，不需要占盯防配额。
+            if asset is None or asset.tier not in (TIER_WATCH, TIER_CONFIRMED):
                 s.delete(row)
                 moved += 1
     return moved

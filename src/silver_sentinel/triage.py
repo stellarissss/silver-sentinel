@@ -168,8 +168,14 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
     return TriageDecision(TIER_COLD, ["证据不足"])
 
 
-def apply(asset: Asset, *, facts: dict[str, Any] | None = None) -> TriageDecision:
-    """算出分级并写回资产。返回决策供调用方记录。"""
+def apply(
+    asset: Asset, *, facts: dict[str, Any] | None = None, allow_downgrade: bool = False
+) -> TriageDecision:
+    """算出分级并写回资产。返回决策供调用方记录。
+
+    allow_downgrade 只给「规则口径变更后的重新定级」用：评分逻辑改了，
+    原先按旧口径升上去的档必须能落回来，否则一次误判会永久留在 watch。
+    """
     decision = decide(asset, facts=facts)
     previous = asset.tier
     meta = dict(asset.meta or {})
@@ -180,7 +186,9 @@ def apply(asset: Asset, *, facts: dict[str, Any] | None = None) -> TriageDecisio
     # 首次分级可以自由落档；之后只允许「升级」自动发生。
     # 降级必须经过 decay 或人工，否则一次采集失败就能把确认过的目标刷回候选。
     rank = {TIER_CONFIRMED: 4, TIER_WATCH: 3, TIER_CANDIDATE: 2, TIER_COLD: 1, TIER_DISMISSED: 0}
-    if first_time or rank.get(decision.tier, 0) >= rank.get(previous, 0) or previous in (None, ""):
+    if allow_downgrade and previous != TIER_CONFIRMED and not asset.reviewed_by:
+        asset.tier = decision.tier
+    elif first_time or rank.get(decision.tier, 0) >= rank.get(previous, 0) or previous in (None, ""):
         asset.tier = decision.tier
     elif previous == TIER_CONFIRMED and decision.tier != TIER_CONFIRMED:
         # 已确认的不会自动降级

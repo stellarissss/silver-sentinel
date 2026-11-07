@@ -306,6 +306,45 @@ def aggregate(
     return round(score, 1), confidence, "high_risk", coverage, sources, notes
 
 
+# ---------------------------------------------------------------- 领域识别
+#
+# 线上有一类稳定的误报：体育直播、影视站群。它们的域名常常长成
+# `fj-weixin-qq.cc`、`jrs-weixin-qq.cc` 这种「地名+品牌词」的批量注册形态，
+# 页面正文里又会顺带出现「巴马」「温泉」「分红」之类的地名/运营词。
+# 词库与内容规则在字面上全中，但这条线索和涉老诈骗毫无关系。
+#
+# 这里做一个窄而明确的判断：正文里体育/影视词密集、且完全没有涉老诈骗的
+# 定性词时，视为「主题无关」，只保留结构特征（备案、域名年龄、TLD）。
+# 之所以要求「完全没有」，是因为骗局页面也常拿体育直播做幌子（赌博引流），
+# 一旦出现「民族资产解冻/养老/返利」等词，就不再走这条豁免。
+
+ELDER_SIGNATURE_TERMS = (
+    "民族资产解冻", "资产解冻", "养老", "老龄", "返利", "补贴", "免费领", "领鸡蛋",
+    "保健品", "讲座", "会销", "拉人头", "报单", "股权认购", "数字人民币", "云数贸",
+    "消费养老", "以房养老", "理疗", "艾灸", "收藏品", "纪念币",
+)
+OFF_TOPIC_VERTICALS: dict[str, tuple[str, ...]] = {
+    "sports": (
+        "足球", "篮球", "NBA", "CBA", "英超", "西甲", "德甲", "意甲", "法甲",
+        "中超", "世界杯", "比分", "赛事", "直播", "录像", "集锦", "WNBA", "NCAA",
+    ),
+    "media": ("电影", "电视剧", "动漫", "全集", "在线观看", "高清", "迅雷", "磁力"),
+}
+
+
+def detect_off_topic(text: str) -> str:
+    """判断页面主体是不是「和涉老诈骗无关的垂直站」。返回领域名或空串。"""
+    sample = (text or "")[:20000]
+    if not sample:
+        return ""
+    if any(term in sample for term in ELDER_SIGNATURE_TERMS):
+        return ""
+    for vertical, terms in OFF_TOPIC_VERTICALS.items():
+        if sum(1 for term in terms if term in sample) >= 4:
+            return vertical
+    return ""
+
+
 def assess(
     facts: dict[str, Any],
     text: str = "",
@@ -317,6 +356,15 @@ def assess(
     min_signals: int = 2,
 ) -> Assessment:
     rs = ruleset or load_ruleset()
+
+    # 主题无关的页面不看内容，只看结构。理由见上方注释。
+    if text:
+        vertical = detect_off_topic(text)
+        if vertical:
+            if isinstance(facts, dict):
+                facts["off_topic"] = vertical
+            text = ""
+
     ctx = {
         "facts": facts,
         "text": normalize_text(text).lower(),

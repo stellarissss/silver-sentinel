@@ -444,7 +444,9 @@ def ops_verify(deep: bool = True) -> dict[str, Any]:
 
 
 @router.post("/api/ops/rescore")
-def ops_rescore(limit: int = 200, asset_id: int | None = None, all_assets: bool = False) -> dict[str, Any]:
+def ops_rescore(
+    limit: int = 200, asset_id: int | None = None, all_assets: bool = False, retier: bool = False
+) -> dict[str, Any]:
     """用已取到的证据重算评分。
 
     部署新版本后必须跑一次：历史资产是在「读不到正文」的版本下打的分。
@@ -453,7 +455,7 @@ def ops_rescore(limit: int = 200, asset_id: int | None = None, all_assets: bool 
 
     if asset_id:
         return rescore_by_id(asset_id, trigger="api")
-    return rescore_many(limit=limit, only_with_text=not all_assets)
+    return rescore_many(limit=limit, only_with_text=not all_assets, retier=retier)
 
 
 @router.post("/api/assets/{asset_id}/llm")

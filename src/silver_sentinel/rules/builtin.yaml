@@ -346,10 +346,20 @@ rules:
     weight: 26
     confidence: 0.7
     when:
+      # 只凭一个品牌词（weixin / qq / douyin）不算强词根：
+      # 体育、影视站群会批量注册 fj-weixin-qq.cc 这类域名，字面全中但和
+      # 涉老诈骗无关。要求「高置信 + 至少两个独立命中」，或直接命中骗局专属簇。
       all:
         - fact: keyword_hint
           op: gte
           value: 0.8
+        - any:
+            - fact: keyword_hits
+              op: gte
+              value: 2
+            - fact: keyword_clusters
+              op: contains
+              value: scam_signature
     detail: 域名或语料中出现「国科/中科/国惠/民族资产解冻/被冒用品牌」等强主题词根，是非官方主体冒用权威名义的典型特征。
     cite: 词库 cluster=authority/scam_signature/brand
 
@@ -596,14 +606,18 @@ rules:
     weight: 24
     confidence: 0.9
     when:
-      text_any:
-        - 屏幕共享
-        - 远程协助
-        - 远程控制
-        - 向日葵
-        - ToDesk
-        - 腾讯会议共享
-        - 帮您操作手机
+      # 「向日葵」「ToDesk」本身是正规软件，体育/影视页面里也会出现
+      # （队名、赞助商）。必须和「远程」同现才算诱导。
+      any:
+        - text_any:
+            - 屏幕共享
+            - 远程协助
+            - 远程控制
+            - 腾讯会议共享
+            - 帮您操作手机
+        - text_all: [向日葵, 远程]
+        - text_all: [ToDesk, 远程]
+        - text_any: [下载向日葵, 安装向日葵, 下载ToDesk, 安装ToDesk]
     detail: 一旦共享屏幕，对方可实时读取验证码与余额，几乎必然导致资金损失。
 
   - id: PER-008

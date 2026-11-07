@@ -279,11 +279,19 @@ def scan(
     kw_host = ""
     if kind in {AssetKind.URL.value, AssetKind.DOMAIN.value}:
         kw_host = normalize_domain(display_value)
-    kw_match = get_library().match_any(kw_host, f"{display_value} {corpus[:4000]}")
+    # 体育/影视站群不该按正文匹配词库：那些域名常带 weixin/qq，整类会误判
+    from .scoring.engine import detect_off_topic
+
+    vertical = detect_off_topic(corpus)
+    kw_text = "" if vertical else f"{display_value} {corpus[:4000]}"
+    if vertical:
+        facts["off_topic"] = vertical
+    kw_match = get_library().match_any(kw_host, kw_text)
     if kw_match.hits:
         facts["keyword_hint"] = round(kw_match.score, 3)
         facts["keyword_terms"] = kw_match.terms[:8]
         facts["keyword_clusters"] = sorted(kw_match.clusters)
+        facts["keyword_hits"] = len(kw_match.hits)
 
     # ---- 官方通报匹配（名称类命中直接可给高权重）
     haystack_names = [
