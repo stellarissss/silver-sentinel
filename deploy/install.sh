@@ -226,7 +226,7 @@ log "写入 $UNIT"
 # 只给数据目录写权限，但副本目录 / 证据仓可能配在数据目录之外
 # （线上就是 /var/lib/silver-sentinel/replica）。漏了它们，副本同步会静默失败。
 RW_PATHS="$DATA_DIR"
-for _key in SILVER_REPLICA_TARGET SILVER_VAULT_DIR; do
+for _key in SILVER_REPLICA_TARGET SILVER_VAULT_TARGET SILVER_VAULT_DIR; do
   _val="$(sed -n "s/^${_key}=//p" "$ENV_FILE" 2>/dev/null | head -1 | tr -d "\"'")"
   case "$_val" in
     /*) case " $RW_PATHS " in *" $_val "*) ;; *) RW_PATHS="$RW_PATHS $_val" ;; esac ;;
