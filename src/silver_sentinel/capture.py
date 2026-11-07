@@ -315,7 +315,9 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
             s.scalars(
                 select(CaptureTask).where(
                     CaptureTask.state == "running",
-                    CaptureTask.started_at < now - timedelta(minutes=15),
+                    # 单条取证硬超时 240 秒；超过 10 分钟还挂着，只可能是进程被
+                    # 杀掉时留下的行。回收得越快，重启后的空窗越短。
+                    CaptureTask.started_at < now - timedelta(minutes=10),
                 )
             )
         )
@@ -460,6 +462,7 @@ def backfill(limit: int = 30) -> int:
             CaptureTask.finished_at.is_not(None),
             CaptureTask.finished_at > dead_before,
         )
+
         if room <= 0:
             return 0
 
@@ -491,7 +494,10 @@ def backfill(limit: int = 30) -> int:
                     ),
                     retry_ready,
                     ~in_flight,
-                    ~recently_dead,
+                    # 任务级「刚判死」只兜底没有 capture_retry_at 的老数据。
+                    # 两者同时生效会打架：资产级说「10 分钟后可重试」，任务级
+                    # 说「6 小时内不行」，结果队列空转、36 条可重试资产没人碰。
+                    or_(Asset.capture_retry_at.is_not(None), ~recently_dead),
                 )
                 .order_by(tier_rank, Asset.score.desc(), Asset.last_capture_at.is_(None).desc(), Asset.first_seen.desc())
                 .limit(min(limit, room))
@@ -555,7 +561,7 @@ def capture_asset(asset_id: int) -> dict[str, Any]:
         # 浏览器起不来时，这个线程已经被 Playwright 留下的 event loop 毒化了，
         # 留在池里只会让后面每一次取证都报同一句话。换一个新线程。
         text = f"{result.get('reason') or ''}{result.get('error') or ''}"
-        if "浏览器不可用" in text or "asyncio loop" in text:
+        if "浏览器不可用" in text or "asyncio loop" in text or "different thread" in text:
             _reset_capture_pool()
         return result
 

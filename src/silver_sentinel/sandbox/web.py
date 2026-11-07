@@ -174,6 +174,7 @@ class WebSandbox:
         self.stats = {"runs": 0, "ok": 0, "blocked_private": 0, "errors": 0, "recycles": 0}
         self._launched_at = 0.0
         self._runs_at_launch = 0
+        self._owner_thread: int | None = None
 
     def _maybe_recycle(self) -> None:
         """到点就把浏览器换掉。只在单线程取证循环里调用，无并发风险。"""
@@ -188,10 +189,20 @@ class WebSandbox:
         self.stats["recycles"] += 1
 
     def _ensure_browser(self):
+        ident = threading.get_ident()
         if self._browser is not None:
-            return self._browser
+            if getattr(self, "_owner_thread", None) in (None, ident):
+                return self._browser
+            # 句柄属于上一个线程。取证超时后 `_reset_capture_pool` 会换新线程，
+            # 但旧线程可能还活着、还攥着浏览器——Playwright 的同步对象与线程
+            # 绑定，新线程一碰就是 `Cannot switch to a different thread`，
+            # 而且每次都会失败、永远不会自愈。线上表现就是「跑一阵之后一条
+            # 也取不到，重启才好」。这里直接丢弃旧句柄，在当前线程重建。
+            log.warning("浏览器句柄属于已废弃的取证线程，丢弃并重建")
+            self.close()
+            self.stats["recycles"] = self.stats.get("recycles", 0) + 1
         with self._lock:
-            if self._browser is not None:
+            if self._browser is not None and getattr(self, "_owner_thread", None) == ident:
                 return self._browser
             from playwright.sync_api import sync_playwright
 
@@ -231,6 +242,7 @@ class WebSandbox:
             self.last_error = ""
             self._launched_at = time.monotonic()
             self._runs_at_launch = self.stats["runs"]
+            self._owner_thread = ident
             return self._browser
 
     def observe(self, url: str, *, timeout: float | None = None) -> WebObservation:
@@ -475,7 +487,14 @@ class WebSandbox:
 
             self.stats["ok"] += 1
         except Exception as exc:  # noqa: BLE001
-            obs.error = f"{type(exc).__name__}: {exc}"[:300]
+            text = f"{type(exc).__name__}: {exc}"
+            # 跨线程使用 Playwright 的报错必须当成「浏览器句柄失效」处理，
+            # 否则会一直复用到天荒地老：每条都失败、每条都留下同一句报错。
+            if "different thread" in text or "Event loop is closed" in text:
+                self.close()
+                self.stats["recycles"] += 1
+                text += "（旧线程的浏览器句柄已丢弃，下次重建）"
+            obs.error = text[:300]
             self.stats["errors"] += 1
         finally:
             if context is not None:
@@ -513,6 +532,7 @@ class WebSandbox:
             pass
         self._browser = None
         self._playwright = None
+        self._owner_thread = None
         self.available = False
 
 

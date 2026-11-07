@@ -543,7 +543,12 @@ def health_self() -> dict[str, Any]:
     # 要么浏览器每页都在超时——两种都需要人看一眼，不能算 ok。
     last_age = round((utcnow() - last_evidence).total_seconds(), 1) if last_evidence else None
     if windows["1h"] == 0 and windows["6h"] > 0:
-        problems.append("最近 1 小时没有新证据（取证可能在空转）")
+        if (queue.get("pending_assets") or 0) > 0:
+            problems.append("最近 1 小时没有新证据（取证可能在空转）")
+        else:
+            # 队列真的空了：不是取证坏了，是发现层这段时间没产出新候选。
+            # 单独说清楚，避免运维对着正常的空队列去查浏览器。
+            problems.append("最近 1 小时无新证据，队列也无积压（发现供给不足）")
     if windows["6h"] == 0 and (queue.get("pending_assets") or 0) > 0:
         problems.append(f"6 小时无新证据，但仍有 {queue.get('pending_assets')} 个待取证资产")
 

@@ -97,6 +97,37 @@ def test_dead_target_is_not_requeued_in_minutes(db, monkeypatch):
     assert capture.backfill(limit=8) == 0
 
 
+def test_asset_level_retry_wins_over_task_level_guard(db):
+    """资产级冷却与任务级「刚判死」不能互相打架。
+
+    线上现场：36 条失败资产按错误文本被判成 transient，`capture_retry_at`
+    只推后 10 分钟；但它们的老任务 `attempts=3` 且 5 分钟前才结束，任务级的
+    「6 小时内不再试」仍然生效。结果 due=0、队列空转，可重试资产一条也进不来。
+    """
+    from silver_sentinel.capture import backfill
+    from silver_sentinel.domain import utcnow
+    from silver_sentinel.models import CaptureTask
+
+    with db() as s:
+        asset = _asset(s, "retry.example.com", capture_state="failed")
+        asset.capture_retry_at = utcnow() - timedelta(minutes=1)
+        asset_id = asset.id
+        s.add(
+            CaptureTask(
+                asset_id=asset_id,
+                state="failed",
+                attempts=3,
+                next_run_at=utcnow(),
+                finished_at=utcnow() - timedelta(minutes=5),
+            )
+        )
+        s.flush()
+
+    assert backfill(limit=8) == 1
+    with db() as s:
+        assert s.query(CaptureTask).filter_by(asset_id=asset_id, state="queued").count() == 1
+
+
 def test_dead_target_returns_after_cooldown(db):
     from silver_sentinel.capture import backfill
     from silver_sentinel.domain import utcnow
