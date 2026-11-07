@@ -152,7 +152,18 @@ class WebObservation:
 
 
 class WebSandbox:
-    """Playwright 驱动的单例。浏览器进程复用，context 每次新建。"""
+    """Playwright 驱动的单例。浏览器进程复用，context 每次新建。
+
+    复用到什么程度是个取舍：每次新建浏览器要 2～4 秒，500 个目标就白烧半小时；
+    但一直不换，Chromium 的堆会随着每次页面导航慢慢涨——不崩，只是把 2G 的机器
+    越挤越紧，最后取证开始超时、失败率上升，看起来像「跑着跑着就不动了」。
+    所以按次数与时长双阈值定期回收：到点关掉，下一次 observe 再冷启动。
+    """
+
+    # 每 N 次取证回收一次浏览器进程
+    RECYCLE_EVERY_RUNS = 300
+    # 或者每 N 小时回收一次（取二者先到者）
+    RECYCLE_EVERY_SECONDS = 6 * 3600
 
     def __init__(self) -> None:
         self._playwright = None
@@ -160,7 +171,21 @@ class WebSandbox:
         self._lock = threading.Lock()
         self.available = False
         self.last_error = ""
-        self.stats = {"runs": 0, "ok": 0, "blocked_private": 0, "errors": 0}
+        self.stats = {"runs": 0, "ok": 0, "blocked_private": 0, "errors": 0, "recycles": 0}
+        self._launched_at = 0.0
+        self._runs_at_launch = 0
+
+    def _maybe_recycle(self) -> None:
+        """到点就把浏览器换掉。只在单线程取证循环里调用，无并发风险。"""
+        if self._browser is None:
+            return
+        aged = time.monotonic() - self._launched_at
+        used = self.stats["runs"] - self._runs_at_launch
+        if aged < self.RECYCLE_EVERY_SECONDS and used < self.RECYCLE_EVERY_RUNS:
+            return
+        log.info("浏览器已运行 %ds / %d 次，回收重建以释放内存", int(aged), used)
+        self.close()
+        self.stats["recycles"] += 1
 
     def _ensure_browser(self):
         if self._browser is not None:
@@ -204,12 +229,16 @@ class WebSandbox:
 
             self.available = True
             self.last_error = ""
+            self._launched_at = time.monotonic()
+            self._runs_at_launch = self.stats["runs"]
             return self._browser
 
     def observe(self, url: str, *, timeout: float | None = None) -> WebObservation:
         timeout = timeout or settings.sandbox_timeout
         started = time.monotonic()
         obs = WebObservation(url=url)
+
+        self._maybe_recycle()
 
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):

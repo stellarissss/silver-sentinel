@@ -519,8 +519,10 @@ def health_self() -> dict[str, Any]:
     if free_gb < 2:
         problems.append(f"磁盘剩余 {free_gb}GB")
     queue = worker.capture_queue_health()
-    if queue.get("stalled"):
-        problems.append(f"取证队列积压 {queue['oldest_queued_minutes']} 分钟")
+    if (queue.get("oldest_queued_minutes") or 0) > 45:
+        problems.append(f"取证队列有任务已等待 {queue['oldest_queued_minutes']} 分钟未执行")
+    if (queue.get("worker_heartbeat_age_s") or 0) > 300:
+        problems.append(f"取证线程心跳已停 {int(queue['worker_heartbeat_age_s'])} 秒")
 
     return {
         "ok": not problems,

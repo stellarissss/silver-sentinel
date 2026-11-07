@@ -113,7 +113,6 @@ class CaptureWorker:
         log.info("取证线程已启动，基础间隔 %ss", self.interval)
         # 启动先跑一轮：进程重启后积压的任务不该再等一个 tick
         while not _STOP.is_set():
-            started = time.monotonic()
             ran = 0
             try:
                 if settings.capture_enabled:
@@ -122,16 +121,17 @@ class CaptureWorker:
                 self.failed += 1
                 beat("capture", error=f"{type(exc).__name__}: {exc}"[:200])
                 log.warning("取证线程异常：%s", exc, exc_info=True)
-            elapsed = time.monotonic() - started
             if ran:
-                # 有活就立刻接上，别为了等 tick 让浏览器空着
+                # 有活就立刻接上：这里的 1 秒只是让调度线程透口气，
+                # 不是节拍。原来用 `interval - elapsed`，一条取证 5 秒就要
+                # 白等 10 秒，等于自废三分之二吞吐。
                 self.idle_rounds = 0
-                pause = max(1.0, self.interval - elapsed)
+                pause = 1.0
             else:
                 self.idle_rounds += 1
                 # 队列空时逐步退避到 4 倍间隔，减少 SQLite 轮询与日志噪声
                 pause = min(self.interval * 4, self.interval * (1 + self.idle_rounds * 0.5))
-            _STOP.wait(max(1.0, pause))
+            _STOP.wait(max(0.5, pause))
 
 
 # ---------------------------------------------------------------- 巡检线程
@@ -293,27 +293,49 @@ def start_background() -> None:
 
 
 def capture_queue_health() -> dict[str, Any]:
-    """取证队列健康度：积压、失败率、最老任务。"""
+    """取证队列健康度：积压、失败率、最老任务。
+
+    「最老任务」只统计**到期**（next_run_at <= now）的任务。退避中的任务本来
+    就要等，把它算成积压会让健康检查一直报 stalled——线上就出现过 5 条退避
+    任务把 oldest_queued 顶到 46 分钟，其实浏览器空闲、没有任何该跑没跑的活。
+    """
     now = utcnow()
     with session_scope() as s:
         counts = dict(
             s.execute(select(CaptureTask.state, func.count(CaptureTask.id)).group_by(CaptureTask.state)).all()
         )
-        oldest = s.scalar(select(func.min(CaptureTask.created_at)).where(CaptureTask.state == "queued"))
+        oldest_due = s.scalar(
+            select(func.min(CaptureTask.created_at)).where(
+                CaptureTask.state == "queued", CaptureTask.next_run_at <= now
+            )
+        )
+        due_count = s.scalar(
+            select(func.count(CaptureTask.id)).where(
+                CaptureTask.state == "queued", CaptureTask.next_run_at <= now
+            )
+        ) or 0
         recent = list(
             s.scalars(select(CaptureTask).where(CaptureTask.finished_at.is_not(None)).order_by(CaptureTask.id.desc()).limit(50))
         )
     done = sum(1 for t in recent if t.state == "done")
     rate = round(done / len(recent), 3) if recent else None
-    age_min = round((now - oldest).total_seconds() / 60, 1) if oldest else 0
+    age_min = round((now - oldest_due).total_seconds() / 60, 1) if oldest_due else 0
+    # 线程心跳停了（>5 分钟）比队列数字更早说明问题：线程死掉时队列看起来
+    # 一切正常，只是永远不动。
+    hb = heartbeat_snapshot().get("capture") or {}
+    hb_age = hb.get("age_s")
+    queued = counts.get("queued", 0)
     return {
-        "queued": counts.get("queued", 0),
+        "queued": queued,
+        "queued_due": due_count,
+        "queued_scheduled": max(0, queued - due_count),
         "running": counts.get("running", 0),
         "failed_total": counts.get("failed", 0),
         "done_total": counts.get("done", 0),
         "success_rate_recent": rate,
         "oldest_queued_minutes": age_min,
-        "stalled": bool(age_min and age_min > 60),
+        "worker_heartbeat_age_s": hb_age,
+        "stalled": bool((age_min and age_min > 45) or (hb_age is not None and hb_age > 300)),
     }
 
 

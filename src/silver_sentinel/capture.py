@@ -136,14 +136,30 @@ def enqueue(asset_id: int, *, reason: str = "", priority: int | None = None) -> 
 
 
 def queue_summary() -> dict[str, Any]:
+    now = utcnow()
     with session_scope() as s:
         rows = s.execute(
             select(CaptureTask.state, func.count(CaptureTask.id)).group_by(CaptureTask.state)
         ).all()
         counts = {state: n for state, n in rows}
-        oldest = s.scalar(
-            select(func.min(CaptureTask.created_at)).where(CaptureTask.state == "queued")
+        # 「最老任务」要分两种看：退避中的任务本来就要等，把它算成积压会
+        # 让健康检查一直报警（线上实测：5 条退避任务让 oldest 显示 46 分钟，
+        # 其实浏览器空闲、没有任何该跑没跑的东西）。
+        oldest_due = s.scalar(
+            select(func.min(CaptureTask.created_at)).where(
+                CaptureTask.state == "queued", CaptureTask.next_run_at <= now
+            )
         )
+        next_due = s.scalar(
+            select(func.min(CaptureTask.next_run_at)).where(
+                CaptureTask.state == "queued", CaptureTask.next_run_at > now
+            )
+        )
+        due_count = s.scalar(
+            select(func.count(CaptureTask.id)).where(
+                CaptureTask.state == "queued", CaptureTask.next_run_at <= now
+            )
+        ) or 0
         failed = list(
             s.scalars(
                 select(CaptureTask)
@@ -159,16 +175,21 @@ def queue_summary() -> dict[str, Any]:
                 Asset.kind.in_(("domain", "url")),
             )
         ) or 0
+    queued = counts.get("queued", 0)
     return {
-        "queued": counts.get("queued", 0),
+        "queued": queued,
+        "queued_due": due_count,
+        "queued_scheduled": max(0, queued - due_count),
         "running": counts.get("running", 0),
         "done": counts.get("done", 0),
         "failed": counts.get("failed", 0),
         "skipped": counts.get("skipped", 0),
         "pending_assets": pending_assets,
-        "oldest_queued": oldest.isoformat() if oldest else None,
+        "oldest_queued": oldest_due.isoformat() if oldest_due else None,
         # 队列健康度：界面上要能直接看出「是在干活、还是卡住了」
-        "oldest_queued_minutes": round((utcnow() - oldest).total_seconds() / 60, 1) if oldest else 0,
+        "oldest_queued_minutes": round((now - oldest_due).total_seconds() / 60, 1) if oldest_due else 0,
+        # 下一次退避到期还有多久：为 0 表示队列里没有等着的活
+        "next_due_in_minutes": round((next_due - now).total_seconds() / 60, 1) if next_due else 0,
         "worker": _worker_snapshot(),
         "recent_failures": [
             {"asset_id": t.asset_id, "error": t.error[:200], "attempts": t.attempts} for t in failed
@@ -287,23 +308,56 @@ def backfill(limit: int = 30) -> int:
     3. 取过证但超过 `capture_refresh_hours` 的——页面会改版，三天前的证据
        对「现在还在骗人吗」没有说服力。
 
-    仍然按队列水位补：worker 是常驻线程，队列只需要一小段缓冲，
-    塞满整条河只会让 priority 失去意义、oldest_queued 一路变大。
+    水位只按「立即可跑」的任务算（下一段详述），这是 24/7 连续取证的关键：
+
+    线上实测过一种静默停摆——队列里躺着 5 条失败重试的任务，`next_run_at`
+    分别在 5～16 分钟之后，而水位统计把它们算成「已占用」。于是每轮 backfill
+    都判定 room<=0，一条新资产也补不进来；浏览器空转，积压的 600 多个待取证
+    资产纹丝不动。表现就是「跑一阵 → 慢下来 → 像停了一样」。
+
+    所以：
+    - room 只看 **due**（next_run_at <= now）的任务，退避中的不占水位；
+    - 查询里排除**已在队列中**（queued/running）的资产，否则取到的前 N 条
+      全是老面孔，enqueue 全部跳过，同样补不进新的；
+    - 连续 3 次失败且还没过冷却期的资产视为「判死」，不再反复重试——
+      死域名永久占位会挤掉真线索；冷却过后自动再试一次，不会永久放弃。
     """
     from datetime import timedelta
 
-    from sqlalchemy import case
+    from sqlalchemy import case, exists
 
+    now = utcnow()
     with session_scope() as s:
-        queued = s.scalar(
+        due = s.scalar(
+            select(func.count(CaptureTask.id)).where(
+                CaptureTask.state == "queued", CaptureTask.next_run_at <= now
+            )
+        ) or 0
+        total = s.scalar(
             select(func.count(CaptureTask.id)).where(CaptureTask.state == "queued")
         ) or 0
+
         target = max(4, settings.capture_batch * 6)
-        room = target - queued
+        cap = max(target, settings.capture_queue_cap)
+        room = min(target - due, cap - total)
+
+        # 同一资产已有排队/执行中的任务就不再进队
+        in_flight = exists().where(
+            CaptureTask.asset_id == Asset.id,
+            CaptureTask.state.in_(("queued", "running")),
+        )
+        dead_before = now - timedelta(hours=settings.capture_retry_cooldown_hours)
+        recently_dead = exists().where(
+            CaptureTask.asset_id == Asset.id,
+            CaptureTask.state == "failed",
+            CaptureTask.attempts >= 3,
+            CaptureTask.finished_at.is_not(None),
+            CaptureTask.finished_at > dead_before,
+        )
         if room <= 0:
             return 0
 
-        stale_before = utcnow() - timedelta(hours=settings.capture_refresh_hours)
+        stale_before = now - timedelta(hours=settings.capture_refresh_hours)
         tier_rank = case(
             (Asset.tier == TIER_CONFIRMED, 0),
             (Asset.tier == TIER_WATCH, 1),
@@ -322,6 +376,8 @@ def backfill(limit: int = 30) -> int:
                             or_(Asset.last_capture_at.is_(None), Asset.last_capture_at < stale_before),
                         ),
                     ),
+                    ~in_flight,
+                    ~recently_dead,
                 )
                 .order_by(tier_rank, Asset.score.desc(), Asset.last_capture_at.is_(None).desc(), Asset.first_seen.desc())
                 .limit(min(limit, room))
