@@ -78,6 +78,42 @@ class CertObservation:
         }
 
 
+def _json_payload(resp: Any) -> Any:
+    """把响应体解成 JSON，能扛住「服务端压缩了但客户端没解」的情况。
+
+    正常路径是 httpx 自己按 Content-Encoding 解压；但线上见过 gstatic 用 br
+    回包、而运行环境没装 brotli 的情况，此时 `resp.json()` 会在 UTF-8 解码处
+    抛 ValueError，报错信息是一串乱码字节。这里按魔数再兜一层。
+    """
+    try:
+        return resp.json()
+    except ValueError:
+        pass
+
+    raw: bytes = resp.content
+    decoded: bytes | None = None
+    if raw[:2] == b"\x1f\x8b":
+        import gzip
+
+        decoded = gzip.decompress(raw)
+    elif raw[:1] == b"\x78":
+        import zlib
+
+        decoded = zlib.decompress(raw)
+    else:
+        try:  # brotli 没有魔数，只能试
+            import brotli
+
+            decoded = brotli.decompress(raw)
+        except Exception:  # noqa: BLE001
+            decoded = None
+
+    if decoded is None:
+        raise ValueError(f"无法解码响应体（{len(raw)} 字节，content-encoding="
+                         f"{resp.headers.get('content-encoding') or '无'}）")
+    return json.loads(decoded.decode("utf-8", "replace"))
+
+
 def _http_json(url: str, timeout: float = 25.0) -> Any:
     """统一走 OPSEC 闸门：不自报身份、按策略选出口、失败转 OSError 便于降级。"""
     from ..opsec import EgressBlocked, get_guard
@@ -101,7 +137,7 @@ def _http_json(url: str, timeout: float = 25.0) -> Any:
             with httpx.Client(**kwargs) as client:
                 resp = client.get(url)
                 if resp.status_code == 200:
-                    return resp.json()
+                    return _json_payload(resp)
                 # 429/5xx 是 CT 日志的常态限流，退避后重试；4xx 其余直接失败
                 if resp.status_code not in {429, 500, 502, 503, 504}:
                     raise OSError(f"HTTP {resp.status_code}")

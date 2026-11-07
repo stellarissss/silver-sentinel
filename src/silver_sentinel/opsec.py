@@ -65,6 +65,17 @@ class InfraLeakError(RuntimeError):
 
 # ---------------------------------------------------------------- 常量
 
+# 只宣告「本机真能解」的压缩格式。线上踩过：服务器 venv 没装 brotli，
+# 但仍然对外宣告 br，gstatic 的 CT log_list.json 就用 br 回，
+# httpx 解不开 → json 解析拿到 0xf1 之类的字节 → 退回内置清单。
+# 内置清单会随 CT 日志冻结而过期，那正是最难发现的一类故障。
+try:  # pragma: no cover - 取决于环境是否装了 brotli
+    import brotli as _brotli  # noqa: F401
+
+    ACCEPT_ENCODING = "gzip, deflate, br"
+except ImportError:  # pragma: no cover
+    ACCEPT_ENCODING = "gzip, deflate"
+
 # 常见浏览器 UA。刻意不含任何项目标识——这是最容易犯的低级错误。
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -368,7 +379,7 @@ class Guard:
             "User-Agent": ua,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": ACCEPT_ENCODING,
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Upgrade-Insecure-Requests": "1",

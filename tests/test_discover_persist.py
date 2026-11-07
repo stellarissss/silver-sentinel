@@ -51,3 +51,28 @@ def test_cert_fingerprint_is_persisted(fresh_db):
     with session_scope() as session:
         asset = session.query(Asset).one()
         assert asset.fingerprint == "b" * 64
+
+
+def test_ct_log_list_payload_survives_unexpected_compression(monkeypatch):
+    """服务端压缩、客户端没解时，不能把整份 CT 日志清单丢掉。
+
+    线上实测：gstatic 用 br 回 log_list.json，而服务器 venv 没装 brotli，
+    `resp.json()` 在 UTF-8 解码处抛 ValueError，于是每次启动都退回内置清单。
+    内置清单会随日志冻结过期，这正是「进程在跑、一条新证书都不进来」的成因。
+    """
+    import gzip
+    import json
+
+    from silver_sentinel.discover.ct import _json_payload
+
+    payload = {"operators": [{"name": "test", "logs": [{"description": "x"}]}]}
+    raw = gzip.compress(json.dumps(payload).encode())
+
+    class Resp:
+        headers = {"content-encoding": ""}  # 假装客户端没有解开
+        content = raw
+
+        def json(self):
+            raise ValueError("'utf-8' codec can't decode byte 0x1f in position 0")
+
+    assert _json_payload(Resp()) == payload
