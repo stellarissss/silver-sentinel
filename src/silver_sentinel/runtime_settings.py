@@ -212,8 +212,16 @@ def llm_public() -> dict[str, Any]:
             "gray_low": cfg["gray_low"],
             "gray_high": cfg["gray_high"],
             "presets": [
-                {"label": "DeepSeek V4 Flash（推荐，快且便宜）", "model": "deepseek-v4-flash", "base_url": "https://api.deepseek.com"},
-                {"label": "DeepSeek V4 Pro（更强，成本高）", "model": "deepseek-v4-pro", "base_url": "https://api.deepseek.com"},
+                {
+                    "label": "DeepSeek V4.1 Flash（推荐：快、便宜，¥ 级成本）",
+                    "model": "deepseek-v4-flash",
+                    "base_url": "https://api.deepseek.com",
+                },
+                {
+                    "label": "DeepSeek V4 Pro（更强推理，成本约 3 倍）",
+                    "model": "deepseek-v4-pro",
+                    "base_url": "https://api.deepseek.com",
+                },
             ],
         },
         "egress": {

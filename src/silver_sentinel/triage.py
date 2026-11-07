@@ -84,6 +84,17 @@ def _urgency(facts: dict[str, Any], asset: Asset) -> tuple[bool, list[str]]:
         reasons.append("命中官方涉诈通报")
         urgent = True
 
+    # 模型结论作为「时效性」信号，不单独定性：它读到了页面原文，
+    # 对「现在还在拉人」比任何域名特征都敏感。只在置信度足够时计入。
+    llm_class = str(facts.get("llm_classification") or "")
+    try:
+        llm_conf = float(facts.get("llm_confidence") or 0)
+    except (TypeError, ValueError):
+        llm_conf = 0.0
+    if llm_class in ("elderly_scam", "likely_scam") and llm_conf >= 0.7:
+        reasons.append(f"模型研判：{llm_class}（{llm_conf:.2f}）")
+        urgent = True
+
     if (asset.scan_count or 0) >= 3 and (asset.last_seen - asset.first_seen).days <= 3:
         reasons.append("短期内被多次独立发现")
         urgent = True
@@ -104,6 +115,14 @@ def _hard_evidence(facts: dict[str, Any], score: float, verdict: str) -> list[st
         out.append("共用收款地址")
     if facts.get("shared_certificate"):
         out.append("共用签名证书")
+    # 模型判到「就是这类骗局」且引用被核对过，才算一条硬证据；
+    # 「unclear」永远不进这个清单。
+    if str(facts.get("llm_classification") or "") == "elderly_scam":
+        try:
+            if float(facts.get("llm_confidence") or 0) >= 0.85:
+                out.append("模型研判与规则一致（引用已核对）")
+        except (TypeError, ValueError):
+            pass
     return out
 
 

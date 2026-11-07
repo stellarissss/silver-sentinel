@@ -139,6 +139,8 @@ silver-sentinel discover status                   # 吞吐、游标、DNS 池健
 silver-sentinel cycle                             # 研判→富化→建图→团伙→衰减
 silver-sentinel enrich 42 --probe                 # 单个目标富化并实测网页
 silver-sentinel graph rebuild                     # 重建图谱并重新归并团伙
+silver-sentinel rescore --limit 2000              # 用已取到的正文重算评分（升级后必跑）
+silver-sentinel health                            # 进程内能力 + 取证队列健康度
 
 # 证据可靠性
 silver-sentinel log verify                        # 逐条重算哈希链

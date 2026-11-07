@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Any
@@ -17,6 +18,8 @@ import httpx
 
 from .. import runtime_settings
 from ..config import settings
+
+log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """你是反诈骗研判分析师，专门分析针对中国老年人的诈骗线索（俗称「领鸡蛋骗局」）。
 这类骗局通常的链条是：免费礼品引流 → 健康讲座/社群洗脑 → 小额返利建立信任 → 推销高价无效产品，或以「国家项目」「民族资产解冻」「养老补贴」为名诱导下载仿冒 App 并投资。
@@ -141,13 +144,27 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any] | None:
                 json=body,
             )
         if resp.status_code != 200:
+            # 以前这里静默返回 None，界面上只看到「LLM 未参与」，查不出原因。
+            # 401/404/402 各对应密钥、模型名、余额，必须说出来。
+            log.warning("LLM 调用失败 HTTP %s：%s", resp.status_code, resp.text[:300])
             return None
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
-    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError):
+        usage = data.get("usage") or {}
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
+        log.warning("LLM 调用异常：%s: %s", type(exc).__name__, exc)
         return None
 
-    return _validate(_extract_json(content))
+    result = _validate(_extract_json(content))
+    if result is None:
+        log.warning("LLM 输出不符合约定结构：%s", str(content)[:200])
+        return None
+    result["usage"] = {
+        "prompt": usage.get("prompt_tokens", 0),
+        "completion": usage.get("completion_tokens", 0),
+        "total": usage.get("total_tokens", 0),
+    }
+    return result
 
 
 def test_connection(*, base_url: str = "", api_key: str = "", model: str = "") -> dict[str, Any]:

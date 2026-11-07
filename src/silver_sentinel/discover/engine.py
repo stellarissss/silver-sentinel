@@ -222,6 +222,34 @@ class DiscoveryEngine:
             self._stream.stop()
         self._flush(force=True)
 
+    def ensure_running(self) -> bool:
+        """看门狗用：发现线程死掉后重建。
+
+        重启会短暂出现重复线程（旧的还活着的那几条），所以加 10 分钟冷却，
+        避免看门狗自己把引擎抖成震荡。重复的 flush 有锁、重复的探测会命中
+        去重器，代价远小于「发现层悄悄停了三天没人知道」。
+        """
+        if not settings.discover_enabled or not settings.allow_network:
+            return False
+        if not self._running:
+            self.start()
+            return True
+        if all(t.is_alive() for t in self._threads):
+            return True
+        now = time.monotonic()
+        if now - getattr(self, "_last_restart", 0.0) < 600:
+            return False
+        log.error("发现线程有死亡（%d/%d 存活），重启引擎", sum(t.is_alive() for t in self._threads), len(self._threads))
+        self._last_restart = now
+        try:
+            self.stop()
+        except Exception:  # noqa: BLE001
+            log.debug("停止旧引擎失败", exc_info=True)
+        self._threads = [t for t in self._threads if t.is_alive()]
+        self._running = False
+        self.start()
+        return True
+
     # ------------------------------------------------------------ CT 轮询
     def _ct_loop(self, follower) -> None:
         while not self._stop.is_set() and not getattr(follower, "retired", False):

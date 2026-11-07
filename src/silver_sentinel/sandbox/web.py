@@ -336,6 +336,19 @@ class WebSandbox:
             response = page.goto(nav_url, wait_until="domcontentloaded", timeout=timeout * 1000)
             page.wait_for_timeout(2500)      # 给 JS 跳转留时间
 
+            # 很多落地页首屏是个空壳，正文由接口拉回来再渲染。只等 2.5 秒会
+            # 抓到几百字节的「加载中…」，评分自然上不去。这里按需再等一会：
+            # 正文短才等网络空闲，正文够长就立刻走，不为少数站点拖慢整条队列。
+            try:
+                if len(page.inner_text("body") or "") < 200:
+                    page.wait_for_load_state("networkidle", timeout=3000)
+                    for _ in range(4):
+                        if len(page.inner_text("body") or "") >= 200:
+                            break
+                        page.wait_for_timeout(400)
+            except Exception:  # noqa: BLE001 长连接站点永远不 idle，不是错误
+                pass
+
             obs.status = response.status if response else 0
             obs.final_url = page.url
             try:

@@ -33,9 +33,9 @@ except ImportError:  # pragma: no cover - 依赖声明里有 Pillow，这里只�
     # 缺 Pillow 时不要整个取证模块 import 失败（会连带 /api/capture/queue 一起 500）：
     # 截图照存，只是算不出 dHash 指纹。
     Image = None  # type: ignore[assignment]
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 
-from . import runtime_settings, triage
+from . import runtime_settings
 from .collectors import apk_fetch
 from .config import settings
 from .core.eventlog import emit
@@ -43,6 +43,7 @@ from .db import session_scope
 from .domain import AssetKind, utcnow
 from .evidence import append as append_evidence
 from .evidence import append_file as append_evidence_file
+from .evidence import read_bytes as read_evidence_bytes
 from .models import (
     TIER_CANDIDATE,
     TIER_COLD,
@@ -85,7 +86,9 @@ _MAX_NETWORK = 4_000_000
 # 而且 Playwright 的同步 API 绑死创建它的线程——同一实例换线程用会直接报
 # "Cannot switch to a different thread"。所以不是加锁，是固定放在一个专用线程里执行。
 _CAPTURE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ss-capture")
-_CAPTURE_TIMEOUT = 600
+# 单次取证的硬上限。沙箱自身 45 秒超时，加上 APK 下载与截图，
+# 240 秒还没回来就一定有东西卡住了，直接换线程比干等 10 分钟强。
+_CAPTURE_TIMEOUT = 240
 
 
 # ---------------------------------------------------------------- 队列
@@ -164,10 +167,29 @@ def queue_summary() -> dict[str, Any]:
         "skipped": counts.get("skipped", 0),
         "pending_assets": pending_assets,
         "oldest_queued": oldest.isoformat() if oldest else None,
+        # 队列健康度：界面上要能直接看出「是在干活、还是卡住了」
+        "oldest_queued_minutes": round((utcnow() - oldest).total_seconds() / 60, 1) if oldest else 0,
+        "worker": _worker_snapshot(),
         "recent_failures": [
             {"asset_id": t.asset_id, "error": t.error[:200], "attempts": t.attempts} for t in failed
         ],
     }
+
+
+def _worker_snapshot() -> dict[str, Any]:
+    try:
+        from .worker import heartbeat_snapshot
+
+        hb = heartbeat_snapshot().get("capture") or {}
+        return {
+            "runs": hb.get("runs", 0),
+            "ok": hb.get("ok", 0),
+            "failed": hb.get("failed", 0),
+            "age_s": hb.get("age_s"),
+            "error": hb.get("error", ""),
+        }
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def run_batch(limit: int = 2) -> dict[str, Any]:
@@ -257,34 +279,51 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
 
 
 def backfill(limit: int = 30) -> int:
-    """把「有效但没取过证」的资产补进队列。
+    """把「该取证但还没取」的资产补进队列。
 
-    发现层每轮都会新增候选，而取证队列只在有任务时干活。缺了这一步，
-    新线索会一直停在 capture_state=pending，界面上永远显示「待取证」。
+    三类目标按优先级进队：
+    1. 从未取过证的（capture_state=pending）——新线索，最需要；
+    2. 取证失败过的（failed）——上次可能是网络抖动，过一阵值得再试；
+    3. 取过证但超过 `capture_refresh_hours` 的——页面会改版，三天前的证据
+       对「现在还在骗人吗」没有说服力。
 
-    但补队不能无脑补：worker 每轮只抓 `capture_batch` 个（默认 2），
-    如果每轮都塞 12 个进来，队列只会越堆越长。线上实测就是这个效果——
-    一分钟进 12 个、出 2 个，`oldest_queued` 很快变成几小时前。
-    所以这里按「队列水位」补：只把待办填到一个小缓冲，剩下的等下一轮。
+    仍然按队列水位补：worker 是常驻线程，队列只需要一小段缓冲，
+    塞满整条河只会让 priority 失去意义、oldest_queued 一路变大。
     """
+    from datetime import timedelta
+
+    from sqlalchemy import case
+
     with session_scope() as s:
         queued = s.scalar(
             select(func.count(CaptureTask.id)).where(CaptureTask.state == "queued")
         ) or 0
-        # 缓冲水位：够 worker 抓几轮就行，不必把整条河搬进队列
-        target = max(4, settings.capture_batch * 3)
+        target = max(4, settings.capture_batch * 6)
         room = target - queued
         if room <= 0:
             return 0
+
+        stale_before = utcnow() - timedelta(hours=settings.capture_refresh_hours)
+        tier_rank = case(
+            (Asset.tier == TIER_CONFIRMED, 0),
+            (Asset.tier == TIER_WATCH, 1),
+            else_=2,
+        )
         rows = list(
             s.scalars(
                 select(Asset)
                 .where(
                     Asset.tier.in_((TIER_CONFIRMED, TIER_WATCH, TIER_CANDIDATE)),
                     Asset.kind.in_(("domain", "url")),
-                    Asset.capture_state == "pending",
+                    or_(
+                        Asset.capture_state.in_(("pending", "failed")),
+                        and_(
+                            Asset.capture_state == "captured",
+                            or_(Asset.last_capture_at.is_(None), Asset.last_capture_at < stale_before),
+                        ),
+                    ),
                 )
-                .order_by(Asset.score.desc(), Asset.first_seen.desc())
+                .order_by(tier_rank, Asset.score.desc(), Asset.last_capture_at.is_(None).desc(), Asset.first_seen.desc())
                 .limit(min(limit, room))
             )
         )
@@ -333,7 +372,12 @@ def capture_asset(asset_id: int) -> dict[str, Any]:
     try:
         result = future.result(timeout=_CAPTURE_TIMEOUT)
     except FuturesTimeout:
-        return {"ok": False, "busy": True, "reason": "取证超时，队列可能卡住了"}
+        # 超时说明这个线程里的 Playwright 已经卡死（DNS 黑洞、无限重定向）。
+        # 不换线程的话，后面每一次取证都会排在它后面直到进程重启——
+        # 「取证断断续续」有一半是这么来的。
+        _reset_capture_pool()
+        log.warning("取证超时 %ss，已重建取证线程 asset=%s", _CAPTURE_TIMEOUT, asset_id)
+        return {"ok": False, "busy": True, "reason": "取证超时，已重建执行线程"}
     except Exception as exc:  # noqa: BLE001 线程里的异常不该变成 500
         log.exception("取证线程异常 asset=%s", asset_id)
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
@@ -387,6 +431,10 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
     if not (obs.html or obs.screenshot or obs.text):
         _set_capture_state(asset_id, "failed", last_error or "页面无内容")
         return {"ok": False, "reason": last_error or "页面无内容", "status": obs.status}
+
+    # 安装包链接：DOM 里找不到时，运行时请求里往往有（JS 拼出来的下载地址）。
+    # 这一步不产生额外请求，纯属把已经抓到的流量再用一次。
+    obs.apk_links = _merge_apk_candidates(obs)
 
     # ---- 落证据（失败也留痕）
     evidence_written: list[str] = []
@@ -495,16 +543,26 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
                       "honeypot", "egress", "tls")
         }
         asset.meta = meta
-        decision = triage.apply(asset, facts=facts)
+
+        # 关键一步：拿页面正文重算评分。
+        # 之前这里只做 triage.apply，分数还是「只有域名」时算出来的——
+        # 于是取证做得再多，也永远进不了 watch（域名特征上限 38.8 < 50）。
+        from .scoring.reassess import rescore
+
+        rescored = rescore(s, asset, facts=facts, text=obs.text or "", trigger="capture")
+        decision_reasons = rescored["reasons"]
         new_tier = asset.tier
+        new_score = float(asset.score or 0.0)
         s.flush()
 
     _set_capture_state(asset_id, "captured")
 
     # ---- APK 下载（在事务外做，别把长下载塞进数据库事务）
     apk_info: dict[str, Any] = {}
-    if obs.apk_links or facts.get("qrcode_links"):
-        apk_info = _maybe_download_apk(asset_id, obs.apk_links, obs.final_url or obs.url, tier)
+    apk_hints = list(obs.apk_links)
+    apk_hints += [u for u in (facts.get("qrcode_links") or []) if ".apk" in u.lower()]
+    if apk_hints:
+        apk_info = _maybe_download_apk(asset_id, apk_hints, obs.final_url or obs.url, tier)
         if apk_info.get("ok"):
             evidence_written.append("apk")
 
@@ -536,7 +594,8 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         "apk": apk_info,
         "changes": changes,
         "tier": new_tier,
-        "reasons": decision.reasons[:4],
+        "reasons": decision_reasons[:4],
+        "score": new_score,
     }
 
 
@@ -555,6 +614,27 @@ def _host_of(url: str) -> str:
         return (urlsplit(url).hostname or "").lower()
     except ValueError:
         return ""
+
+
+_APK_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.apk(?:\?[^\s\"'<>]*)?", re.IGNORECASE)
+
+
+def _merge_apk_candidates(obs) -> list[str]:
+    """把 DOM、HTML、运行时请求、二维码四处看到的下载地址合并去重。
+
+    移动端落地页的下载按钮常由一个 JS 函数拼出 URL，DOM 里只有一个
+    `onclick`，真正发出去的请求才带 .apk。只扫 DOM 会漏掉一大半。
+    """
+    found: list[str] = list(obs.apk_links or [])
+    for item in getattr(obs, "requests", []) or []:
+        url = str(item.get("url") or "")
+        if _APK_URL_RE.match(url) and url not in found:
+            found.append(url)
+    blob = (obs.html or "")[:2_000_000]
+    for url in _APK_URL_RE.findall(blob):
+        if url not in found:
+            found.append(url)
+    return found[:20]
 
 
 # ---------------------------------------------------------------- 内容规则
@@ -1035,11 +1115,13 @@ def asset_zip(asset_id: int) -> bytes:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for item, row in zip(payload, rows, strict=False):
-            path = Path(row.path)
-            if not path.is_absolute():
-                path = settings.data_dir / path
-            if path.exists():
-                zf.write(path, arcname=f"evidence/{item['file']}")
+            # 明文可能已被证据仓脱敏，这里必须解密后再写入；
+            # 否则导出的证据包里只有 manifest，一个文件都没有。
+            data = read_evidence_bytes(row)
+            if data:
+                zf.writestr(f"evidence/{item['file']}", data)
+            else:
+                zf.writestr(f"evidence/{item['file']}.MISSING.txt", f"sha256={row.sha256}\n该证据的明文与密文均不可读\n")
     return buf.getvalue()
 
 

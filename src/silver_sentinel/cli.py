@@ -241,8 +241,10 @@ def cmd_serve(args) -> int:
     import uvicorn
 
     from . import webauth
+    from .logsetup import setup_logging
 
     init_db()
+    setup_logging()
     host = args.host or settings.web_host
     port = args.port or settings.web_port
 
@@ -273,7 +275,30 @@ def cmd_health(args) -> int:  # noqa: ARG001
         "rules": len(load_ruleset().rules),
         "capabilities": settings.capability_report(),
     }
+    try:
+        from .worker import capture_queue_health
+
+        info["capture"] = capture_queue_health()
+    except Exception as exc:  # noqa: BLE001
+        info["capture"] = {"error": str(exc)}
     print(json.dumps(info, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_rescore(args) -> int:
+    """用已取到的证据重算评分。
+
+    线上有一批资产是在「读不到正文」的版本下打的分：证据仓里明明有
+    page_text，评分只用了域名。这条命令把它们捞回来重判。
+    """
+    from .scoring.reassess import rescore_by_id, rescore_many
+
+    init_db()
+    if args.asset_id:
+        result = rescore_by_id(args.asset_id, trigger="cli")
+    else:
+        result = rescore_many(limit=args.limit, only_with_text=not args.all)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -936,6 +961,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("health", help="运行状态")
     p.set_defaults(func=cmd_health)
+
+    p = sub.add_parser("rescore", help="用已取证正文重算评分（可批量）")
+    p.add_argument("asset_id", nargs="?", type=int, help="只重算这一个资产")
+    p.add_argument("--limit", type=int, default=200)
+    p.add_argument("--all", action="store_true", help="连没有正文的资产也重算")
+    p.set_defaults(func=cmd_rescore)
 
     p = sub.add_parser("serve", help="启动 Web 控制台")
     p.add_argument("--host", default="", help="默认取 SILVER_WEB_HOST，未设则 127.0.0.1")

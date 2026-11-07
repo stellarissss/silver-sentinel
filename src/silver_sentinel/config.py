@@ -80,6 +80,8 @@ class Settings:
     llm_model: str = "gpt-4o-mini"
     llm_timeout: float = 45.0
     llm_enabled: bool = True
+    # 每轮补判几条。模型调用要几秒到几十秒，宁可每轮少判两条也不要拖住主循环
+    llm_batch: int = 2
 
     # ---------------------------------------------------------------- 外部情报
     urlhaus_auth_key: str = ""
@@ -144,14 +146,17 @@ class Settings:
     android_serial: str = ""
 
     # ---------------------------------------------------------------- 取证队列
-    # 每个周期跑几个页面。2G 内存跑 Chromium 必须串行，单次 30–45 秒，
-    # 2 个一周期约 90 秒，正好跟上 60 秒 tick 的节奏。
+    # 取证已从主周期拆成独立常驻线程（见 worker.py）：
+    # 抓到一条就接着抓下一条，队列空了才退避。批次保持 1，因为 Chromium
+    # 在这台机器上只能开一个；「连续」比「一次抓多条」更重要。
     capture_enabled: bool = True
-    capture_batch: int = 2
+    capture_batch: int = 1
     # 每轮补多少条「有效但没取过证」的资产进队列
-    capture_backfill_limit: int = 12
-    # 队列空闲时的轮询间隔
-    capture_interval_seconds: int = 45
+    capture_backfill_limit: int = 8
+    # 空闲时的轮询间隔；有活时会立即接上，不等这个值
+    capture_interval_seconds: int = 15
+    # 已取证资产的复访周期：超过这个小时数就重新排队，抓页面变化
+    capture_refresh_hours: int = 72
 
     # ---------------------------------------------------------------- 出站防护（OPSEC）
     # 默认开启：拦内网/元数据、去标识 UA、导出脱敏。是否需要代理才允许访问可疑目标，
@@ -319,7 +324,9 @@ class Settings:
         self.capture_enabled = _bool("SILVER_CAPTURE_ENABLED", True)
         self.capture_batch = max(1, _int("SILVER_CAPTURE_BATCH", self.capture_batch))
         self.capture_backfill_limit = max(0, _int("SILVER_CAPTURE_BACKFILL", self.capture_backfill_limit))
-        self.capture_interval_seconds = max(10, _int("SILVER_CAPTURE_INTERVAL", self.capture_interval_seconds))
+        self.capture_interval_seconds = max(5, _int("SILVER_CAPTURE_INTERVAL", self.capture_interval_seconds))
+        self.capture_refresh_hours = max(1, _int("SILVER_CAPTURE_REFRESH_HOURS", self.capture_refresh_hours))
+        self.llm_batch = max(0, _int("SILVER_LLM_BATCH", self.llm_batch))
 
         self.opsec_enabled = _bool("SILVER_OPSEC_ENABLED", True)
         self.opsec_allow_direct = _bool("SILVER_OPSEC_ALLOW_DIRECT", True)

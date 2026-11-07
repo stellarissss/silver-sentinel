@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
+import time
 from pathlib import Path
 
 from sqlalchemy import select
@@ -17,6 +19,8 @@ from .config import settings
 from .db import compute_chain_hash
 from .domain import utcnow
 from .models import Evidence
+
+log = logging.getLogger(__name__)
 
 MIME_BY_EXT = {
     ".png": "image/png",
@@ -115,6 +119,142 @@ def append_file(
     session.add(row)
     session.flush()
     return row
+
+
+# ---------------------------------------------------------------- 读回
+#
+# 证据仓开启 SILVER_VAULT_REMOVE_PLAINTEXT 之后，明文会被删掉，只剩密文。
+# 但读取方（预览、下载、打包、重扫）一直直接 `Path(row.path).read_bytes()`，
+# 于是全都拿到空字符串——界面显示「证据缺失」、研判只有域名没有正文、
+# 分数永远上不去。这是线上「抓了上千条却零高价值线索」的真正原因。
+#
+# 下面这组函数是全项目唯一的证据读取入口：先读明文，读不到就用 sha256
+# 从本地密文还原。任何新代码都不要绕过它们直接读 row.path。
+
+_MISSING_BACKOFF = 300.0
+_missing_until: dict[str, float] = {}
+
+
+def path_of(row: Evidence) -> Path:
+    path = Path(row.path or "")
+    if not path.is_absolute():
+        path = settings.data_dir / path
+    return path
+
+
+def _decrypt(sha256: str) -> bytes:
+    """从本地加密仓还原明文。失败返回空串，并短暂缓存失败避免刷日志。"""
+    if not sha256:
+        return b""
+    now = time.monotonic()
+    if _missing_until.get(sha256, 0) > now:
+        return b""
+    try:
+        from .vault import get_vault
+
+        data = get_vault().open_local(sha256)
+    except Exception as exc:  # noqa: BLE001 密钥缺失/密文损坏都当成「读不到」
+        _missing_until[sha256] = now + _MISSING_BACKOFF
+        log.debug("密文还原失败 %s: %s", sha256[:12], exc)
+        return b""
+    if not data:
+        _missing_until[sha256] = now + _MISSING_BACKOFF
+        return b""
+    return data
+
+
+def read_bytes(row: Evidence) -> bytes:
+    """读证据原始字节：明文优先，缺失时用密文还原。
+
+    这里不抛异常——调用方多是接口与流水线，一条证据读不出来不该让整页 500。
+    需要区分「没证据」和「解不开」时用 `read_status`。
+    """
+    path = path_of(row)
+    try:
+        if path.is_file():
+            return path.read_bytes()
+    except OSError:
+        pass
+    return _decrypt(row.sha256)
+
+
+def read_text(row: Evidence | None, limit: int = 200_000) -> str:
+    if row is None:
+        return ""
+    data = read_bytes(row)
+    if not data:
+        return ""
+    return data[:limit].decode("utf-8", "replace")
+
+
+def read_status(row: Evidence) -> str:
+    """plain | vault | missing。给健康检查与排障用。"""
+    path = path_of(row)
+    try:
+        if path.is_file():
+            return "plain"
+    except OSError:
+        pass
+    return "vault" if _decrypt(row.sha256) else "missing"
+
+
+def materialize(row: Evidence) -> Path | None:
+    """把证据落到一个可直接交给 FileResponse 的临时文件。
+
+    明文在就直接返回原路径；只有密文时解密到 `<data>/tmp/`，
+    由调用方在响应结束后删除——不要写回 evidence 目录，
+    那会让「已脱敏」的证据重新裸奔在磁盘上。
+    """
+    path = path_of(row)
+    if path.is_file():
+        return path
+    data = _decrypt(row.sha256)
+    if not data:
+        return None
+    tmp_dir = settings.data_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    ext = path.suffix or ".bin"
+    target = tmp_dir / f"ev-{row.id}-{row.sha256[:16]}{ext}"
+    try:
+        target.write_bytes(data)
+    except OSError:
+        return None
+    return target
+
+
+def cleanup_tmp(older_than_seconds: int = 3600) -> int:
+    """清掉解密出来的临时文件与残留的下载包。"""
+    tmp_dir = settings.data_dir / "tmp"
+    if not tmp_dir.is_dir():
+        return 0
+    cutoff = time.time() - older_than_seconds
+    removed = 0
+    for item in tmp_dir.iterdir():
+        try:
+            if item.is_file() and item.stat().st_mtime < cutoff:
+                item.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def latest_text(session: Session, asset_id: int, limit: int = 60_000) -> str:
+    """取该资产最新一份页面正文（明文或密文均可）。研判与重评共用。"""
+    return read_text(latest_text_row(session, asset_id), limit)
+
+
+def latest_text_row(session: Session, asset_id: int, kind: str = "page_text") -> Evidence | None:
+    return session.scalars(
+        select(Evidence)
+        .where(
+            Evidence.asset_id == asset_id,
+            Evidence.kind == kind,
+            Evidence.deleted_at.is_(None),
+        )
+        .order_by(Evidence.id.desc())
+        .limit(1)
+    ).first()
 
 
 # ---------------------------------------------------------------- 软删除

@@ -112,6 +112,17 @@ PIVOT_NOISE_ROOTS = {
     "bootstrapcdn.com", "fontawesome.com", "sentry.io", "hotjar.com",
     "facebook.com", "twitter.com", "tiktok.com", "instagram.com",
     "microsoft.com", "windows.net", "apple.com", "amazon.com",
+    # 线上实测噪声：这些域名天天出现在「新发现的同伙」里，全是基础设施
+    "akamaihd.net", "akamaized.net", "akamai.com", "wsimg.com", "wixstatic.com",
+    "parastorage.com", "byteimg.com", "pstatp.com", "ibytedtos.com", "hdslb.com",
+    "zhimg.com", "alicdn.com", "taobao.com", "tmall.com", "jd.com",
+    "hcaptcha.com", "recaptcha.net", "gstatic.cn", "polyfill.io",
+    "afternic.com", "dan.com", "sedo.com", "godaddy.com", "secureserver.net",
+    "namecheap.com", "dnspod.net", "dnsv1.com", "cloudflare-dns.com",
+    "gravatar.com", "sentry-cdn.com", "bugsnag.com", "newrelic.com",
+    "manus-analytics.com", "plausible.io", "umami.is", "clarity.ms",
+    "zhiyun.com", "yximgs.com", "kuaishou.com", "douyin.com", "ixigua.com",
+    "smzdm.com", "360.cn", "qhimg.com", "sogou.com", "so.com",
 }
 
 

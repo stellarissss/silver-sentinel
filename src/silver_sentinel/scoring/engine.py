@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -110,6 +111,42 @@ def load_ruleset(extra_path: str | Path | None = None) -> RuleSet:
         ingest(yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})
         rs.sources.append(str(path))
 
+    return rs
+
+
+_RULESET_CACHE: dict[str, Any] = {"key": None, "value": None}
+_RULESET_LOCK = threading.Lock()
+
+
+def _ruleset_key() -> tuple:
+    """规则文件的 (路径, mtime, 大小)。改过规则立即生效，没改就走缓存。"""
+    items = []
+    for path in (RULES_DIR / "builtin.yaml", RULES_DIR / "content.yaml"):
+        try:
+            st = path.stat()
+            items.append((str(path), st.st_mtime_ns, st.st_size))
+        except OSError:
+            items.append((str(path), 0, 0))
+    extra = os.environ.get("SILVER_RULES_PATH", "")
+    if extra and Path(extra).is_file():
+        try:
+            st = Path(extra).stat()
+            items.append((extra, st.st_mtime_ns, st.st_size))
+        except OSError:
+            pass
+    return tuple(items)
+
+
+def get_ruleset() -> RuleSet:
+    """带缓存的规则集。研判是热路径，每轮解析两份 YAML 纯属浪费。"""
+    key = _ruleset_key()
+    with _RULESET_LOCK:
+        if _RULESET_CACHE["key"] == key and _RULESET_CACHE["value"] is not None:
+            return _RULESET_CACHE["value"]
+    rs = load_ruleset()
+    with _RULESET_LOCK:
+        _RULESET_CACHE["key"] = key
+        _RULESET_CACHE["value"] = rs
     return rs
 
 

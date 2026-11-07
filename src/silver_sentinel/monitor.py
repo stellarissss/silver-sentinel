@@ -139,12 +139,14 @@ def _retire_target(target_id: int, reason: str) -> None:
 
 
 def _run_asset_target(target_id: int, run_id: int | None, row: dict) -> dict:
-    """资产级盯防：复访 + 变更检测。
+    """资产级盯防：把目标塞进取证队列，由常驻取证线程执行。
 
-    走 capture 而不是 scan，因为「变没变」要看页面、截图、证书、解析、安装包，
-    光看分数看不出来。取证本身自带短事务，这里不要在它外面套事务。
+    以前这里是同步调 capture_asset：一个目标 20 秒，10 个到期目标就是 200 秒，
+    调度线程全程握着浏览器，取证队列只能干等——「断断续续」的另一半原因。
+    现在只负责排队；真正抓页面的是 worker，抓完自然会写变更事件。
     """
-    from .capture import capture_asset
+    from .capture import capture_asset, enqueue
+    from .worker import capture_worker_alive
 
     label = row["value"]
     stats: dict = {"kind": row["kind"], "value": label, "scanned": 1, "found": 0}
@@ -159,6 +161,26 @@ def _run_asset_target(target_id: int, run_id: int | None, row: dict) -> dict:
         with session_scope() as s:
             hit = s.scalar(select(Asset).where(Asset.value == label).limit(1))
             asset_id = hit.id if hit else 0
+    if not asset_id:
+        _close_run(
+            run_id, target_id,
+            status="skipped", error="资产已不存在", stats=stats,
+            interval_minutes=row["interval"], changed=False,
+        )
+        _retire_target(target_id, "找不到对应资产")
+        return {"target": label, "status": "skipped", "stats": stats, "error": "资产已不存在"}
+
+    # 取证线程活着就只排队（最高优先级），让队列统一调度；
+    # 线程没起来（老部署/手工跑）才退回同步执行。
+    if capture_worker_alive():
+        enqueue(asset_id, reason="watch", priority=1)
+        stats["queued"] = True
+        _close_run(
+            run_id, target_id,
+            status="ok", error="", stats=stats,
+            interval_minutes=row["interval"], changed=False,
+        )
+        return {"target": label, "status": "ok", "stats": stats, "error": ""}
 
     try:
         result = capture_asset(asset_id)

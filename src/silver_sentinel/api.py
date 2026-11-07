@@ -60,6 +60,9 @@ def _opsec_summary() -> dict[str, Any]:
 async def lifespan(app: FastAPI):  # noqa: ARG001
     import os
 
+    from .logsetup import setup_logging
+
+    setup_logging()
     init_db()
 
     # 兼容两种写法：SILVER_AUTOSTART（旧）与 SILVER_AUTOSTART_MONITOR（编排文件里用的）
@@ -91,14 +94,28 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             get_vault().start()
         except Exception as exc:  # noqa: BLE001
             logger.warning("证据仓同步启动失败：%s", exc)
+        try:
+            # 常驻取证线程 + 巡检 + 看门狗。取证必须独立于主周期，
+            # 否则建图/富化一慢，取证就断档。
+            from .worker import start_background
+
+            start_background()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("常驻取证线程启动失败：%s", exc)
 
     if os.environ.get("SILVER_AUTOSTART_MONITOR", "0").strip() in {"1", "true", "yes"}:
-        from .monitor import start_background
+        from .monitor import start_background as start_monitor
 
-        start_background()
+        start_monitor()
     yield
 
     # 优雅收尾：把事件日志刷盘，别丢最后几条
+    try:
+        from .worker import stop_all
+
+        stop_all()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from .core.eventlog import get_log
 

@@ -443,9 +443,96 @@ def ops_verify(deep: bool = True) -> dict[str, Any]:
     return {"eventlog": get_log().verify(deep=deep), "evidence_chain": chain}
 
 
+@router.post("/api/ops/rescore")
+def ops_rescore(limit: int = 200, asset_id: int | None = None, all_assets: bool = False) -> dict[str, Any]:
+    """用已取到的证据重算评分。
+
+    部署新版本后必须跑一次：历史资产是在「读不到正文」的版本下打的分。
+    """
+    from .scoring.reassess import rescore_by_id, rescore_many
+
+    if asset_id:
+        return rescore_by_id(asset_id, trigger="api")
+    return rescore_many(limit=limit, only_with_text=not all_assets)
+
+
+@router.post("/api/assets/{asset_id}/llm")
+def asset_llm(asset_id: int) -> dict[str, Any]:
+    """单条 LLM 补判（手动触发，不受灰区限制）。"""
+    from .pipeline import llm_judge
+
+    return llm_judge(asset_id, force=True)
+
+
 @router.post("/api/ops/cycle")
 def ops_cycle(scan_limit: int | None = None) -> dict[str, Any]:
     return run_cycle(scan_limit=scan_limit)
+
+
+@router.get("/api/health/self")
+def health_self() -> dict[str, Any]:
+    """自检：这台机器现在还能不能「持续侦查、持续取证」。
+
+    只返回事实，不做判断以外的修饰——运维需要的是「哪条线停了、积压多深」，
+    而不是一个绿色的 ok。
+    """
+    import shutil
+
+    from . import worker
+    from .db import db_stats
+    from .models import Evidence
+    from .vault import VaultError, get_vault
+
+    beats = worker.heartbeat_snapshot()
+    cycles = beats.get("cycle") or {}
+    capture = beats.get("capture") or {}
+    stats = db_stats()
+
+    with session_scope() as s:
+        evidence_total = s.scalar(select(func.count(Evidence.id))) or 0
+        evidence_active = s.scalar(
+            select(func.count(Evidence.id)).where(Evidence.deleted_at.is_(None))
+        ) or 0
+        watch = s.scalar(
+            select(func.count(Asset.id)).where(Asset.tier.in_((TIER_WATCH, TIER_CONFIRMED)))
+        ) or 0
+        captured = s.scalar(
+            select(func.count(Asset.id)).where(Asset.capture_state == "captured")
+        ) or 0
+
+    usage = shutil.disk_usage(settings.data_dir)
+    free_gb = round(usage.free / 1024**3, 2)
+    stream = get_engine().status().get("stats", {})
+
+    try:
+        vault_info = get_vault().status()
+    except VaultError as exc:
+        vault_info = {"enabled": settings.vault_enabled, "error": str(exc)}
+
+    problems: list[str] = []
+    if not worker.is_alive("capture"):
+        problems.append("取证线程未运行")
+    if cycles.get("age_s") and cycles["age_s"] > 300:
+        problems.append(f"主周期已 {int(cycles['age_s'])} 秒没有心跳")
+    if free_gb < 2:
+        problems.append(f"磁盘剩余 {free_gb}GB")
+    queue = worker.capture_queue_health()
+    if queue.get("stalled"):
+        problems.append(f"取证队列积压 {queue['oldest_queued_minutes']} 分钟")
+
+    return {
+        "ok": not problems,
+        "problems": problems,
+        "worker": worker.stats(),
+        "heartbeats": beats,
+        "cycle": {"count": cycles.get("count", 0), "age_s": cycles.get("age_s"), "ok": cycles.get("ok")},
+        "capture": {**queue, "worker": capture},
+        "assets": {"total": stats.get("assets", 0), "captured": captured, "watch": watch},
+        "evidence": {"total": evidence_total, "active": evidence_active},
+        "discover": stream,
+        "disk": {"free_gb": free_gb, "used_pct": round(usage.used / usage.total * 100, 1)},
+        "vault": vault_info,
+    }
 
 
 @router.post("/api/ops/replica")
@@ -700,44 +787,47 @@ def asset_capture(asset_id: int) -> dict[str, Any]:
 
 @router.get("/api/evidence/{evidence_id}/download")
 def evidence_download(evidence_id: int):
+    from fastapi.responses import FileResponse
+
+    from . import evidence as evidence_service
     from .models import Evidence
 
     with session_scope() as session:
         row = session.get(Evidence, evidence_id)
         if row is None or row.deleted_at is not None:
             raise HTTPException(status_code=404, detail="证据不存在或已删除")
-        path = Path(row.path)
-        if not path.is_absolute():
-            path = settings.data_dir / path
-        name = f"{row.kind}-{row.id}{path.suffix or '.bin'}"
+        name = f"{row.kind}-{row.id}{Path(row.path).suffix or '.bin'}"
         mime = row.mime or "application/octet-stream"
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="文件已丢失（可能被清理）")
+        path = evidence_service.materialize(row)
+    if path is None:
+        raise HTTPException(status_code=410, detail="文件已丢失（明文与密文均不可读）")
     return FileResponse(path, filename=name, media_type=mime)
 
 
 @router.get("/api/evidence/{evidence_id}/preview")
 def evidence_preview(evidence_id: int):
-    """内联预览：图片直接显示，文本按纯文本返回。"""
+    """内联预览：图片直接显示，文本按纯文本返回。
+
+    明文被证据仓脱敏后，这里必须能透明解密——否则界面上每一格都显示
+    「文件已丢失」，取证做多少都等于零。
+    """
     from fastapi.responses import PlainTextResponse, Response
 
+    from . import evidence as evidence_service
     from .models import Evidence
 
     with session_scope() as session:
         row = session.get(Evidence, evidence_id)
         if row is None or row.deleted_at is not None:
             raise HTTPException(status_code=404, detail="证据不存在或已删除")
-        path = Path(row.path)
-        if not path.is_absolute():
-            path = settings.data_dir / path
         mime = row.mime or ""
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="文件已丢失")
+        data = evidence_service.read_bytes(row)
+    if not data:
+        raise HTTPException(status_code=410, detail="文件已丢失（明文与密文均不可读）")
     if mime.startswith("image/"):
-        return Response(path.read_bytes(), media_type=mime)
+        return Response(data, media_type=mime)
     if mime.startswith("text/") or mime == "application/json":
-        text = path.read_text(encoding="utf-8", errors="replace")[:200_000]
-        return PlainTextResponse(text)
+        return PlainTextResponse(data[:200_000].decode("utf-8", "replace"))
     raise HTTPException(status_code=415, detail="该类型不支持在线预览，请下载")
 
 
