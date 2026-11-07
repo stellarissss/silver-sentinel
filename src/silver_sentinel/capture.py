@@ -99,6 +99,7 @@ _DEAD_MARKERS = (
     "ERR_NAME_RESOLUTION_FAILED",
     "ERR_CONNECTION_REFUSED",
     "ERR_ADDRESS_UNREACHABLE",
+    "NXDOMAIN",
     "无法解析",
     "无可访问地址",
 )
@@ -226,11 +227,12 @@ def queue_summary() -> dict[str, Any]:
             select(CaptureTask.state, func.count(CaptureTask.id)).group_by(CaptureTask.state)
         ).all()
         counts = {state: n for state, n in rows}
-        # 「最老任务」要分两种看：退避中的任务本来就要等，把它算成积压会
-        # 让健康检查一直报警（线上实测：5 条退避任务让 oldest 显示 46 分钟，
-        # 其实浏览器空闲、没有任何该跑没跑的东西）。
+        # 「最老到期任务」以 next_run_at 为准，不用 created_at：一条重试了三次
+        # 的任务 created_at 可能是一小时前，但它十分钟前才重新到期。用创建时间
+        # 算等待时长，会把「刚退避完」误报成「积压了 53 分钟」（线上实测），
+        # 进而触发 stalled 告警甚至看门狗重启——重启并不能让它跑得更快。
         oldest_due = s.scalar(
-            select(func.min(CaptureTask.created_at)).where(
+            select(func.min(CaptureTask.next_run_at)).where(
                 CaptureTask.state == "queued", CaptureTask.next_run_at <= now
             )
         )
@@ -611,6 +613,29 @@ def _reset_capture_pool() -> None:
         pass
 
 
+def _fast_dead(host: str) -> str:
+    """用一次 DNS 查询挡掉永久失效的域名，别为 NXDOMAIN 去拉 Chromium。
+
+    线上失败清单里 64 条是 NXDOMAIN，每条都要走「https 超时 30 秒 → http
+    再超时 30 秒」才判死；一次 DNS 查询 3 秒内就能给出同样的结论。
+
+    只把**明确的 NXDOMAIN** 判死。超时、解析器故障、NoAnswer 一律放行给
+    浏览器——宁可多花几十秒，也不能把一次 DNS 抖动当成站点下线，那会让
+    真线索被冷落三天。
+    """
+    if not host or not settings.allow_network:
+        return ""
+    try:
+        import dns.resolver
+
+        dns.resolver.resolve(host, "A", lifetime=3.0)
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        if type(exc).__name__ == "NXDOMAIN":
+            return "DNS 解析失败（NXDOMAIN）"
+        return ""
+
+
 def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
     with session_scope() as s:
         asset = s.get(Asset, asset_id)
@@ -623,6 +648,12 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
     if kind not in (AssetKind.DOMAIN.value, AssetKind.URL.value):
         _set_capture_state(asset_id, "skipped", f"{kind} 不支持页面取证")
         return {"ok": False, "skipped": True, "reason": f"{kind} 不支持页面取证"}
+
+    probe_host = _host_of(value) if kind == AssetKind.URL.value else value
+    dead = _fast_dead(probe_host)
+    if dead:
+        _set_capture_state(asset_id, "dead", dead)
+        return {"ok": False, "reason": dead}
 
     urls = _candidate_urls(kind, value)
     obs = None

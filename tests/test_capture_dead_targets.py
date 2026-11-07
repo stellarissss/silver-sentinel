@@ -240,3 +240,28 @@ def test_seed_retry_state_classifies_history(db):
         assert blocked.capture_state == "failed"
         assert blocked.capture_retry_at is not None
         assert blocked.capture_retry_at < dead.capture_retry_at
+
+
+def test_fast_dead_only_trusts_nxdomain(monkeypatch):
+    """DNS 预检只把 NXDOMAIN 判死；超时和 NoAnswer 必须放行给浏览器。"""
+    import dns.resolver
+
+    from silver_sentinel.capture import _fast_dead
+    from silver_sentinel.config import settings
+
+    monkeypatch.setattr(settings, "allow_network", True)
+
+    def nxdomain(*_a, **_k):
+        raise dns.resolver.NXDOMAIN()
+
+    monkeypatch.setattr(dns.resolver, "resolve", nxdomain)
+    assert "NXDOMAIN" in _fast_dead("gone.example.com")
+
+    def timeout(*_a, **_k):
+        raise dns.exception.Timeout()
+
+    monkeypatch.setattr(dns.resolver, "resolve", timeout)
+    assert _fast_dead("slow.example.com") == ""
+
+    monkeypatch.setattr(dns.resolver, "resolve", lambda *_a, **_k: object())
+    assert _fast_dead("alive.example.com") == ""

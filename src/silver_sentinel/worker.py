@@ -371,7 +371,7 @@ def capture_queue_health() -> dict[str, Any]:
             s.execute(select(CaptureTask.state, func.count(CaptureTask.id)).group_by(CaptureTask.state)).all()
         )
         oldest_due = s.scalar(
-            select(func.min(CaptureTask.created_at)).where(
+            select(func.min(CaptureTask.next_run_at)).where(
                 CaptureTask.state == "queued", CaptureTask.next_run_at <= now
             )
         )
