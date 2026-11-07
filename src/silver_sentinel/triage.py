@@ -45,6 +45,9 @@ WATCH_SCORE_WITH_URGENCY = 32.0     # 有强时效信号时放宽
 # 这是涉老诈骗的最小充分结构：冒用机构名义（KW-001）＋ 用福利或恐吓
 # 推动老人行动（PER/CT 类）。加权分会因换词掉到门槛下，结构不会。
 WATCH_SCORE_COMPOSITE = 45.0
+# 「机构级伪装」：一次伪造多个身份元素（部委名 + 公文格式 + 证件样式）。
+# 这类站往往正文特征稀疏、加权分上不去，但伪装本身已经足够定性。
+IMPERSONATION_WATCH = 3
 CANDIDATE_SCORE = 12.0
 COLD_AFTER_DAYS = 45                # 长期无新证据的候选降为冷存
 
@@ -131,12 +134,17 @@ def _hard_evidence(facts: dict[str, Any], score: float, verdict: str) -> list[st
 
 
 def _composite(asset: Asset, facts: dict[str, Any] | None = None) -> list[str]:
-    """冒充 + 诱导的结构性组合，用于分数差一点点时的兜底。
+    """结构性组合兜底：分数差一点点时，看维度而不是看加权和。
 
     线上实测：一条「民政局/高龄津贴/免费领鸡蛋/专家讲座」的站，命中
     KW-001 + PER-001 + CT-008 + 未备案，分数 49.7，差 0.3 分卡在 watch
     门外。这类漏报没法靠调权重解决——同一套话术换几个词，加权分就掉下来了。
-    改看维度结构：只要冒充类与说服类各自成立，就该进盯防。
+
+    两条判据：
+
+    - 冒充 + 说服各自成立（最通用，覆盖大部分引流话术）；
+    - 冒充强度 ≥3 且分数 ≥45（冒充退役军人事务部这类「机构级」伪装，
+      往往同时伪造多个身份元素：部委名、公文格式、证件样式）。
     """
     coverage = (facts or {}).get("coverage")
     if not isinstance(coverage, dict):
@@ -148,6 +156,8 @@ def _composite(asset: Asset, facts: dict[str, Any] | None = None) -> list[str]:
         return []
     if impersonation >= 1 and persuasion >= 1:
         return ["同时具备身份冒充与说服施压两类特征"]
+    if impersonation >= IMPERSONATION_WATCH and float(asset.score or 0) >= WATCH_SCORE_COMPOSITE:
+        return [f"冒充特征命中 {impersonation} 项，机构级伪装"]
     return []
 
 

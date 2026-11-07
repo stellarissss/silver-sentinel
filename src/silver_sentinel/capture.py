@@ -1240,6 +1240,58 @@ def ensure_watch(
     return True
 
 
+def reconcile_watch(limit: int = MAX_AUTO_WATCH) -> dict[str, int]:
+    """把 watch/confirmed 资产补进盯防池。
+
+    纳管调用点散在 intake / rescore / 人工三处，任何一处漏掉（或历史上
+    某次异常中断），资产就只剩 24 小时复访这一档低频动作——看起来一切
+    在跑，实际没人盯。线上就出现过：watch 有 1 条，watch_targets 是空的，
+    scan_runs 一天 0 条。
+
+    只在配额内补，不淘汰已有目标：对账的职责是补齐，不是重新排座次。
+    """
+    added = 0
+    with session_scope() as s:
+        existing = set(s.scalars(select(WatchTarget.value).where(WatchTarget.kind == "asset")))
+        current = s.scalar(
+            select(func.count(WatchTarget.id)).where(WatchTarget.auto.is_(True))
+        ) or 0
+        room = max(0, limit - current)
+        if room <= 0:
+            return {"added": 0, "existing": len(existing), "room": 0}
+        rows = s.scalars(
+            select(Asset)
+            .where(
+                Asset.tier.in_((TIER_WATCH, TIER_CONFIRMED)),
+                Asset.kind.in_(("domain", "url")),
+            )
+            .order_by(Asset.score.desc())
+        )
+        for asset in rows:
+            key = asset.value[:200]
+            if key in existing:
+                continue
+            s.add(
+                WatchTarget(
+                    kind="asset",
+                    value=key,
+                    asset_id=asset.id,
+                    interval_minutes=(120 if asset.tier == TIER_CONFIRMED else 360),
+                    auto=True,
+                    note=f"{asset.tier} 自动纳管（对账）",
+                    # 立刻排一次：对账发现的漏网目标通常已经很久没被看过
+                    next_run_at=utcnow() + timedelta(minutes=5),
+                )
+            )
+            existing.add(key)
+            added += 1
+            if added >= room:
+                break
+    if added:
+        log.info("盯防对账：补入 %d 个目标", added)
+    return {"added": added, "existing": len(existing), "room": room}
+
+
 def prune_watch() -> int:
     """把已经排除/冷存/降回候选的目标移出自动监控。人工加的保持不动。"""
     moved = 0
@@ -1288,7 +1340,7 @@ def _backfill_domains(asset_id: int, facts: dict[str, Any], obs) -> None:
         return
 
     try:
-        get_engine().inject(candidates[:12], source="pivot", note=f"pivot from asset {asset_id}")
+        get_engine().inject(candidates[:30], source="pivot", note=f"pivot from asset {asset_id}")
     except Exception:  # noqa: BLE001
         log.debug("回灌失败", exc_info=True)
 

@@ -328,6 +328,7 @@ def cmd_doctor(args) -> int:
     from .worker import capture_queue_health, heartbeat_file
 
     result: dict = {"ok": True, "problems": []}
+    payload: dict = {}
     path = heartbeat_file()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -365,11 +366,104 @@ def cmd_doctor(args) -> int:
         result["capture"] = {"error": str(exc)}
         result["problems"].append(f"读队列失败：{exc}")
 
+    # 发现侧：只把「引擎没在跑」算故障。CT 日志落后是产能问题，
+    # 重启解决不了反而丢游标，所以只记录、不触发重启。
+    discover = payload.get("discover") if isinstance(payload, dict) else None
+    if discover:
+        result["discover"] = discover
+        if discover.get("running") is False:
+            result["problems"].append("发现引擎未运行")
+        elif (discover.get("lag") or 0) > 300_000:
+            result["discover_warning"] = (
+                f"CT 日志落后 {discover['lag']} 条，发现产能可能不足（不触发重启）"
+            )
+
     result["ok"] = not result["problems"]
     if args.quiet and result["ok"]:
         return 0
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["ok"] else 1
+
+
+def cmd_brief(args) -> int:
+    """一段时间内的侦查 / 取证态势。
+
+    回答的是运维最关心的一句话：「过去一天，这台机器到底干了什么」。
+    分开看「发现供给」和「取证吞吐」——两者任一是 0，都说明链路断了，
+    但断的位置不同，处理方式也不同。
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import func, select
+
+    from .domain import utcnow as _utcnow
+    from .models import CaptureTask, Evidence
+
+    hours = max(1, args.hours)
+    since = _utcnow() - timedelta(hours=hours)
+
+    with session_scope() as s:
+        new_assets = s.scalar(select(func.count(Asset.id)).where(Asset.first_seen >= since)) or 0
+        by_source = dict(
+            s.execute(
+                select(Asset.discovery_source, func.count(Asset.id))
+                .where(Asset.first_seen >= since)
+                .group_by(Asset.discovery_source)
+                .order_by(func.count(Asset.id).desc())
+            ).all()
+        )
+        siblings = s.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.first_seen >= since, Asset.discovery_source == "ct_san"
+            )
+        ) or 0
+        captured = s.scalar(
+            select(func.count(CaptureTask.id)).where(
+                CaptureTask.state == "done", CaptureTask.finished_at >= since
+            )
+        ) or 0
+        failed = s.scalar(
+            select(func.count(CaptureTask.id)).where(
+                CaptureTask.state == "failed", CaptureTask.finished_at >= since
+            )
+        ) or 0
+        evidence = s.scalar(
+            select(func.count(Evidence.id)).where(Evidence.captured_at >= since)
+        ) or 0
+        watch_new = s.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.first_seen >= since, Asset.tier.in_(("watch", "confirmed"))
+            )
+        ) or 0
+        pending = s.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.capture_state == "pending",
+                Asset.tier.in_(("candidate", "watch", "confirmed")),
+            )
+        ) or 0
+
+    total = captured + failed
+    rate = f"{captured / total * 100:.1f}%" if total else "—"
+    src = "  ".join(f"{k or '未知'} {v}" for k, v in list(by_source.items())[:6])
+
+    print(f"{BOLD}侦查态势{RESET}（近 {hours} 小时）")
+    print(f"  新资产    {new_assets:>6}   {DIM}{src}{RESET}")
+    print(f"  证书兄弟  {siblings:>6}   {DIM}同证书扩散（站群关联）{RESET}")
+    print(f"  取证完成  {captured:>6}   失败 {failed}（成功率 {rate}）")
+    print(f"  新增证据  {evidence:>6}")
+    print(f"  新增盯防  {watch_new:>6}")
+    print(f"  待取证    {pending:>6}   {DIM}队列里还排着的资产{RESET}")
+
+    problems = []
+    if not new_assets and not pending:
+        problems.append("没有任何新资产——发现链路可能停了")
+    if not captured and pending:
+        problems.append("有待取证资产但没有完成——取证线程可能卡住")
+    if failed > max(20, captured):
+        problems.append("失败数超过完成数——目标侧在集体拒连，检查出口 IP 是否被拉黑")
+    for item in problems:
+        print(f"  {YEL}⚠ {item}{RESET}")
+    return 0 if not problems else 1
 
 
 def cmd_rescore(args) -> int:
@@ -1059,6 +1153,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-age", type=int, default=300, help="心跳最大允许年龄（秒）")
     p.add_argument("--quiet", action="store_true", help="正常时不输出")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("brief", help="侦查态势：一段时间内的发现 / 取证 / 证据增量")
+    p.add_argument("--hours", type=int, default=24, help="统计窗口（小时），默认 24")
+    p.set_defaults(func=cmd_brief)
 
     p = sub.add_parser("rescore", help="用已取证正文重算评分（可批量）")
     p.add_argument("asset_id", nargs="?", type=int, help="只重算这一个资产")

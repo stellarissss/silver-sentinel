@@ -167,12 +167,23 @@ def housekeeping() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         log.debug("清理回收站失败：%s", exc)
 
+    # 盯防对账：watch/confirmed 必须有对应的 WatchTarget，否则只剩低频复访。
+    # 纳管调用点分散，靠对账兜底比在每个调用点加分支可靠。
+    watch = {"added": 0}
+    try:
+        from .capture import reconcile_watch
+
+        watch = reconcile_watch()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("盯防对账失败：%s", exc)
+
     usage = shutil.disk_usage(settings.data_dir)
     free_gb = usage.free / 1024**3
     out = {
         "task_runs_removed": removed_runs,
         "tmp_removed": tmp,
         "trash_removed": trash.get("removed", 0),
+        "watch_reconciled": watch.get("added", 0),
         "disk_free_gb": round(free_gb, 2),
         "disk_used_pct": round(usage.used / usage.total * 100, 1),
     }
@@ -270,6 +281,23 @@ def _write_heartbeat() -> None:
         queue = capture_queue_health()
     except Exception as exc:  # noqa: BLE001
         queue = {"error": str(exc)[:200]}
+    # 发现侧也要进心跳：CT 日志追不上时，取证会「有活就干、没活就停」，
+    # 表现成吞吐忽高忽低，而所有取证指标都正常。lag 是唯一能早看到的信号。
+    try:
+        from .discover.engine import get_engine
+
+        dstat = get_engine().status()
+        discover = {
+            "running": dstat.get("running"),
+            "lag": dstat.get("followers_total_lag"),
+            "frozen": dstat.get("followers_frozen"),
+            "seen": (dstat.get("stats") or {}).get("seen"),
+            "queued": (dstat.get("stats") or {}).get("queued"),
+            "cert_siblings": (dstat.get("stats") or {}).get("cert_siblings"),
+            "cert_cluster": (dstat.get("stats") or {}).get("cert_cluster"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        discover = {"error": str(exc)[:200]}
     payload = {
         "pid": os.getpid(),
         "version": __version__,
@@ -285,6 +313,7 @@ def _write_heartbeat() -> None:
             "pending": queue.get("pending_assets"),
             "starved": queue.get("starved"),
         },
+        "discover": discover,
     }
     path = heartbeat_file()
     tmp = path.with_suffix(".json.tmp")

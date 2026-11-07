@@ -31,7 +31,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from sqlalchemy import select
@@ -41,7 +41,15 @@ from ..core.bus import bus
 from ..core.eventlog import emit
 from ..db import session_scope
 from ..domain import utcnow
-from ..models import TIER_CANDIDATE, TIER_COLD, Asset, DiscoveryEvent, KeywordHit
+from ..models import (
+    TIER_CANDIDATE,
+    TIER_COLD,
+    TIER_CONFIRMED,
+    TIER_WATCH,
+    Asset,
+    DiscoveryEvent,
+    KeywordHit,
+)
 from ..normalize import collapse_host
 from .ct import CertObservation, CertStreamClient, CTLogFollower, CtrlShSearch
 from .dnsprobe import DNSProbe, SeedGenerator
@@ -53,6 +61,20 @@ log = logging.getLogger(__name__)
 # 设得低是刻意的——「宁可错杀」，冷存比漏掉便宜。
 COLD_THRESHOLD = 0.30
 
+# 证书兄弟扩散：一张证书上的 SAN 几乎必然属于同一团伙。
+# 诈骗站群习惯用一次签发带几十个域名，这是零成本的关联证据——
+# 内容词库看不到的兄弟站，靠「同一张证书」就能捞出来。
+#
+# 门槛不是分数，而是「命中的簇」：域名命中分数普遍在 0.16~0.30，用 0.5 卡
+# 等于永远不扩散；但只靠载体词（中心/平台/客服）扩散又会把整张证书的
+# 无关域名全捞进来。判据是「至少命中一个强簇」。
+CERT_SIBLING_MIN_SCORE = 0.30
+CERT_SIBLING_CLUSTERS = frozenset(
+    {"policy_theme", "authority", "elder_care", "scam_signature", "inducement", "variant"}
+)
+CERT_SIBLING_LIMIT = 8
+CERT_SIBLING_HINT = 0.28   # 低于 0.30 门槛：进冷存，不与真线索抢取证队列
+
 
 @dataclass
 class DiscoverStats:
@@ -63,6 +85,9 @@ class DiscoverStats:
     whitelisted: int = 0
     cold: int = 0
     db_errors: int = 0
+    cert_siblings: int = 0
+    cert_cluster: int = 0
+    cold_promoted: int = 0
     started_at: float = field(default_factory=time.time)
 
     def as_dict(self) -> dict[str, Any]:
@@ -75,6 +100,9 @@ class DiscoverStats:
             "whitelisted": self.whitelisted,
             "cold": self.cold,
             "db_errors": self.db_errors,
+            "cert_siblings": self.cert_siblings,
+            "cert_cluster": self.cert_cluster,
+            "cold_promoted": self.cold_promoted,
             "uptime_seconds": round(uptime, 1),
             # 这两个数以前混在一起叫 rate_per_min，显示成 1.7/分，
             # 看起来像「系统几乎没在工作」——其实那是入池速度，不是采集速度。
@@ -302,6 +330,56 @@ class DiscoveryEngine:
             with self._pending_lock:
                 self.pending.append((obs, "domain", domain, result.score, result.terms, obs_host))
 
+            # 同一张证书上的其他注册域：这是团伙级关联，内容词库看不到也能捞到
+            if result.score >= CERT_SIBLING_MIN_SCORE and any(
+                getattr(hit, "cluster", "") in CERT_SIBLING_CLUSTERS for hit in result.hits
+            ):
+                self._spread_cert_siblings(obs, domain)
+
+    def _spread_cert_siblings(self, obs: CertObservation, origin: str) -> None:
+        """把同一张证书上的其他注册域送进冷存。
+
+        诈骗站群常用一次签发带几十个域名，兄弟站可能还没建站、可能是后台、
+        可能正文里一个词都没有。它们的价值不在内容，而在「和已知可疑域名
+        共享同一张证书」——这比任何词库命中都硬。
+
+        用 `san:` 前缀独立去重：兄弟域名先以冷档进来，之后自己命中关键词时
+        仍能走正常路径升级，不会被「已存在」挡在门外。
+        """
+        from ..normalize import is_pivot_noise
+
+        siblings: list[str] = []
+        for raw in obs.all_domains:
+            host = str(raw).lower().strip(".")
+            if not host or "." not in host:
+                continue
+            root = collapse_host(host) if settings.discover_collapse_subdomains else host
+            if not root or root == origin or root in siblings:
+                continue
+            if self.lib.is_whitelisted(root) or is_pivot_noise(root):
+                continue
+            siblings.append(root)
+            if len(siblings) >= CERT_SIBLING_LIMIT:
+                break
+        if not siblings:
+            return
+
+        # 兄弟域名单独标记来源：证书关联命中多少，是判断「站群密度」的指标。
+        # 共用同一个 obs 会把它记成 ct_poll，事后分不清是词库捞到的还是证书带来的。
+        sib_obs = replace(obs, source="ct_san")
+
+        added = 0
+        with self._pending_lock:
+            for root in siblings:
+                if not self.deduper.add("san:" + root):
+                    continue
+                self.pending.append(
+                    (sib_obs, "domain", root, CERT_SIBLING_HINT, ["cert_sibling"], root)
+                )
+                added += 1
+        if added:
+            self.stats.cert_siblings += added
+
     # ------------------------------------------------------------ DNS 探测
     def _dns_loop(self) -> None:
         # 先等 CT 跑起来，避免启动瞬间抢带宽
@@ -376,9 +454,37 @@ class DiscoveryEngine:
             # 失败不重排队：事件日志里已有流水，人工可回放
             emit("discover.flush_failed", count=len(rows), error=str(exc)[:200])
 
+    def _cert_clusters(self, session, rows: list[tuple]) -> dict[str, str]:
+        """同一张证书签过的可疑域名，按指纹索引。
+
+        一次批量查，避免逐条 SELECT。只认「已经进过研判」的资产——
+        两个都还在候选池、都还没取证的域名，谈不上团伙证据。
+        """
+        fps = {obs.fingerprint for obs, *_rest in rows if obs is not None and obs.fingerprint}
+        if not fps:
+            return {}
+        out: dict[str, str] = {}
+        for fp, normalized, tier, score in session.execute(
+            select(Asset.fingerprint, Asset.normalized, Asset.tier, Asset.score).where(
+                Asset.fingerprint.in_(fps),
+                Asset.tier.in_((TIER_WATCH, TIER_CONFIRMED, TIER_CANDIDATE)),
+            )
+        ):
+            if tier == TIER_CANDIDATE and (score or 0) < 20:
+                continue
+            out.setdefault(fp, normalized)
+        return out
+
     def _persist(self, session, rows: list[tuple]) -> int:
         created = 0
         assets: list[dict[str, Any]] = []
+        clusters = self._cert_clusters(session, rows)
+        # 同一批里出现多个域名的证书：一次签发给整个站群，比「库里已有」
+        # 更早能看到。诈骗团伙常常一次性签发 5~20 个域名再逐个启用。
+        fp_counts: dict[str, int] = {}
+        for obs, *_rest in rows:
+            if obs is not None and obs.fingerprint:
+                fp_counts[obs.fingerprint] = fp_counts.get(obs.fingerprint, 0) + 1
         for obs, kind, value, score, terms, host in rows:
             normalized = value
             existing = session.scalar(
@@ -395,6 +501,16 @@ class DiscoveryEngine:
                     if score > meta.get("discover_hint", 0):
                         meta["discover_hint"] = round(score, 3)
                         changed = True
+                        # 冷档资产被更强的发现信号命中：提回候选池，别让它沉底。
+                        # 已被研判过的不动，避免覆盖评分与人工结论。
+                        if (
+                            asset.tier == TIER_COLD
+                            and score >= COLD_THRESHOLD
+                            and not meta.get("triaged")
+                        ):
+                            asset.tier = TIER_CANDIDATE
+                            asset.discovery_reason = "、".join(terms[:6]) or asset.discovery_reason
+                            self.stats.cold_promoted += 1
                     hosts = meta.get("hosts") or []
                     if host and host not in hosts and len(hosts) < 30:
                         meta["hosts"] = hosts + [host]
@@ -418,17 +534,46 @@ class DiscoveryEngine:
                 )
                 continue
 
+            # 同一张证书签过的域名已在研判队列里：这张证书就是团伙证据，
+            # 新域名即便自己一个词都没命中，也该进候选池看一眼。
+            cluster_of = None
+            if obs is not None and obs.fingerprint:
+                cluster_of = clusters.get(obs.fingerprint)
+                if cluster_of == normalized:
+                    cluster_of = None
+
+            # 同批多域名同证书：一次签发给整个站群，还没建站就该记下来
+            batch_mates = 0
+            if obs is not None and obs.fingerprint:
+                batch_mates = max(0, fp_counts.get(obs.fingerprint, 1) - 1)
+
+            meta: dict[str, Any] = {
+                "discover_hint": round(score, 3),
+                "hosts": [host] if host else [],
+            }
+            reason = "、".join(terms[:6])
+            if cluster_of:
+                meta["cert_cluster"] = cluster_of
+                reason = (reason + "；" if reason else "") + f"同证书：{cluster_of}"
+                self.stats.cert_cluster += 1
+            elif batch_mates:
+                meta["cert_siblings"] = batch_mates
+                reason = (reason + "；" if reason else "") + f"同批签发 {batch_mates + 1} 个域名"
+                self.stats.cert_cluster += 1
+
             asset = Asset(
                 kind=kind,
                 value=value,
                 normalized=normalized,
-                tier=TIER_CANDIDATE if score >= COLD_THRESHOLD else TIER_COLD,
+                tier=TIER_CANDIDATE
+                if (score >= COLD_THRESHOLD or cluster_of or batch_mates)
+                else TIER_COLD,
                 discovery_source=obs.source if obs else "manual",
-                discovery_reason="、".join(terms[:6]),
+                discovery_reason=reason,
                 score=0.0,
                 verdict="insufficient",
                 fingerprint=(obs.fingerprint[:64] if obs is not None else ""),
-                meta={"discover_hint": round(score, 3), "hosts": [host] if host else []},
+                meta=meta,
             )
             session.add(asset)
             session.flush()

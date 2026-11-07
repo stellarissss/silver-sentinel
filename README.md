@@ -144,6 +144,7 @@ silver-sentinel rescore --retier --limit 6000     # 规则口径变更后连分�
 silver-sentinel dismiss 1 --reason "演示样例包"    # 人工排除，之后重评不会拉回来
 silver-sentinel health                            # 进程内能力 + 取证队列健康度
 silver-sentinel doctor                            # 存活自检（看门狗用，异常退出码 1）
+silver-sentinel brief --hours 24                  # 侦查态势：发现/取证/证据增量，断了就返回 1
 
 # 证据可靠性
 silver-sentinel log verify                        # 逐条重算哈希链

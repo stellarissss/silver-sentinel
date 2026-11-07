@@ -94,9 +94,12 @@ class Settings:
     ct_stream_enabled: bool = True
     # 流断了之后的兜底：直接轮询 CT log 的 get-entries
     ct_poll_logs: str = ""           # 逗号分隔；空则自动拉官方 log_list 里可用且可达的日志
-    ct_poll_logs_limit: int = 3      # 自动挑选时最多跟几条日志（每条一个线程）
-    ct_poll_interval: int = 60
-    ct_poll_batch: int = 256
+    # 每条日志一个线程。3 条时实测覆盖不到全球新增证书的 5%，
+    # 大量站群在别的日志里签发，永远轮不到。5 条是 2 核机器的平衡点。
+    ct_poll_logs_limit: int = 5
+    # 轮询不是定时任务，而是「预算内尽量追平」；间隔只决定两轮之间歇多久。
+    ct_poll_interval: int = 30
+    ct_poll_batch: int = 384
     # 发现即入库的准入线。宁可错杀，命中一个词就进候选池
     discover_min_keyword_hits: int = 1
     # 单个域名被判定为「明显无关」时进入冷存，但仍保留记录

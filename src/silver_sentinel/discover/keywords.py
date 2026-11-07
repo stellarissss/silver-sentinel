@@ -742,6 +742,15 @@ class KeywordLibrary:
             elif cluster == "inducement":
                 # 「免费领鸡蛋」单独出现时更像促销而非诈骗，降一档但仍保留可疑性
                 weight *= 1.0 if has_strong else 0.55
+            elif cluster == "variant":
+                # 错别字/谐音是「主动规避关键词审查」的行为，不是无害的相关词。
+                # 线上 `butie-fafang.cn`（补帖=补贴）曾因 0.6×0.30=0.18 被直接丢弃。
+                weight *= 1.0 if has_strong else 0.75
+            elif cluster == "policy_theme":
+                # 政策词单独出现只说明「相关」，但域名里写「扶贫/养老/补贴」的
+                # 极少是无辜站点。折算压到 0.30 会让这类域名（0.55×0.30=0.165）
+                # 连 0.30 的落库门槛都过不去——最该盯的一类反而全被丢掉。
+                weight *= 1.0 if has_strong else 0.55
             else:
                 # 纯政策词 / 载体词，没有强簇支撑时只是「相关」，不是「可疑」
                 weight *= 0.70 if has_strong else 0.30
