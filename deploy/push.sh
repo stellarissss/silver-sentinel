@@ -26,6 +26,19 @@ SSH_ARGS=("$@")
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE_DIR="/tmp/ss-deploy"
 
+# 服务器只开了密码认证时：DEPLOY_PASSWORD=xxx bash deploy/push.sh root@host
+# 用 SSH_ASKPASS 而不是 echo 口令 | ssh，也不需要装 sshpass：
+# OpenSSH 8.4+ 的 SSH_ASKPASS_REQUIRE=force 会强制走这个助手取口令。
+if [ -n "${DEPLOY_PASSWORD:-}" ]; then
+  ASKPASS_HELPER="$(mktemp /tmp/ss-askpass-XXXXXX)"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$DEPLOY_PASSWORD"\n' > "$ASKPASS_HELPER"
+  chmod 700 "$ASKPASS_HELPER"
+  export DEPLOY_PASSWORD SSH_ASKPASS="$ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force
+  export DISPLAY="${DISPLAY:-:0}"
+  trap 'rm -f "$ASKPASS_HELPER"' EXIT
+  SSH_ARGS+=(-o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no)
+fi
+
 log()  { printf '\033[2m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 die()  { printf '\033[31m  xx\033[0m %s\n' "$*" >&2; exit 1; }
 

@@ -25,6 +25,35 @@ ok()   { printf '\033[32m  ok\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m  !!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m  xx\033[0m %s\n' "$*" >&2; exit 1; }
 
+# ---------------------------------------------------------------- 既有部署探测
+# 早期版本可能是手工装的：账号不叫 sentinel、环境文件在 /etc、数据在 /var/lib/.../data。
+# 按默认值重装会在旁边另起一套空目录，启动后界面上就是「数据全没了」。
+# 所以先看现有 unit 怎么写的，认它的账号、环境文件与数据目录。
+UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
+ENV_FILE=""
+ADOPTED=0
+if [ -f "$UNIT_FILE" ]; then
+  _user="$(sed -n 's/^User=//p' "$UNIT_FILE" | head -1)"
+  _env="$(sed -n 's/^EnvironmentFile=//p' "$UNIT_FILE" | head -1)"
+  _env="${_env#-}"
+  [ -n "$_user" ] && APP_USER="$_user"
+  [ -n "$_env" ] && ENV_FILE="$_env"
+  ADOPTED=1
+fi
+[ -n "$ENV_FILE" ] || ENV_FILE="$APP_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+  _data="$(sed -n 's/^SILVER_DATA_DIR=//p' "$ENV_FILE" | head -1 | tr -d "\"'" )"
+  [ -n "$_data" ] && DATA_DIR="$_data"
+fi
+
+# 老部署的虚拟环境可能叫 venv 而不是 .venv，别在同一个目录里再建一个
+VENV_DIR="$APP_DIR/.venv"
+[ -x "$APP_DIR/venv/bin/python" ] && VENV_DIR="$APP_DIR/venv"
+
+if [ "$ADOPTED" = "1" ]; then
+  log "检测到既有部署，沿用：账号 $APP_USER / 环境文件 $ENV_FILE / 数据目录 $DATA_DIR / 虚拟环境 $VENV_DIR"
+fi
+
 # ---------------------------------------------------------------- 前置检查
 [ "$(id -u)" -eq 0 ] || die "需要 root（用 sudo bash install.sh ...）"
 [ -n "$WHEEL" ] || die "用法: install.sh <wheel 文件路径>"
@@ -58,8 +87,8 @@ log "Python: $PY ($("$PY" -V 2>&1))"
 # venv 在 Debian 系是独立包（python3.12-venv），缺了 `python -m venv` 会失败；
 # 这里失败就补装再重试一次，别让用户对着 ensurepip 的报错自己猜。
 make_venv() {
-  rm -rf "$APP_DIR/.venv"
-  if "$PY" -m venv "$APP_DIR/.venv" >/dev/null 2>&1; then return 0; fi
+  rm -rf "$VENV_DIR"
+  if "$PY" -m venv "$VENV_DIR" >/dev/null 2>&1; then return 0; fi
 
   log "venv 创建失败，补装 venv 组件后重试 ..."
   local vp
@@ -72,8 +101,8 @@ make_venv() {
   elif command -v yum >/dev/null 2>&1; then
     yum install -y "python${vp}" python3-pip >/dev/null 2>&1 || true
   fi
-  rm -rf "$APP_DIR/.venv"
-  "$PY" -m venv "$APP_DIR/.venv" >/dev/null 2>&1
+  rm -rf "$VENV_DIR"
+  "$PY" -m venv "$VENV_DIR" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------- 账号与目录
@@ -89,7 +118,6 @@ install -d -m 0750 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR/evidence" "$DATA_DIR
 
 # ---------------------------------------------------------------- 口令
 # 已有 .env 就不动它；只补缺失项，避免升级把口令重置、把人挡在外面
-ENV_FILE="$APP_DIR/.env"
 NEW_PASSWORD=""
 if [ ! -f "$ENV_FILE" ]; then
   NEW_PASSWORD="$("$PY" - <<'EOF'
@@ -135,23 +163,33 @@ if [ -z "$PASSWORD" ]; then
 fi
 
 # ---------------------------------------------------------------- 虚拟环境与安装
-if [ ! -x "$APP_DIR/.venv/bin/python" ] || ! "$APP_DIR/.venv/bin/python" -c 'import sys' >/dev/null 2>&1; then
-  log "创建虚拟环境 $APP_DIR/.venv"
+if [ ! -x "$VENV_DIR/bin/python" ] || ! "$VENV_DIR/bin/python" -c 'import sys' >/dev/null 2>&1; then
+  log "创建虚拟环境 $VENV_DIR"
   make_venv || die "虚拟环境创建失败（$PY）。Debian/Ubuntu 先装 python3-venv，RHEL 系装 python3-pip"
 fi
 
 log "安装 $(basename "$WHEEL") ..."
-"$APP_DIR/.venv/bin/python" -m pip install --quiet --upgrade pip setuptools wheel
+"$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip setuptools wheel
 # --force-reinstall 保证同名同版本也能覆盖（重打 wheel 调试时常见）
-"$APP_DIR/.venv/bin/python" -m pip install --quiet --no-cache-dir --force-reinstall "$WHEEL" \
+"$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir --force-reinstall "$WHEEL" \
   || die "pip install 失败"
 
-VER="$("$APP_DIR/.venv/bin/python" -c 'import silver_sentinel as s; print(s.__version__)' 2>/dev/null || echo '?')"
+VER="$("$VENV_DIR/bin/python" -c 'import silver_sentinel as s; print(s.__version__)' 2>/dev/null || echo '?')"
 ok "已安装 silver-sentinel $VER"
 
 # ---------------------------------------------------------------- systemd
 UNIT="/etc/systemd/system/${SERVICE}.service"
 log "写入 $UNIT"
+
+# 只给数据目录写权限，但副本目录 / 证据仓可能配在数据目录之外
+# （线上就是 /var/lib/silver-sentinel/replica）。漏了它们，副本同步会静默失败。
+RW_PATHS="$DATA_DIR"
+for _key in SILVER_REPLICA_TARGET SILVER_VAULT_DIR; do
+  _val="$(sed -n "s/^${_key}=//p" "$ENV_FILE" 2>/dev/null | head -1 | tr -d "\"'")"
+  case "$_val" in
+    /*) case " $RW_PATHS " in *" $_val "*) ;; *) RW_PATHS="$RW_PATHS $_val" ;; esac ;;
+  esac
+done
 cat > "$UNIT" <<EOF
 [Unit]
 Description=Silver Sentinel console ($APP_NAME)
@@ -164,8 +202,8 @@ Type=simple
 User=$APP_USER
 Group=$APP_USER
 WorkingDirectory=$APP_DIR
-EnvironmentFile=$APP_DIR/.env
-ExecStart=$APP_DIR/.venv/bin/silver-sentinel serve --host \${SILVER_WEB_HOST} --port \${SILVER_WEB_PORT}
+EnvironmentFile=$ENV_FILE
+ExecStart=$VENV_DIR/bin/silver-sentinel serve --host \${SILVER_WEB_HOST} --port \${SILVER_WEB_PORT}
 Restart=always
 RestartSec=5
 TimeoutStopSec=20
@@ -174,7 +212,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$DATA_DIR
+ReadWritePaths=$RW_PATHS
 ReadOnlyPaths=$APP_DIR
 
 [Install]
