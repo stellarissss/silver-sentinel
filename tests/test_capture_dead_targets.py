@@ -24,15 +24,23 @@ def db(fresh_db):
     return session_scope
 
 
-def _asset(session, value: str, *, capture_state: str = "pending", capture_error: str = ""):
+def _asset(
+    session,
+    value: str,
+    *,
+    capture_state: str = "pending",
+    capture_error: str = "",
+    tier: str = "candidate",
+    score: float = 10.0,
+):
     from silver_sentinel.models import Asset
 
     asset = Asset(
         kind="domain",
         value=value,
         normalized=value,
-        score=10.0,
-        tier="candidate",
+        score=score,
+        tier=tier,
         capture_state=capture_state,
         capture_error=capture_error,
     )
@@ -95,6 +103,42 @@ def test_dead_target_is_not_requeued_in_minutes(db, monkeypatch):
 
     # 冷却期内补队不能再把它捞回来
     assert capture.backfill(limit=8) == 0
+
+
+def test_cold_fill_only_when_queue_is_idle(db, monkeypatch):
+    """队列真空时用冷档填谷，但要有节流，且不能挤占真线索。"""
+    from silver_sentinel import capture
+    from silver_sentinel.config import settings
+    from silver_sentinel.models import CaptureTask
+
+    monkeypatch.setattr(settings, "capture_cold_fill_seconds", 180)
+    capture._COLD_FILL_AT = 0.0
+
+    with db() as s:
+        cold = _asset(s, "cold.example.com", tier="cold")
+        cold_id = cold.id
+
+    assert capture.backfill(limit=8) == 1
+    with db() as s:
+        assert s.query(CaptureTask).filter_by(asset_id=cold_id, state="queued").count() == 1
+
+    # 节流：同一分钟内不会再取第二条
+    assert capture.backfill(limit=8) == 0
+
+
+def test_cold_fill_does_not_preempt_real_leads(db, monkeypatch):
+    from silver_sentinel import capture
+    from silver_sentinel.config import settings
+
+    monkeypatch.setattr(settings, "capture_cold_fill_seconds", 180)
+    capture._COLD_FILL_AT = 0.0
+
+    with db() as s:
+        _asset(s, "cold2.example.com", tier="cold")
+        _asset(s, "hot.example.com", score=50.0)
+
+    assert capture.backfill(limit=8) == 1, "只有一条真线索进队，不应再补冷档"
+    assert capture._COLD_FILL_AT == 0.0
 
 
 def test_asset_level_retry_wins_over_task_level_guard(db):

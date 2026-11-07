@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import threading
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -77,6 +78,14 @@ KIND_LABEL = {k: v for k, v in EXPECTED_KINDS}
 KIND_LABEL.update({"assessment": "研判快照", "text": "原始文本", "qrcode": "二维码", "dns": "解析记录"})
 
 PRIORITY = {TIER_CONFIRMED: 10, TIER_WATCH: 25, TIER_CANDIDATE: 60, TIER_COLD: 200}
+
+# 冷档填谷的上次时间（monotonic）。进程重启后归零，最多多抓一条，无副作用。
+_COLD_FILL_AT = 0.0
+
+
+def _cold_fill_ready() -> bool:
+    gap = int(getattr(settings, "capture_cold_fill_seconds", 0) or 0)
+    return gap > 0 and (time.monotonic() - _COLD_FILL_AT) >= gap
 
 # 失败分三类，冷却时间完全不同。混在一起按「失败 3 次 → 等 6 小时」处理，
 # 结果是死域名每天被重新拉起 4 次，每次二三十秒只换来同一句 NXDOMAIN，
@@ -159,7 +168,7 @@ def enqueue(asset_id: int, *, reason: str = "", priority: int | None = None) -> 
             return False
         if asset.tier in (TIER_DISMISSED,) and reason != "manual":
             return False
-        if asset.tier == TIER_COLD and reason != "manual":
+        if asset.tier == TIER_COLD and reason not in ("manual", "cold-fill"):
             return False
 
         existing = s.scalar(
@@ -438,6 +447,8 @@ def backfill(limit: int = 30) -> int:
 
     from sqlalchemy import case, exists
 
+    global _COLD_FILL_AT
+
     now = utcnow()
     with session_scope() as s:
         due = s.scalar(
@@ -507,6 +518,30 @@ def backfill(limit: int = 30) -> int:
     added = 0
     for aid in ids:
         if enqueue(aid, reason="backfill"):
+            added += 1
+
+    # 队列真空时用冷档资产填谷：发现层一小时只产几个候选，浏览器大部分时间
+    # 是闲的。冷档不是「无关」，只是「域名词根不够强」——用页面正文再复核
+    # 一遍本来就要做的事，顺带让取证不断档。节流由 capture_cold_fill_seconds
+    # 控制，优先级 200，任何时候都排在真线索后面。
+    if added == 0 and due == 0 and _cold_fill_ready():
+        with session_scope() as s:
+            cold_id = s.scalar(
+                select(Asset.id)
+                .where(
+                    Asset.tier == TIER_COLD,
+                    Asset.capture_state == "pending",
+                    Asset.kind.in_(("domain", "url")),
+                    ~exists().where(
+                        CaptureTask.asset_id == Asset.id,
+                        CaptureTask.state.in_(("queued", "running")),
+                    ),
+                )
+                .order_by(Asset.score.desc(), Asset.first_seen.desc())
+                .limit(1)
+            )
+        if cold_id and enqueue(cold_id, reason="cold-fill", priority=PRIORITY[TIER_COLD]):
+            _COLD_FILL_AT = time.monotonic()
             added += 1
     return added
 

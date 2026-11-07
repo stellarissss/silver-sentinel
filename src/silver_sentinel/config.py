@@ -169,6 +169,10 @@ class Settings:
     capture_dead_retry_hours: int = 72
     # 被 WAF / 证书 / 空响应挡住的目标：可能只是临时封锁，给 24 小时
     capture_blocked_retry_hours: int = 24
+    # 空闲时用冷档资产「填谷」：队列没有到期任务时，每隔这么多秒取一条
+    # 冷档待取证资产跑一遍。设 0 关闭。作用是让浏览器在发现层供给不足时
+    # 仍在产出证据，也顺带用页面正文复核一遍当初被判冷的线索。
+    capture_cold_fill_seconds: int = 180
 
     # ---------------------------------------------------------------- 出站防护（OPSEC）
     # 默认开启：拦内网/元数据、去标识 UA、导出脱敏。是否需要代理才允许访问可疑目标，
@@ -352,6 +356,9 @@ class Settings:
         )
         self.capture_blocked_retry_hours = max(
             1, _int("SILVER_CAPTURE_BLOCKED_RETRY_HOURS", self.capture_blocked_retry_hours)
+        )
+        self.capture_cold_fill_seconds = max(
+            0, _int("SILVER_CAPTURE_COLD_FILL_SECONDS", self.capture_cold_fill_seconds)
         )
         self.llm_batch = max(0, _int("SILVER_LLM_BATCH", self.llm_batch))
 

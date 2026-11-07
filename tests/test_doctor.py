@@ -43,3 +43,19 @@ def test_doctor_fails_without_heartbeat_file(fresh_db):
     from silver_sentinel.cli import cmd_doctor
 
     assert cmd_doctor(SimpleNamespace(max_age=300, quiet=True)) == 1
+
+
+def test_health_self_flags_stale_watchdog(fresh_db):
+    """看门狗自己停了，控制台要能看见。"""
+    from fastapi.testclient import TestClient
+
+    from silver_sentinel.api import app
+
+    (fresh_db / "watchdog.json").write_text(
+        json.dumps({"ts": time.time() - 3600, "ok": True, "action": "ok"}),
+        encoding="utf-8",
+    )
+    with TestClient(app) as c:
+        data = c.get("/api/health/self").json()
+    assert data["watchdog"]["present"] is True
+    assert any("看门狗" in p for p in data["problems"])

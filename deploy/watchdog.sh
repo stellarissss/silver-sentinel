@@ -21,6 +21,7 @@ MAX_RESTARTS="${MAX_RESTARTS:-3}"
 WINDOW=$((60 * 60))                     # 一小时内最多重启 3 次
 STATE="${STATE:-/var/lib/silver-sentinel/watchdog.state}"
 LOG_FILE="${LOG_FILE:-$DATA_DIR/logs/watchdog.log}"
+CHECK_FILE="${CHECK_FILE:-$DATA_DIR/watchdog.json}"
 
 log() {
   local line
@@ -30,6 +31,15 @@ log() {
   printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
 }
 
+# 每次检查都留一条记录（含健康时）。控制台据此判断「看门狗本身还活着吗」——
+# timer 悄悄停了的话，服务再怎么坏也没人重启，而界面上一切正常。
+stamp() {
+  local ok="$1" action="$2"
+  printf '{"ts": %s, "ok": %s, "action": "%s", "service": "%s"}\n' \
+    "$(date +%s)" "$ok" "$action" "$SERVICE" >"$CHECK_FILE" 2>/dev/null || true
+  chmod 0644 "$CHECK_FILE" 2>/dev/null || true
+}
+
 # ---- 0. 重启宽限期：服务刚起不久时心跳还没落盘，别急着重启
 # ActiveEnterTimestampMonotonic 是微秒；取不到就当作老服务，继续往下查。
 START_US="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$SERVICE" 2>/dev/null || echo "")"
@@ -37,6 +47,7 @@ if [ -n "$START_US" ] && [ "$START_US" != "0" ]; then
   NOW_US="$(awk '{printf "%.0f", $1 * 1000000}' /proc/uptime)"
   UP_S=$(( (NOW_US - START_US) / 1000000 ))
   if [ "$UP_S" -lt 300 ]; then
+    stamp true "grace"
     exit 0
   fi
 fi
@@ -45,6 +56,7 @@ fi
 OUT="$("$VENV/bin/silver-sentinel" doctor --max-age "$MAX_AGE" 2>&1)"
 RC=$?
 if [ $RC -eq 0 ]; then
+  stamp true "ok"
   exit 0
 fi
 
@@ -61,6 +73,7 @@ printf '%s\n' "$OUT" | tail -20 | while IFS= read -r l; do log "  $l"; done
 
 if [ "${COUNT:-0}" -ge "$MAX_RESTARTS" ]; then
   log "已达重启上限：不再自动重启，需要人工介入（查看 journalctl -u $SERVICE）"
+  stamp false "fused"
   exit 2
 fi
 
@@ -68,4 +81,5 @@ printf '%s\n' "$RECENT" "$NOW" | grep '[0-9]' >"$STATE"
 
 systemctl restart "$SERVICE"
 log "已执行 systemctl restart $SERVICE"
+stamp false "restarted"
 exit 1

@@ -539,6 +539,25 @@ def health_self() -> dict[str, Any]:
         problems.append(f"取证队列有任务已等待 {queue['oldest_queued_minutes']} 分钟未执行")
     if (queue.get("worker_heartbeat_age_s") or 0) > 300:
         problems.append(f"取证线程心跳已停 {int(queue['worker_heartbeat_age_s'])} 秒")
+
+    # 看门狗自己也可能停：timer 没跑，服务坏了没人重启。它每 2 分钟留一次
+    # 记录，15 分钟没动静就说明检查链本身断了。
+    watchdog: dict[str, Any] = {"present": False}
+    try:
+        wd_path = Path(settings.data_dir) / "watchdog.json"
+        if wd_path.is_file():
+            wd = json.loads(wd_path.read_text(encoding="utf-8"))
+            wd_age = int(time.time() - float(wd.get("ts") or 0))
+            watchdog = {
+                "present": True,
+                "age_s": wd_age,
+                "ok": wd.get("ok"),
+                "action": wd.get("action"),
+            }
+            if wd_age > 900:
+                problems.append(f"看门狗已 {wd_age // 60} 分钟没有检查（timer 可能停了）")
+    except Exception as exc:  # noqa: BLE001
+        watchdog = {"present": False, "error": str(exc)[:120]}
     # 假绿：所有心跳都正常，但两小时一条证据没出。要么队列全在冷却，
     # 要么浏览器每页都在超时——两种都需要人看一眼，不能算 ok。
     last_age = round((utcnow() - last_evidence).total_seconds(), 1) if last_evidence else None
@@ -560,6 +579,7 @@ def health_self() -> dict[str, Any]:
         "cycle": {"count": cycles.get("count", 0), "age_s": cycles.get("age_s"), "ok": cycles.get("ok")},
         "capture": {**queue, "worker": capture},
         "assets": {"total": stats.get("assets", 0), "captured": captured, "watch": watch},
+        "watchdog": watchdog,
         "evidence": {
             "total": evidence_total,
             "active": evidence_active,
