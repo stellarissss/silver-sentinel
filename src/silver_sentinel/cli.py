@@ -427,6 +427,15 @@ def cmd_brief(args) -> int:
                 CaptureTask.state == "failed", CaptureTask.finished_at >= since
             )
         ) or 0
+        # 冷档填谷的失败不算异常：cold 池里大量是「签了还没建站」的域名，
+        # 填谷就是在替它们占位、等上线。真正要看的是真线索的失败率。
+        failed_by_reason = dict(
+            s.execute(
+                select(CaptureTask.reason, func.count(CaptureTask.id))
+                .where(CaptureTask.state == "failed", CaptureTask.finished_at >= since)
+                .group_by(CaptureTask.reason)
+            ).all()
+        )
         evidence = s.scalar(
             select(func.count(Evidence.id)).where(Evidence.captured_at >= since)
         ) or 0
@@ -445,11 +454,16 @@ def cmd_brief(args) -> int:
     total = captured + failed
     rate = f"{captured / total * 100:.1f}%" if total else "—"
     src = "  ".join(f"{k or '未知'} {v}" for k, v in list(by_source.items())[:6])
+    cold_failed = failed_by_reason.get("cold-fill", 0)
+    real_failed = failed - cold_failed
+    fail_note = f"失败 {failed}"
+    if cold_failed:
+        fail_note += f"（填谷 {cold_failed}）"
 
     print(f"{BOLD}侦查态势{RESET}（近 {hours} 小时）")
     print(f"  新资产    {new_assets:>6}   {DIM}{src}{RESET}")
     print(f"  证书兄弟  {siblings:>6}   {DIM}同证书扩散（站群关联）{RESET}")
-    print(f"  取证完成  {captured:>6}   失败 {failed}（成功率 {rate}）")
+    print(f"  取证完成  {captured:>6}   {fail_note}（成功率 {rate}）")
     print(f"  新增证据  {evidence:>6}")
     print(f"  新增盯防  {watch_new:>6}")
     print(f"  待取证    {pending:>6}   {DIM}队列里还排着的资产{RESET}")
@@ -459,8 +473,8 @@ def cmd_brief(args) -> int:
         problems.append("没有任何新资产——发现链路可能停了")
     if not captured and pending:
         problems.append("有待取证资产但没有完成——取证线程可能卡住")
-    if failed > max(20, captured):
-        problems.append("失败数超过完成数——目标侧在集体拒连，检查出口 IP 是否被拉黑")
+    if real_failed > max(20, captured):
+        problems.append("真线索的失败数超过完成数——目标侧在集体拒连，检查出口 IP 是否被拉黑")
     for item in problems:
         print(f"  {YEL}⚠ {item}{RESET}")
     return 0 if not problems else 1
