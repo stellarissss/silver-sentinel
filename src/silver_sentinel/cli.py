@@ -228,6 +228,34 @@ def cmd_trash(args) -> int:
     return 0
 
 
+def cmd_dismiss(args) -> int:
+    """人工排除：把一条资产从自动盯防里摘出来，并留下判断依据。
+
+    为什么需要它：任何人在生产环境上手试一次（导入演示 APK、贴一条公开
+    通报里的样例域名），那条记录就会永久留在库里并参与评分。没有人工
+    排除的口子，示例数据会一直排在高危列表第一位，把真线索挤下去。
+    """
+    from .models import TIER_DISMISSED
+
+    init_db()
+    with session_scope() as s:
+        asset = s.get(Asset, args.asset_id)
+        if asset is None:
+            print(f"没有 id={args.asset_id} 的资产")
+            return 1
+        asset.tier = TIER_DISMISSED
+        asset.reviewed_by = args.by
+        asset.dismiss_reason = args.reason[:200]
+        meta = dict(asset.meta or {})
+        meta["scoring_exempt"] = True
+        asset.meta = meta
+        print(
+            f"已排除 #{asset.id} {asset.value[:60]}（原分级 {asset.score:.1f}，"
+            f"理由：{args.reason}）。后续重评不会把它拉回盯防。"
+        )
+    return 0
+
+
 def cmd_rules(args) -> int:
     rs = load_ruleset()
     print(f"规则集 v{rs.version}，共 {len(rs.rules)} 条\n")
@@ -881,6 +909,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=30)
     p.add_argument("--purge-days", type=int, default=None, help="清理多少天前的文件（必须显式指定）")
     p.set_defaults(func=cmd_trash)
+
+    p = sub.add_parser("dismiss", help="人工排除：把一条资产移出自动盯防并记录理由")
+    p.add_argument("asset_id", type=int)
+    p.add_argument("--reason", required=True, help="判断依据（会写进资产记录，供复核）")
+    p.add_argument("--by", default="ops", help="操作人标识")
+    p.set_defaults(func=cmd_dismiss)
 
     # ------------------------------------------------------------ 发现
     p = sub.add_parser("discover", help="发现引擎：CT 监控 / 词库 / 注入 / 历史补漏")

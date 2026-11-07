@@ -198,14 +198,27 @@ def test_single_brand_term_is_not_strong_keyword(fresh_db):
     assert "KW-003" in ids
 
 
-def test_authority_term_still_triggers_strong_keyword(fresh_db):
-    """机构冒充词是强信号，不受品牌词收紧影响。"""
+def test_authority_term_alone_is_only_a_weak_signal(fresh_db):
+    """只有机构名、没有正文时只算弱信号。
+
+    域名本身叫「国惠中科」当然可疑，但 gongxiaoshe88.com 这类把拼音域名
+    挂上加速器下载站的抢注案例说明：**光凭域名拼音撞上机构名**不能定性。
+    取证后如果正文出现政策/涉老话术，重评会自动升到 KW-001。
+    """
     from silver_sentinel.models import Asset
     from silver_sentinel.scoring.reassess import assess_now
 
     asset = Asset(kind="domain", value="guohui-zhongke.cn", normalized="guohui-zhongke.cn")
     assessment, _facts = assess_now(asset, text="")
-    assert "KW-001" in {s.rule_id for s in assessment.signals}
+    ids = {s.rule_id for s in assessment.signals}
+    assert "KW-004" in ids
+    assert "KW-001" not in ids
+
+    # 同一域名，正文出现涉老政策话术后必须升级为强信号
+    text = "国惠中科惠民补贴申领中心 面向 60 岁以上老人发放养老补贴 登记信息即可领取"
+    upgraded, _ = assess_now(asset, text=text)
+    assert "KW-001" in {s.rule_id for s in upgraded.signals}
+    assert upgraded.score > assessment.score
 
 
 def test_voting_saas_is_not_watch_level(fresh_db):
@@ -228,3 +241,41 @@ def test_voting_saas_is_not_watch_level(fresh_db):
     ids = {s.rule_id for s in assessment.signals}
     assert "PER-006" not in ids
     assert assessment.score < 50
+
+
+def test_manual_dismiss_survives_retier(fresh_db):
+    """人工排除必须扛得住规则口径变更后的重定级。
+
+    生产库里的演示包（silver-sample.apk，70.3 分）曾长期占据 watch 第一名，
+    把真线索挤下去。排除之后再跑 rescore --retier 不能把它拉回来。
+    """
+    from types import SimpleNamespace
+
+    from silver_sentinel.cli import cmd_dismiss
+    from silver_sentinel.db import session_scope
+    from silver_sentinel.models import TIER_DISMISSED, Asset
+    from silver_sentinel.scoring.reassess import rescore_by_id
+
+    with session_scope() as s:
+        asset = Asset(
+            kind="apk",
+            value="silver-sample.apk",
+            normalized="silver-sample.apk",
+            score=70.3,
+            tier="watch",
+            verdict="high_risk",
+            meta={"facts": {}},
+        )
+        s.add(asset)
+        s.flush()
+        aid = asset.id
+
+    cmd_dismiss(SimpleNamespace(asset_id=aid, reason="演示用样例包，非真实线索", by="test"))
+
+    rescore_by_id(aid, trigger="retier")
+
+    with session_scope() as s:
+        fresh = s.get(Asset, aid)
+        assert fresh.tier == TIER_DISMISSED
+        assert fresh.reviewed_by == "test"
+        assert "示例" in (fresh.dismiss_reason or "") or "样例" in (fresh.dismiss_reason or "")

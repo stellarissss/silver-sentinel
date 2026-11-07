@@ -353,11 +353,48 @@ rules:
         - fact: keyword_clusters
           op: contains
           value: scam_signature
+        # 机构名（供销社/老龄委/乡村振兴局…）本身只是**手段**，必须与政策或
+        # 涉老主题同现才算骗局特征。否则「gongxiaoshe88.com」这种把拼音域名
+        # 挂上加速器下载站的抢注域名会白拿 26 分直接进 watch。
+        # 不接受 inducement 作旁证：「免费试用」「福利」在软件站同样常见。
+        - all:
+            - fact: keyword_clusters
+              op: contains
+              value: authority
+            - any:
+                - fact: keyword_clusters
+                  op: contains
+                  value: policy_theme
+                - fact: keyword_clusters
+                  op: contains
+                  value: elder_care
+    detail: 语料出现真黑话，或机构名与政策/涉老主题同现——非官方主体冒用权威名义的典型特征。
+    cite: 词库 cluster=authority/scam_signature
+
+  - id: KW-004
+    category: impersonation
+    title: 语料单提机构名（弱信号）
+    weight: 10
+    confidence: 0.4
+    when:
+      all:
         - fact: keyword_clusters
           op: contains
           value: authority
-    detail: 域名或语料中出现「国科/中科/国惠/民族资产解冻」等强主题词根，是非官方主体冒用权威名义的典型特征。
-    cite: 词库 cluster=authority/scam_signature
+        - not:
+            fact: keyword_clusters
+            op: contains
+            value: scam_signature
+        - not:
+            fact: keyword_clusters
+            op: contains
+            value: policy_theme
+        - not:
+            fact: keyword_clusters
+            op: contains
+            value: elder_care
+    detail: 仅出现机构名而无配套的政策/涉老话术，可能只是行业站或抢注域名，不作定性依据。
+    cite: 词库 cluster=authority
 
   - id: KW-003
     category: impersonation

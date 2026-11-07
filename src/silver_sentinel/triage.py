@@ -41,6 +41,10 @@ log = logging.getLogger(__name__)
 # watch 的门槛低于 high_risk，因为我们宁可多看几个。
 WATCH_SCORE = 50.0
 WATCH_SCORE_WITH_URGENCY = 32.0     # 有强时效信号时放宽
+# 「冒充 × 施压/诱导」双维度覆盖时的放宽门槛。
+# 这是涉老诈骗的最小充分结构：冒用机构名义（KW-001）＋ 用福利或恐吓
+# 推动老人行动（PER/CT 类）。加权分会因换词掉到门槛下，结构不会。
+WATCH_SCORE_COMPOSITE = 45.0
 CANDIDATE_SCORE = 12.0
 COLD_AFTER_DAYS = 45                # 长期无新证据的候选降为冷存
 
@@ -126,6 +130,27 @@ def _hard_evidence(facts: dict[str, Any], score: float, verdict: str) -> list[st
     return out
 
 
+def _composite(asset: Asset, facts: dict[str, Any] | None = None) -> list[str]:
+    """冒充 + 诱导的结构性组合，用于分数差一点点时的兜底。
+
+    线上实测：一条「民政局/高龄津贴/免费领鸡蛋/专家讲座」的站，命中
+    KW-001 + PER-001 + CT-008 + 未备案，分数 49.7，差 0.3 分卡在 watch
+    门外。这类漏报没法靠调权重解决——同一套话术换几个词，加权分就掉下来了。
+    改看维度结构：只要冒充类与说服类各自成立，就该进盯防。
+    """
+    coverage = (facts or {}).get("coverage")
+    if not isinstance(coverage, dict):
+        coverage = ((asset.meta or {}).get("scoring") or {}).get("coverage") or {}
+    try:
+        impersonation = int(coverage.get("impersonation") or 0)
+        persuasion = int(coverage.get("persuasion") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return []
+    if impersonation >= 1 and persuasion >= 1:
+        return ["同时具备身份冒充与说服施压两类特征"]
+    return []
+
+
 def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | None = None) -> TriageDecision:
     facts = facts or (asset.meta or {}).get("facts", {}) or {}
     verdict = verdict or asset.verdict or "insufficient"
@@ -148,12 +173,20 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
     icp_registered = asset.icp_status == "registered"
     icp_note = f"备案主体：{asset.icp_entity}" if icp_registered and asset.icp_entity else ""
 
+    composite = _composite(asset, facts)
     if score >= WATCH_SCORE or (urgent and score >= WATCH_SCORE_WITH_URGENCY) or len(hard) >= 2:
         reasons = hard + urgency_reasons
         if icp_registered and score < 80:
             reasons.append(icp_note + "（已备案，降为候选）")
             return TriageDecision(TIER_CANDIDATE, reasons, urgent)
         return TriageDecision(TIER_WATCH, reasons or ["综合评分较高"], urgent)
+
+    if composite and score >= WATCH_SCORE_COMPOSITE:
+        reasons = composite + hard + urgency_reasons
+        if icp_registered and score < 80:
+            reasons.append(icp_note + "（已备案，降为候选）")
+            return TriageDecision(TIER_CANDIDATE, reasons, urgent)
+        return TriageDecision(TIER_WATCH, reasons, urgent)
 
     if score >= CANDIDATE_SCORE or urgent or hard:
         reasons = hard + urgency_reasons

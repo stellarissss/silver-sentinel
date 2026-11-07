@@ -338,7 +338,35 @@ OFF_TOPIC_VERTICALS: dict[str, tuple[str, ...]] = {
         "福利姬", "裸舞", "裸聊", "无码", "三级片", "伦理片", "情色", "色情",
         "麻豆", "糖心", "哔咔", "撸管", "约炮", "人妻", "偷拍",
     ),
+    # 加速器/翻墙工具站：一类被抢注域名承载的灰产聚合站。它们会同时命中
+    # 未备案、引导下载 APK、域名拼音撞上机构名（gongxiaoshe88 → 供销社），
+    # 但服务对象不是老人，也不使用涉老话术。豁免内容信号，只留结构特征。
+    "accelerator": (
+        "加速器", "vpn", "翻墙", "科学上网", "外网", "机场节点",
+        "免费节点", "ssr", "v2ray", "clash", "梯子", "翻墙软件",
+    ),
+    # 跨境赌博站群：品牌词 + 连续数字后缀批量注册（didi3663/didi8398/… 实测
+    # 一次进来 20 个同模板域名），正文是「彩金、有效投注、存提款、备用网址」。
+    # 它们会命中「退款客服」「支付宝背书」「未备案」，40 分上下，既到不了
+    # watch 又长期占着候选池前排。属违法但与涉老诈骗不同主题，豁免内容信号，
+    # 只留结构特征——真要关联到涉老案件时，靠域名/证书/收款地址建图。
+    "gambling": (
+        "棋牌", "娱乐城", "彩金", "投注", "存提款", "提现", "百家乐",
+        "视讯", "电子游艺", "开元棋牌", "备用网址", "娱乐平台", "博彩",
+        "真人荷官", "老虎机", "六合彩", "时时彩", "信用盘",
+    ),
+    # 域名停放/待售页：正文是 SEO 填充文 + 「本域名出售 / 联系邮箱 / 微信」。
+    # 这类页会命中品牌词、CT-006（联系邮箱 + 微信）、品牌拼接，40 分上下，
+    # 是候选池里最常见的噪声。判据是可判定的页面类型，命中一条即可。
+    "parked": (
+        "this domain name is for sale", "this domain is for sale", "buy this domain",
+        "本域名出售", "域名出售", "域名转让", "域名停放", "parked domain",
+        "inquire about this domain", "域名询价",
+    ),
 }
+
+# 各类垂直站判定所需的命中词数。默认 4。
+OFF_TOPIC_MIN_HITS: dict[str, int] = {"accelerator": 2, "parked": 1}
 
 
 def detect_off_topic(text: str) -> str:
@@ -348,8 +376,13 @@ def detect_off_topic(text: str) -> str:
         return ""
     if any(term in sample for term in ELDER_SIGNATURE_TERMS):
         return ""
+    # 英文词条（vpn / parked domain / for sale）大小写不敏感
+    haystack = sample.lower()
     for vertical, terms in OFF_TOPIC_VERTICALS.items():
-        if sum(1 for term in terms if term in sample) >= 4:
+        # 词表规模差异很大：体育有几十个专有名词，加速器只有十来个且
+        # 「加速器 + 外网」这种组合已足够定性，没必要凑够 4 个。
+        need = OFF_TOPIC_MIN_HITS.get(vertical, 4)
+        if sum(1 for term in terms if term.lower() in haystack) >= need:
             return vertical
     return ""
 

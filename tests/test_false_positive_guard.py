@@ -98,3 +98,113 @@ def test_sales_jargon_never_counts_as_strong_cluster(jargon: str):
     match = get_library().match_text(f"我们提供{jargon}方案，助力企业增长")
     clusters = {h.cluster for h in match.hits if h.term == jargon}
     assert clusters == {"sales_jargon"}
+
+
+ACCELERATOR_SITE = (
+    "uu加速器无限试用 绿灯加速器 下载 安卓 苹果 排行 小蜜蜂加速器站长 "
+    "instagram加速器软件 雷霆加速官网 起飞加速器免费版下载 免费vps加速器外网 "
+    "猎豹加速器网页版登录 苹果免费加速期 怎么浏览外网新闻 极光加速器官网下载最新版 "
+    "加速器免费使用一天 黑洞加速器apk"
+)
+
+
+def test_accelerator_site_is_off_topic_and_stays_below_watch():
+    """翻墙工具聚合站与涉老诈骗无关。
+
+    线上案例 gongxiaoshe88.com：域名拼音撞上「供销社」，正文是加速器下载站，
+    旧规则给 51.2 分直接进 watch。它的违法点（未备案、分发 APK）与目标人群
+    都不在涉老范畴，按主题无关处理，只留结构特征。
+    """
+    from silver_sentinel.scoring.engine import detect_off_topic
+
+    assert detect_off_topic(ACCELERATOR_SITE) == "accelerator"
+
+    result, merged = _assess(
+        "gongxiaoshe88.com", ACCELERATOR_SITE, icp_registered=False, brand_lookalike=True
+    )
+    assert merged.get("off_topic") == "accelerator"
+    assert result.score < 40, f"{result.score} 仍会被自动盯防：{sorted(_rule_ids(result))}"
+
+
+def test_authority_term_alone_cannot_reach_watch():
+    """机构名单独出现不能把资产推进 watch，必须配上政策/涉老话术。"""
+    from silver_sentinel.models import Asset
+    from silver_sentinel.scoring.reassess import assess_now
+    from silver_sentinel.triage import decide
+
+    shell, _ = _assess("gongxiaoshe88.com", "供销社 官网 系统 网站 应用 中心 平台")
+    assert "KW-001" not in _rule_ids(shell)
+    assert "KW-004" in _rule_ids(shell)
+
+    asset = Asset(
+        kind="domain",
+        value="minzheng-buttie.com",
+        normalized="minzheng-buttie.com",
+        meta={"facts": {"icp_registered": False}},
+    )
+    asset.reviewed_by = None
+    real, merged = assess_now(
+        asset,
+        text=(
+            "民政局 高龄津贴 申领中心 面向 60 岁以上老人发放养老补贴，"
+            "免费领取鸡蛋，登记信息即可，专家讲座报名"
+        ),
+    )
+    assert "KW-001" in _rule_ids(real), "机构名 + 政策 + 涉老话术必须升级为强信号"
+    # 分数差一点点也要进盯防：冒充 × 说服的结构组合比加权分可靠
+    asset.score = real.score
+    asset.verdict = real.verdict
+    assert decide(asset, facts=merged).tier == "watch"
+
+
+GAMBLING_SITE = (
+    "平台优惠彩金申请 当日娱乐 次日领取优惠彩金 超级救援金 电子游艺 视讯大闯关 "
+    "请各位会员按照活动要求完成有效投注后 于次日联系在线客服进行彩金领取 "
+    "滴滴棋牌 存款未到账 提款未到账 码商 备用网址 开元棋牌 补偿彩金"
+)
+
+
+def test_gambling_cluster_is_off_topic_and_stays_below_watch():
+    """跨境赌博站群与涉老诈骗不同主题。
+
+    线上实测：didi3663/didi8398/didi2758… 一次进来 20 个同模板域名，
+    正文是「彩金、有效投注、存提款、备用网址」，靠「退款客服 + 支付宝背书
+    + 未备案」堆到 42.9 分，长期占据候选池前排。它们该靠域名/证书/收款
+    地址建图去关联，而不是靠内容评分抢盯防位。
+    """
+    from silver_sentinel.scoring.engine import detect_off_topic
+
+    assert detect_off_topic(GAMBLING_SITE) == "gambling"
+
+    result, merged = _assess(
+        "didi3663.com", GAMBLING_SITE, icp_registered=False, brand_lookalike="didi"
+    )
+    assert merged.get("off_topic") == "gambling"
+    assert result.score < 40, f"{result.score} 仍在候选池前排：{sorted(_rule_ids(result))}"
+
+
+def test_parked_domain_page_is_off_topic():
+    """待售/停放域名是候选池里最常见的噪声，按页面类型直接豁免。"""
+    from silver_sentinel.scoring.engine import detect_off_topic
+
+    parked = (
+        "可售/This domain name is for sale 联系邮箱 AI音乐市场规模及 douyinyue.com 应用场景 "
+        "douyinyue.com 是专注于AI音乐服务的专业平台 联系邮箱 微信：apples_cn Buy"
+    )
+    assert detect_off_topic(parked) == "parked"
+
+    result, merged = _assess("douyinyue.com", parked, icp_registered=False)
+    assert merged.get("off_topic") == "parked"
+    assert result.score < 30, f"{result.score} 仍被当成涉诈线索：{sorted(_rule_ids(result))}"
+
+
+def test_growth_hacking_copy_is_not_private_domain():
+    """「快速加粉，玩转微信营销」是营销文案，不是把人拉进私域。"""
+    copy, _ = _assess(
+        "vote.example.com",
+        "公众号投票链接怎么做，系统提供快速增粉，高效引流方案，让你玩转微信营销活动",
+    )
+    assert "CT-006" not in _rule_ids(copy)
+
+    real, _ = _assess("scam.example.com", "详情请加我微信 abc12345，老师一对一指导")
+    assert "CT-006" in _rule_ids(real)

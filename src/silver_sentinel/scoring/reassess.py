@@ -113,6 +113,9 @@ def assess_now(
         reviewed=bool(asset.reviewed_by),
         min_signals=settings.min_signals_for_verdict,
     )
+    # 维度覆盖写进 facts：triage 要据此判断「冒充 × 说服」的结构组合，
+    # 纯计算入口（不落库）也必须能拿到，否则测试与线上走两套逻辑。
+    merged["coverage"] = dict(assessment.coverage)
     return assessment, merged
 
 
@@ -175,6 +178,9 @@ def rescore(
         "trigger": trigger,
         "text_len": len(body or ""),
         "signals": written,
+        # 维度覆盖：triage 靠「冒充 × 施压」的组合结构判定最小充分条件，
+        # 这种结构比加权分稳——加权分同一套话术换几个词就掉到门槛下。
+        "coverage": dict(assessment.coverage),
         # 幂等键：正文证据的 id。下次只在这条证据变了（新取证）时才重评，
         # 否则流水线会每小时把同一批资产无限重算。
         "evidence_id": evidence_id,
