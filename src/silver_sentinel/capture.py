@@ -659,6 +659,7 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
             return {"ok": False, "reason": "资产不存在"}
         kind, value = asset.kind, asset.value
         tier = asset.tier
+        state = asset.capture_state or "pending"
         meta = dict(asset.meta or {})
 
     if kind not in (AssetKind.DOMAIN.value, AssetKind.URL.value):
@@ -689,8 +690,13 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
 
     obs = None
     last_error = ""
+    # 重试目标给短缰绳：上一次已经用满 30 秒还没打开，再给 30 秒基本是重复
+    # 等待。首次取证仍用完整超时——慢站点第一次就该被耐心对待。
+    budget = float(settings.sandbox_timeout)
+    if state in ("failed", "dead"):
+        budget = min(budget, 12.0)
     for url in reachable or urls:
-        obs = get_web_sandbox().observe(url)
+        obs = get_web_sandbox().observe(url, timeout=budget)
         if obs.status or obs.html or obs.screenshot:
             break
         last_error = obs.error or "无响应"
