@@ -282,3 +282,34 @@ def test_tcp_precheck_distinguishes_open_and_closed():
     finally:
         srv.close()
     assert not _tcp_alive("127.0.0.1", port, timeout=1)
+
+
+def test_second_transient_failure_escalates_to_daily_cooldown(db, monkeypatch):
+    """两次都超时就不再按分钟重试：第三次基本是目标侧的问题。"""
+    from silver_sentinel import capture
+    from silver_sentinel.models import Asset, CaptureTask
+
+    with db() as s:
+        asset = _asset(s, "slow2.example.com")
+        asset_id = asset.id
+
+    capture.enqueue(asset_id)
+    monkeypatch.setattr(
+        capture, "capture_asset", lambda _aid: {"ok": False, "error": "Timeout 30000ms exceeded"}
+    )
+    capture.run_batch(limit=1)          # 第 1 次：排队 10 分钟后再试
+    with db() as s:
+        t = s.query(CaptureTask).filter_by(asset_id=asset_id).one()
+        assert t.state == "queued"
+
+    with db() as s:                     # 让它现在到期，跑第 2 次
+        t = s.query(CaptureTask).filter_by(asset_id=asset_id).one()
+        t.next_run_at = t.next_run_at - timedelta(minutes=11)
+    capture.run_batch(limit=1)
+
+    with db() as s:
+        t = s.query(CaptureTask).filter_by(asset_id=asset_id).one()
+        assert t.state == "failed"
+        assert t.error.startswith("[blocked]")
+        asset = s.get(Asset, asset_id)
+        assert asset.capture_retry_at is not None

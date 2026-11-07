@@ -392,17 +392,21 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
                     task.finished_at = utcnow()
                     task.error = f"[{kind}] {error}"[:500]
                     retry_at = utcnow() + retry_delay(kind)
-                elif attempts < 3:
-                    # 退避重试：10 分钟 → 40 分钟 → 放弃
+                elif attempts < 2:
+                    # 第一次失败给 10 分钟：可能是瞬时抖动
                     task.state = "queued"
                     task.error = error
-                    task.next_run_at = utcnow() + timedelta(minutes=10 * (4 ** (attempts - 1)))
+                    task.next_run_at = utcnow() + timedelta(minutes=10)
                     retry_at = task.next_run_at
                 else:
+                    # 第二次还是失败，就不再按分钟重试了。线上实测：一批
+                    # Page.goto 超时的目标会按 10/40 分钟循环，每条占浏览器
+                    # 一分钟以上，把新线索全堵在后面。两次能解释抖动，第三次
+                    # 基本就是目标侧的问题，按 blocked 冷却一天。
                     task.state = "failed"
                     task.finished_at = utcnow()
-                    task.error = error
-                    retry_at = utcnow() + timedelta(hours=settings.capture_retry_cooldown_hours)
+                    task.error = f"[blocked] {error}"[:500]
+                    retry_at = utcnow() + timedelta(hours=settings.capture_blocked_retry_hours)
             asset = s.get(Asset, asset_id)
             if asset is not None and ok:
                 asset.capture_state = "captured"
