@@ -243,8 +243,21 @@ def backfill(limit: int = 30) -> int:
 
     发现层每轮都会新增候选，而取证队列只在有任务时干活。缺了这一步，
     新线索会一直停在 capture_state=pending，界面上永远显示「待取证」。
+
+    但补队不能无脑补：worker 每轮只抓 `capture_batch` 个（默认 2），
+    如果每轮都塞 12 个进来，队列只会越堆越长。线上实测就是这个效果——
+    一分钟进 12 个、出 2 个，`oldest_queued` 很快变成几小时前。
+    所以这里按「队列水位」补：只把待办填到一个小缓冲，剩下的等下一轮。
     """
     with session_scope() as s:
+        queued = s.scalar(
+            select(func.count(CaptureTask.id)).where(CaptureTask.state == "queued")
+        ) or 0
+        # 缓冲水位：够 worker 抓几轮就行，不必把整条河搬进队列
+        target = max(4, settings.capture_batch * 3)
+        room = target - queued
+        if room <= 0:
+            return 0
         rows = list(
             s.scalars(
                 select(Asset)
@@ -254,7 +267,7 @@ def backfill(limit: int = 30) -> int:
                     Asset.capture_state == "pending",
                 )
                 .order_by(Asset.score.desc(), Asset.first_seen.desc())
-                .limit(limit)
+                .limit(min(limit, room))
             )
         )
         ids = [a.id for a in rows]
