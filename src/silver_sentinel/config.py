@@ -157,8 +157,10 @@ class Settings:
     capture_backfill_limit: int = 8
     # 空闲时的轮询间隔；有活时会立即接上，不等这个值
     capture_interval_seconds: int = 15
-    # 已取证资产的复访周期：超过这个小时数就重新排队，抓页面变化
-    capture_refresh_hours: int = 72
+    # 已取证资产的复访周期：超过这个小时数就重新排队，抓页面变化。
+    # 24 小时是「还在不在骗人」的最小可信间隔，也让已知活跃目标的复访
+    # 稳定贡献证据流，不必依赖冷档填谷抽到活站点。
+    capture_refresh_hours: int = 24
     # 「判死」冷却：同一资产连续 3 次取证失败后，先关这么久再试。
     # 没有这道闸，死域名会永远占着队列水位，把新线索挤出去。
     capture_retry_cooldown_hours: int = 6
