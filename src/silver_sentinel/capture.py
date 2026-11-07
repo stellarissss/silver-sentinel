@@ -102,8 +102,11 @@ _DEAD_MARKERS = (
     "NXDOMAIN",
     "无法解析",
     "无可访问地址",
-    "端口无法连接",
 )
+
+# 「端口连不上」不等于「域名死了」：跨境链路、云 WAF、地域封锁都会表现成这样。
+# 判死 24 小时而不是 72 小时，代价只是每条多一次 5 秒连接尝试。
+_SOFT_DEAD_MARKERS = ("端口无法连接",)
 _BLOCKED_MARKERS = (
     "ERR_SSL",
     "ERR_CERT",
@@ -123,6 +126,8 @@ def classify_failure(error: str) -> str:
     text = (error or "").upper()
     if not text.strip():
         return FAILURE_TRANSIENT
+    if any(marker.upper() in text for marker in _SOFT_DEAD_MARKERS):
+        return FAILURE_BLOCKED
     if any(marker.upper() in text for marker in _DEAD_MARKERS):
         return FAILURE_DEAD
     if any(marker.upper() in text for marker in _BLOCKED_MARKERS):
@@ -642,15 +647,22 @@ def _fast_dead(host: str) -> str:
         return ""
 
 
-def _tcp_alive(host: str, port: int, timeout: float = 3.0) -> bool:
-    """端口连得上吗。只用来提前结束「必然失败」的取证，不替代浏览器。"""
+def _tcp_alive(host: str, port: int, timeout: float = 5.0, attempts: int = 2) -> bool:
+    """端口连得上吗。只用来提前结束「必然失败」的取证，不替代浏览器。
+
+    5 秒 + 一次重试：3 秒单次在跨境链路上会把慢目标误判成不可达，
+    而误判的代价是把真线索推进冷却。多花 5 秒换掉一次误杀，值。
+    """
     import socket
 
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+    for i in range(max(1, attempts)):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            if i + 1 < attempts:
+                time.sleep(0.5)
+    return False
 
 
 def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
@@ -695,7 +707,9 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
     # 等待。首次取证仍用完整超时——慢站点第一次就该被耐心对待。
     budget = float(settings.sandbox_timeout)
     if state in ("failed", "dead"):
-        budget = min(budget, 12.0)
+        # 20 秒：上一次已用满完整预算，但 12 秒对慢站太苛刻——二次超时会被
+        # 判成 blocked 冷却一天，等于把「只是慢」的站冷藏了。
+        budget = min(budget, 20.0)
     for url in reachable or urls:
         obs = get_web_sandbox().observe(url, timeout=budget)
         if obs.status or obs.html or obs.screenshot:

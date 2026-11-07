@@ -99,7 +99,8 @@ def test_dead_target_is_not_requeued_in_minutes(db, monkeypatch):
         assert asset.capture_state == "dead"
         assert asset.capture_retry_at is not None
         delay = asset.capture_retry_at - task.finished_at
-        assert delay >= timedelta(hours=70)
+        # 48 小时：新签发的域名常常要过一两天才建站，72 小时等于判死刑
+        assert delay >= timedelta(hours=40)
 
     # 冷却期内补队不能再把它捞回来
     assert capture.backfill(limit=8) == 0
@@ -313,3 +314,12 @@ def test_second_transient_failure_escalates_to_daily_cooldown(db, monkeypatch):
         assert t.error.startswith("[blocked]")
         asset = s.get(Asset, asset_id)
         assert asset.capture_retry_at is not None
+
+
+def test_port_unreachable_is_blocked_not_dead():
+    """端口连不上可能是云 WAF 或地域封锁，按 24 小时冷却而不是 48 小时判死。"""
+    from silver_sentinel.capture import FAILURE_BLOCKED, FAILURE_DEAD, classify_failure, retry_delay
+
+    assert classify_failure("端口无法连接（HTTP/HTTPS 均不通）") == FAILURE_BLOCKED
+    assert classify_failure("net::ERR_NAME_NOT_RESOLVED") == FAILURE_DEAD
+    assert retry_delay(FAILURE_BLOCKED) < retry_delay(FAILURE_DEAD)

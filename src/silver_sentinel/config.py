@@ -171,7 +171,9 @@ class Settings:
     # Chromium 要二三十秒，一天白烧几十分钟只换来同一句 ERR_NAME_NOT_RESOLVED。
     # 线上 181 条失败里 64 条是 NXDOMAIN、51 条是 SSL 握手失败，全在按 6 小时
     # 循环重试。这两类改成「隔天再看一眼」，把容量留给活着的目标。
-    capture_dead_retry_hours: int = 72
+    # 新签发的域名常常要过一两天才建站。72 小时太久，等于判了死刑；
+    # 24 小时能覆盖绝大多数「签了还没部署」的情况，代价是每条多一次连接尝试。
+    capture_dead_retry_hours: int = 48
     # 被 WAF / 证书 / 空响应挡住的目标：可能只是临时封锁，给 24 小时
     capture_blocked_retry_hours: int = 24
     # 空闲时用冷档资产「填谷」：队列没有到期任务时，每隔这么多秒取一条
