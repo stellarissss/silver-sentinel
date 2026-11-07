@@ -323,3 +323,33 @@ def test_port_unreachable_is_blocked_not_dead():
     assert classify_failure("端口无法连接（HTTP/HTTPS 均不通）") == FAILURE_BLOCKED
     assert classify_failure("net::ERR_NAME_NOT_RESOLVED") == FAILURE_DEAD
     assert retry_delay(FAILURE_BLOCKED) < retry_delay(FAILURE_DEAD)
+
+
+def test_never_captured_beats_refresh(db):
+    """从未取证的资产必须排在「到期复访」前面。
+
+    线上 3 条 pending 连续 8 分钟没进队：24 小时复访产生的大量 captured
+    资产按分数占满了 limit，新线索永远轮不到。
+    """
+    from datetime import timedelta
+
+    from silver_sentinel.capture import backfill
+    from silver_sentinel.domain import utcnow
+
+    now = utcnow()
+    with db() as s:
+        fresh = _asset(s, "brand-new.cn", score=5.0)
+        stale = _asset(s, "old-high.cn", score=80.0, capture_state="captured")
+        stale.last_capture_at = now - timedelta(days=3)
+        fresh_id = fresh.id
+
+    backfill(limit=1)
+
+    with db() as s:
+        from silver_sentinel.models import CaptureTask
+
+        ids = {
+            t.asset_id
+            for t in s.query(CaptureTask).filter(CaptureTask.state == "queued").all()
+        }
+    assert ids == {fresh_id}, f"只应排入首访资产，实际 {ids}"

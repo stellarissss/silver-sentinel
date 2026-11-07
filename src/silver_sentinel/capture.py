@@ -523,7 +523,18 @@ def backfill(limit: int = 30) -> int:
                     # 说「6 小时内不行」，结果队列空转、36 条可重试资产没人碰。
                     or_(Asset.capture_retry_at.is_not(None), ~recently_dead),
                 )
-                .order_by(tier_rank, Asset.score.desc(), Asset.last_capture_at.is_(None).desc(), Asset.first_seen.desc())
+                # 「从未取证」排在「已取证待复访」前面。
+                # 线上出现过 3 条 pending 资产连续 8 分钟没进队：24 小时复访
+                # 产生的大量 captured 资产按分数占了 limit，新线索永远轮不到，
+                # 而 doctor 报 starved、看着像队列坏了。分级仍然优先于取证状态：
+                # watch 的复访比 candidate 的首访更急。
+                .order_by(
+                    tier_rank,
+                    (Asset.capture_state == "pending").desc(),
+                    Asset.score.desc(),
+                    Asset.last_capture_at.is_(None).desc(),
+                    Asset.first_seen.desc(),
+                )
                 .limit(min(limit, room))
             )
         )
