@@ -36,6 +36,7 @@ dependencies = [
     "pypinyin>=0.51",            # 中文词根自动派生拼音变体（guohui / zhongke ...）
     "networkx>=3.2",             # 社区发现（Louvain / 连通分量）
     "socksio>=1.0",              # SOCKS5 代理（出站隔离）
+    "pillow>=10.0",              # 截图裁剪 + dHash 指纹（变更检测要用）
 ]
 
 [project.optional-dependencies]

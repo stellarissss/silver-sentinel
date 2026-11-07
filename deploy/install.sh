@@ -177,6 +177,26 @@ log "安装 $(basename "$WHEEL") ..."
 VER="$("$VENV_DIR/bin/python" -c 'import silver_sentinel as s; print(s.__version__)' 2>/dev/null || echo '?')"
 ok "已安装 silver-sentinel $VER"
 
+# 导入自检：pip 装完不等于能用。线上踩过一次 pillow 没进依赖、
+# capture 模块 import 就炸，导致 /api/capture/queue 直接 500。
+log "导入自检 ..."
+"$VENV_DIR/bin/python" - <<'PYEOF' || die "导入自检失败（缺依赖？看上面的 ModuleNotFoundError）"
+import importlib
+mods = [
+    "silver_sentinel.capture",
+    "silver_sentinel.api_extra",
+    "silver_sentinel.pipeline",
+    "silver_sentinel.monitor",
+    "silver_sentinel.risk",
+    "silver_sentinel.runtime_settings",
+    "silver_sentinel.report.bundle",
+    "silver_sentinel.discover.engine",
+]
+for m in mods:
+    importlib.import_module(m)
+print(f"  ok {len(mods)} 个核心模块可导入")
+PYEOF
+
 # ---------------------------------------------------------------- systemd
 UNIT="/etc/systemd/system/${SERVICE}.service"
 log "写入 $UNIT"

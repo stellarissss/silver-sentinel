@@ -27,7 +27,12 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - 依赖声明里有 Pillow，这里只兜底
+    # 缺 Pillow 时不要整个取证模块 import 失败（会连带 /api/capture/queue 一起 500）：
+    # 截图照存，只是算不出 dHash 指纹。
+    Image = None  # type: ignore[assignment]
 from sqlalchemy import func, select
 
 from . import runtime_settings, triage
@@ -530,6 +535,8 @@ def _content_signals(obs, facts: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _decode_qrcodes(obs) -> list[str]:
+    if Image is None:
+        return []
     try:
         from pyzbar.pyzbar import decode as qr_decode
 
@@ -657,7 +664,7 @@ def _simhash(text: str, bits: int = 64) -> str:
 
 
 def _dhash(blob: bytes) -> str:
-    if not blob:
+    if not blob or Image is None:
         return ""
     try:
         img = Image.open(io.BytesIO(blob)).convert("L").resize((9, 8), Image.LANCZOS)
