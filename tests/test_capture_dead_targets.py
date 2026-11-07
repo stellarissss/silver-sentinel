@@ -265,3 +265,20 @@ def test_fast_dead_only_trusts_nxdomain(monkeypatch):
 
     monkeypatch.setattr(dns.resolver, "resolve", lambda *_a, **_k: object())
     assert _fast_dead("alive.example.com") == ""
+
+
+def test_tcp_precheck_distinguishes_open_and_closed():
+    """端口预检只负责排除必然失败的取证，判定要保守。"""
+    import socket
+
+    from silver_sentinel.capture import _tcp_alive
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        assert _tcp_alive("127.0.0.1", port, timeout=1)
+    finally:
+        srv.close()
+    assert not _tcp_alive("127.0.0.1", port, timeout=1)

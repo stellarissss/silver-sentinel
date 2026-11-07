@@ -102,6 +102,7 @@ _DEAD_MARKERS = (
     "NXDOMAIN",
     "无法解析",
     "无可访问地址",
+    "端口无法连接",
 )
 _BLOCKED_MARKERS = (
     "ERR_SSL",
@@ -636,6 +637,17 @@ def _fast_dead(host: str) -> str:
         return ""
 
 
+def _tcp_alive(host: str, port: int, timeout: float = 3.0) -> bool:
+    """端口连得上吗。只用来提前结束「必然失败」的取证，不替代浏览器。"""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
     with session_scope() as s:
         asset = s.get(Asset, asset_id)
@@ -656,9 +668,24 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         return {"ok": False, "reason": dead}
 
     urls = _candidate_urls(kind, value)
+    # 端口级预检：443 和 80 都连不上时，浏览器必然要各等一个 30 秒超时。
+    # 线上失败清单里大量 ERR_CONNECTION_REFUSED / 不可达就是这类，先花
+    # 最多 6 秒排除，把时间留给能打开的页面。
+    reachable = [
+        u for u in urls
+        if _tcp_alive(
+            _host_of(u),
+            443 if u.lower().startswith("https://") else 80,
+        )
+    ]
+    if urls and not reachable:
+        reason = "端口无法连接（HTTP/HTTPS 均不通）"
+        _set_capture_state(asset_id, "dead", reason)
+        return {"ok": False, "reason": reason}
+
     obs = None
     last_error = ""
-    for url in urls:
+    for url in reachable or urls:
         obs = get_web_sandbox().observe(url)
         if obs.status or obs.html or obs.screenshot:
             break
