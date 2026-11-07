@@ -1313,6 +1313,7 @@ const CLUSTER_LABEL = {
   investment: "投资理财", project_scam: "工程/项目骗局", honorific: "称谓敬语",
   channel: "传播渠道", payment: "支付收款", ai_hype: "AI 概念", collectible: "收藏品",
   travel_elder: "老年旅游", variant: "仿冒变体", brand: "品牌词", generic: "通用词",
+  sales_jargon: "运营黑话",
 };
 
 function renderLexicon(lib) {
