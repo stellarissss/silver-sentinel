@@ -170,23 +170,40 @@ class WebSandbox:
                 return self._browser
             from playwright.sync_api import sync_playwright
 
-            self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-background-networking",
-                    "--disable-features=NetworkPrediction,Translate",
-                    # WebRTC 是浏览器最容易漏内网/真实出口的地方：强制只走代理 UDP
-                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-                    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-                    # 去掉 navigator.webdriver 这个最廉价的机器人标记
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
+            try:
+                self._playwright = sync_playwright().start()
+                self._browser = self._playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-background-networking",
+                        "--disable-features=NetworkPrediction,Translate",
+                        # WebRTC 是浏览器最容易漏内网/真实出口的地方：强制只走代理 UDP
+                        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                        # 去掉 navigator.webdriver 这个最廉价的机器人标记
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 启动失败必须把现场擦干净：sync_playwright().start() 会在当前线程
+                # 留下一个仍在跑的 event loop，如果不清掉，下一次 start() 会直接报
+                # 「Sync API inside the asyncio loop」，然后永久卡死在这个线程上。
+                # 线上就踩过：浏览器装在 root 的 ~/.cache，服务却以 silver 身份跑，
+                # launch 失败 → 线程被毒化 → 之后每次取证都报这句看不懂的话。
+                self.last_error = (
+                    f"{type(exc).__name__}: {exc}"
+                    "（检查 PLAYWRIGHT_BROWSERS_PATH 与 `playwright install chromium`）"
+                )[:500]
+                self._playwright = None
+                self._browser = None
+                self.available = False
+                raise RuntimeError(self.last_error) from exc
+
             self.available = True
+            self.last_error = ""
             return self._browser
 
     def observe(self, url: str, *, timeout: float | None = None) -> WebObservation:

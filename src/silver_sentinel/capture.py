@@ -300,12 +300,29 @@ def capture_asset(asset_id: int) -> dict[str, Any]:
     except RuntimeError:  # 线程池已关闭（进程在退）
         return {"ok": False, "reason": "取证线程池已关闭"}
     try:
-        return future.result(timeout=_CAPTURE_TIMEOUT)
+        result = future.result(timeout=_CAPTURE_TIMEOUT)
     except FuturesTimeout:
         return {"ok": False, "busy": True, "reason": "取证超时，队列可能卡住了"}
     except Exception as exc:  # noqa: BLE001 线程里的异常不该变成 500
         log.exception("取证线程异常 asset=%s", asset_id)
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+    else:
+        # 浏览器起不来时，这个线程已经被 Playwright 留下的 event loop 毒化了，
+        # 留在池里只会让后面每一次取证都报同一句话。换一个新线程。
+        text = f"{result.get('reason') or ''}{result.get('error') or ''}"
+        if "浏览器不可用" in text or "asyncio loop" in text:
+            _reset_capture_pool()
+        return result
+
+
+def _reset_capture_pool() -> None:
+    global _CAPTURE_POOL
+    old = _CAPTURE_POOL
+    _CAPTURE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ss-capture")
+    try:
+        old.shutdown(wait=False, cancel_futures=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _capture_asset_locked(asset_id: int) -> dict[str, Any]:

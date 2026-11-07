@@ -197,6 +197,28 @@ for m in mods:
 print(f"  ok {len(mods)} 个核心模块可导入")
 PYEOF
 
+# ---------------------------------------------------------------- 浏览器
+# Playwright 的 chromium 默认装进「执行安装的那个用户」的 ~/.cache。
+# 服务是以 $APP_USER 身份跑的，单元又开了 ProtectHome=true ——
+# 浏览器留在 root 家目录时服务永远找不到，取证会一路失败，
+# 而报错只是「浏览器不可用」，不说为什么。所以固定装到应用目录下。
+PW_PATH="$APP_DIR/ms-playwright"
+ensure_env PLAYWRIGHT_BROWSERS_PATH "$PW_PATH"
+install -d -m 0755 "$PW_PATH"
+if [ -n "$(ls -A "$PW_PATH" 2>/dev/null || true)" ]; then
+  ok "chromium 已就位（$PW_PATH）"
+elif "$VENV_DIR/bin/python" -c 'import playwright' >/dev/null 2>&1; then
+  log "安装 chromium（约 150MB，只需一次）"
+  if PLAYWRIGHT_BROWSERS_PATH="$PW_PATH" "$VENV_DIR/bin/python" -m playwright install chromium >/dev/null 2>&1; then
+    ok "chromium 已安装"
+  else
+    warn "chromium 安装失败：网页取证会退化为「无截图」，可稍后重试"
+  fi
+else
+  warn "未安装 playwright（可选依赖）：网页取证不可用，pip install '.[sandbox]' 后重跑本脚本"
+fi
+chown -R "$APP_USER:$APP_USER" "$PW_PATH" 2>/dev/null || true
+
 # ---------------------------------------------------------------- systemd
 UNIT="/etc/systemd/system/${SERVICE}.service"
 log "写入 $UNIT"
