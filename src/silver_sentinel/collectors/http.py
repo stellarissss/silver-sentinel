@@ -96,7 +96,9 @@ class HttpClient:
 
         guard = get_guard()
         kind = guard.preflight(url)          # 可能抛 EgressBlocked
-        headers = guard.headers_for(url)
+        # 目标受众是手机用户：桌面 UA 在仿冒站上经常只拿到「访问受限」，
+        # 实测移动/桌面正文量差 15 倍。可用 SILVER_HTTP_MOBILE_UA=0 关掉。
+        headers = guard.headers_for(url, mobile=settings.http_mobile_ua)
         headers.update(kwargs.pop("headers", {}) or {})
 
         last_error: Exception | None = None

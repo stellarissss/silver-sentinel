@@ -803,6 +803,11 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         if obs.title:
             facts["page_title"] = obs.title[:200]
         facts["page_text_len"] = len(obs.text or "")
+        # 正文过短通常不是「没内容」，是「内容在图片/JS 里」——这类页面的
+        # 词库分一定偏低，不能据此判定无害。记下来，给 ML 当特征，
+        # 也让界面能提示「纯图落地页，需看截图」。
+        if facts["page_text_len"] < 300:
+            facts["low_text_page"] = True
         facts["web_engine"] = obs.engine
         facts["web_status"] = obs.status
         facts["web_egress"] = obs.egress
@@ -839,6 +844,39 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         content_signals = _content_signals(obs, facts)
         if content_signals:
             facts["content_rule_hits"] = [s["rule_id"] for s in content_signals]
+
+        # ---- 自称与冒充：词库看「用了什么词」，这里看「说自己是哪个机构」。
+        # 这是词库识别不了的：骗子的用词和正规站完全一样（补贴/养老/民政），
+        # 但它必须声称自己是财政部，而财政部的官方域名只有一个。
+        try:
+            from .claim import analyze_html
+
+            claim_host = _host_of(obs.final_url or obs.url) or probe_host
+            claim = analyze_html(obs.html or "", claim_host).as_dict()
+            facts["claim"] = claim
+            # 页面自己写的备案号，和「本域名实际备案」是两件事。
+            # 先记下来，由 license_owners 用本地缓存比对，不在这里联网。
+            if claim.get("icp"):
+                facts["claimed_icp"] = claim["icp"]
+                # 备案号 ↔ 域名的绑定关系是确定性的：号是真的，但它不属于你。
+                # 只查本地缓存（ICP 缓存 30 天），不在这里联网。
+                try:
+                    from .enrich.icp import get_icp
+                    from .normalize import registrable_domain
+
+                    owners = get_icp().license_owners(claim["icp"])
+                    cur = registrable_domain(claim_host)
+                    if owners and cur and cur not in owners:
+                        claim["verdict"] = "fake_icp"
+                        claim["level"] = 4
+                        claim["reasons"] = [
+                            f"页面备案号 {claim['icp']} 归属 {owners[0]}，与当前域名不一致"
+                        ]
+                        facts["claim"] = claim
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("备案号比对失败：%s", exc)
+        except Exception as exc:  # noqa: BLE001 抽取失败不能影响取证
+            log.debug("自称抽取失败 %s：%s", asset_id, exc)
 
         meta["facts"] = facts
         meta["web_observation"] = {

@@ -378,11 +378,84 @@ def cmd_doctor(args) -> int:
                 f"CT 日志落后 {discover['lag']} 条，发现产能可能不足（不触发重启）"
             )
 
+    # 备案链路：它是最容易「悄悄死掉」的一环——服务没起、地址没配，
+    # 查询全部返回 unknown，而外观上一切正常。这里只报警、不触发重启
+    # （重启解决不了 docker 容器没起，只会白白打断取证）。
+    try:
+        from .enrich.icp import get_icp
+
+        st = get_icp().status()
+        result["icp"] = {
+            "enabled": st.get("enabled"),
+            "ready": settings.icp_ready,
+            "available": st.get("available"),
+            "last_error": st.get("last_error"),
+            "cache_days": st.get("cache_days"),
+        }
+        if settings.icp_enabled and not settings.icp_ready:
+            result["icp_warning"] = (
+                "备案查询未配置（SILVER_ICP_API 为空）：冒充判定的备案号核验不可用"
+            )
+        elif st.get("available") is False:
+            result["icp_warning"] = f"备案服务不可达：{st.get('last_error') or '探测失败'}"
+    except Exception as exc:  # noqa: BLE001
+        result["icp"] = {"error": str(exc)[:160]}
+
     result["ok"] = not result["problems"]
     if args.quiet and result["ok"]:
         return 0
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["ok"] else 1
+
+
+def cmd_whitelist(args) -> int:
+    """白名单自检：规模、某个域名是不是政府/媒体、机构对应的官方域名。"""
+    from .whitelist import get_whitelist
+
+    wl = get_whitelist()
+    if args.check:
+        rows = [
+            {
+                "host": h,
+                "government": wl.is_government(h),
+                "media": wl.is_media(h),
+                "agency_domains": wl.agency_domains(h),
+            }
+            for h in args.check
+        ]
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    print(json.dumps(wl.stats(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_claim(args) -> int:
+    """对一条 URL / 一段 HTML 做「自称与冒充」分析。
+
+    这是排查误报最快的入口：不用跑完整流水线，直接看它自称了谁、
+    官方域名是什么、判定落在哪一档。
+    """
+    from .claim import analyze_html, analyze_text
+
+    if args.html_file:
+        html = open(args.html_file, encoding="utf-8", errors="ignore").read()
+        report = analyze_html(html, args.host or "")
+    elif args.text:
+        report = analyze_text(args.text, args.host or "", title=args.title or "")
+    elif args.url:
+        from urllib.parse import urlsplit
+
+        from .collectors.http import HttpClient
+
+        html = HttpClient().get_text(args.url) or ""
+        host = args.host or (urlsplit(args.url).hostname or "")
+        report = analyze_html(html, host)
+    else:
+        print(json.dumps({"ok": False, "error": "需要 url / --text / --html-file 之一"},
+                         ensure_ascii=False))
+        return 2
+    print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
+    return 0
 
 
 def cmd_brief(args) -> int:
@@ -747,6 +820,12 @@ def cmd_icp(args) -> int:
     from .normalize import collapse_host
 
     init_db()
+    if getattr(args, "license", ""):
+        # 按备案号反查：这是抓「伪造备案」的正确姿势。
+        # 查域名只能得到「有/没有」，查备案号能直接得到「这个号属于谁」。
+        out = get_icp().lookup_license(args.license)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0 if out.get("status") in ("registered", "unregistered") else 1
     if not settings.icp_ready:
         print(json.dumps({"ok": False, "error": "未配置 SILVER_ICP_API，先起 ICP_Query 再填地址"},
                          ensure_ascii=False, indent=2))
@@ -1125,6 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="并发数；工信部对突发很敏感，建议 1-2，默认 2")
     p.add_argument("--refresh", action="store_true", help="忽略缓存重新查")
     p.add_argument("--dry-run", action="store_true", help="只列出将查询的域名")
+    p.add_argument("--license", default="", help="按备案号反查归属域名（抓伪造备案）")
     p.set_defaults(func=cmd_icp)
 
     # ------------------------------------------------------------ 证据与副本
@@ -1167,6 +1247,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-age", type=int, default=300, help="心跳最大允许年龄（秒）")
     p.add_argument("--quiet", action="store_true", help="正常时不输出")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("whitelist", help="政府/媒体白名单自检")
+    p.add_argument("--check", nargs="*", metavar="HOST", help="检查这些域名是否在白名单")
+    p.set_defaults(func=cmd_whitelist)
+
+    p = sub.add_parser("claim", help="分析页面的「自称」，判定是否冒充政府机构")
+    p.add_argument("url", nargs="?", help="要抓取的 URL")
+    p.add_argument("--host", help="覆盖判定用的域名")
+    p.add_argument("--text", help="直接分析一段文本（不抓页面）")
+    p.add_argument("--html-file", help="分析本地 HTML 文件")
+    p.add_argument("--title", help="配合 --text 使用的标题")
+    p.set_defaults(func=cmd_claim)
 
     p = sub.add_parser("brief", help="侦查态势：一段时间内的发现 / 取证 / 证据增量")
     p.add_argument("--hours", type=int, default=24, help="统计窗口（小时），默认 24")

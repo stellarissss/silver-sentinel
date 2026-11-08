@@ -175,6 +175,39 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
     if facts.get("official_listed") or verdict == "confirmed":
         return TriageDecision(TIER_CONFIRMED, ["命中官方涉诈通报"])
 
+    # 自称/冒充：词库看「用了什么词」，这里看「说自己是哪个机构」。
+    # 后者可核验——部委的官方域名只有一个，对不上就是冒充。
+    claim = facts.get("claim")
+    claim = claim if isinstance(claim, dict) else {}
+    claim_verdict = str(claim.get("verdict") or "")
+    if claim_verdict in ("fake_site_id", "fake_icp"):
+        reason = (
+            f"伪造政府网站标识码 {claim.get('site_id') or ''}（该码只发给 .gov.cn），需人工确认"
+            if claim_verdict == "fake_site_id"
+            else "；".join((claim.get("reasons") or ["页面备案号与域名不一致"])[:1])
+        )
+        return TriageDecision(TIER_WATCH, [reason], urgent=True)
+    if claim_verdict == "fake_site_id":
+        return TriageDecision(
+            TIER_WATCH,
+            [f"伪造政府网站标识码 {claim.get('site_id') or ''}（该码只发给 .gov.cn），需人工确认"],
+            urgent=True,
+        )
+    if claim_verdict == "impersonation":
+        who = (claim.get("agencies") or [""])[0]
+        domains = (claim.get("official_domains") or {}).get(who) or [""]
+        return TriageDecision(
+            TIER_WATCH,
+            [f"冒充「{who}」，该机构官方域名为 {domains[0]}"],
+            urgent=True,
+        )
+    if claim_verdict == "fabricated_agency":
+        return TriageDecision(TIER_CANDIDATE, ["自称政府库中不存在的国家机构"])
+    if claim_verdict == "legit" and score < 80:
+        # 白名单命中：政府站/正规媒体不该占据待处理队列前排。
+        # 不删除——记录留着，改版或域名易主后可复查。
+        return TriageDecision(TIER_COLD, ["命中政府/媒体白名单"])
+
     urgent, urgency_reasons = _urgency(facts, asset)
     hard = _hard_evidence(facts, score, verdict)
 

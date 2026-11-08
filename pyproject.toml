@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "silver-sentinel"
-version = "1.8.3"
+version = "1.9.0"
 description = "银发哨兵：涉老诈骗的持续发现、动态取证、图谱归因与处置闭环"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -68,7 +68,7 @@ Issues = "https://github.com/stellarissss/silver-sentinel/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-silver_sentinel = ["rules/*.yaml", "data/*.yaml", "web/templates/*", "web/static/*"]
+silver_sentinel = ["rules/*.yaml", "data/*.yaml", "data/*.gz", "data/*.txt", "web/templates/*", "web/static/*"]
 # 12377 的类别树是运行时读的，漏了会在举报第一步就 FileNotFoundError
 "silver_sentinel.report" = ["data/*.json"]
 

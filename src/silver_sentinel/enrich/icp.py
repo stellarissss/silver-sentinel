@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
@@ -39,7 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..config import settings
 from ..db import session_scope
@@ -367,6 +368,74 @@ class ICPClient:
         if res.status != "unknown":
             self._cache_put(res)
         return res
+
+    # ------------------------------------------------------------ 备案号反查
+    @staticmethod
+    def normalize_license(value: str) -> str:
+        return re.sub(r"\s+", "", (value or "")).replace("－", "-")
+
+    def license_owners(self, license: str, *, limit: int = 20) -> list[str]:
+        """本地缓存里，这个备案号挂在哪些域名下。
+
+        诈骗站会伪造备案号：实测 `np4w53.cn` 与 `hksm38.com.cn` 两个不同域名
+        共用「京ICP备202600001号-1」，而且页面 JS 用 `Math.random()` 现生成。
+        查「域名有没有备案」永远只能得到「没有」，和亿万没备案的域名混在一起；
+        查「这个号属于谁」才能一击命中伪造。
+
+        只读本地缓存，不联网——取证线程不能被一次 30 秒的验证码识别拖住。
+        联网版是 `lookup_license()`，给 CLI 的离线回填用。
+        """
+        lic = self.normalize_license(license)
+        if not lic:
+            return []
+        try:
+            with session_scope() as s:
+                rows = s.execute(
+                    select(ICPCache.domain)
+                    .where(func.replace(ICPCache.license, " ", "") == lic)
+                    .limit(limit)
+                ).all()
+                return [r[0] for r in rows if r[0]]
+        except Exception as exc:  # noqa: BLE001 缓存坏了不能影响判定
+            log.debug("备案号缓存查询失败：%s", exc)
+            return []
+
+    def lookup_license(self, license: str) -> dict[str, Any]:
+        """按备案号联网反查归属域名。给 `silver-sentinel icp --license` 用。"""
+        lic = self.normalize_license(license)
+        out: dict[str, Any] = {"license": lic, "domains": [], "status": "unknown", "error": ""}
+        if not lic:
+            out["error"] = "备案号为空"
+            return out
+        if not settings.icp_ready:
+            out["error"] = "未配置 SILVER_ICP_API"
+            return out
+        if not self.limiter.acquire(timeout=20.0):
+            out["error"] = "限流等待超时"
+            return out
+        try:
+            payload = self._get(f"{self.base}/query/web?search={urllib.parse.quote(lic)}")
+            failure = _payload_error(payload)
+            if failure:
+                out["error"] = failure
+                return out
+            domains: list[str] = []
+            for row in _iter_records(payload):
+                d = _pick(row, "domain").lower()
+                if d and d not in domains:
+                    domains.append(d)
+            for d in domains:
+                self._cache_put(
+                    ICPResult(domain=d, status="registered", license=lic,
+                              entity=_pick(_iter_records(payload)[0], "entity") if domains else "")
+                )
+            out["domains"] = domains
+            out["status"] = "registered" if domains else "unregistered"
+        except urllib.error.HTTPError as exc:
+            out["error"] = f"HTTP {exc.code}"
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = f"{type(exc).__name__}: {str(exc)[:100]}"
+        return out
 
     # ------------------------------------------------------------ 违法违规名单
     def _check_violation(self, domain: str) -> dict[str, Any]:

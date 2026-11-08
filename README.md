@@ -146,6 +146,12 @@ silver-sentinel health                            # 进程内能力 + 取证队�
 silver-sentinel doctor                            # 存活自检（看门狗用，异常退出码 1）
 silver-sentinel brief --hours 24                  # 侦查态势：发现/取证/证据增量，断了就返回 1
 
+# 身份核验（白名单 + 冒充判定）
+silver-sentinel whitelist                          # 白名单规模与加载状态
+silver-sentinel whitelist --check www.mof.gov.cn np4w53.cn
+silver-sentinel claim https://example.com          # 抽「自称」，判是否冒充政府机构
+silver-sentinel icp --license 京ICP备202600001号-1  # 备案号反查（抓伪造备案）
+
 # 证据可靠性
 silver-sentinel log verify                        # 逐条重算哈希链
 silver-sentinel log tail -n 30                    # 看最近发生了什么
@@ -495,7 +501,9 @@ curl -N :8000/api/stream       # SSE：发现流 / 周期事件
 
 ## 已知局限
 
-- **ICP 备案**依赖自建服务（`icpquery-mcp` / `ICP_Query_lite` / WebScan 任一）。未配置时按「未知」处理，不参与加分——宁可少判，不可错判。且 `beian.miit.gov.cn` 在部分机房不可达，需要前置代理。
+- **ICP 备案**依赖自建服务（`ICP_Query` / `icpquery-mcp` 任一）。未配置时按「未知」处理，不参与加分——宁可少判，不可错判。且 `beian.miit.gov.cn` 在部分机房不可达，需要前置代理。`doctor` 现在会报这一项，不会再出现「配过、悄悄失效、没人发现」。
+- **白名单只做验证，不做过滤**。13k 政府站 + 352 家媒体，覆盖率约 0.1%；53kf、易歌科技这类正规站都不在名单里。它只回答「它自称的那个机构，官方域名是不是它」。
+- **冒充判定覆盖不到「不冒充政府」的诈骗**（荐股、保健品、刷单）。这条路留给后续的用途分类模型，见 `docs/24-从词库到模型演进规划.md`。
 - **微信生态**（小程序、公众号、群聊）无法自动化采集，只能录入名称后做文本与名单匹配，这部分需要人工配合截图。
 - **CT 日志可达性因地区而异**：`nessie/yeti.ct.digicert.com` 在部分环境解析失败，程序会自动换下一个并记日志，不会卡死在某一个上。
 - **沙箱不等于真实设备**：Playwright 跑的是桌面 Chromium，移动端 UA 与 WebView 行为有差异；APK 动态分析需要 MobSF 或真机，否则只有静态推演。

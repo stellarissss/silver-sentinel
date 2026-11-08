@@ -74,6 +74,101 @@ def _keyword_facts(asset: Asset, corpus: str) -> dict[str, Any]:
     }
 
 
+def _claim_signals(merged: dict[str, Any]) -> list[Any]:
+    """把「自称与冒充」转成信号。
+
+    为什么不写成 YAML 规则：claim 是结构化事实（谁自称、官方域名是谁），
+    不是关键词条件；而且权重必须压倒词库——伪造政府网站标识码这一条，
+    比命中一百个「补贴」都硬。
+    """
+    from ..domain import Signal
+
+    claim = merged.get("claim") or {}
+    if not isinstance(claim, dict):
+        return []
+    verdict = str(claim.get("verdict") or "")
+    site_id = claim.get("site_id") or ""
+    agencies = claim.get("agencies") or []
+    domains = claim.get("official_domains") or {}
+    who = agencies[0] if agencies else ""
+    official = (domains.get(who) or [""])[0] if who else ""
+
+    if verdict in ("fake_site_id", "fake_icp"):
+        return [
+            Signal(
+                rule_id="IMP-001" if verdict == "fake_site_id" else "IMP-004",
+                category="impersonation",
+                title="伪造政府网站标识码" if verdict == "fake_site_id" else "伪造备案号",
+                weight=96.0,
+                confidence=0.99 if verdict == "fake_site_id" else 0.9,
+                detail=(f"非政府域名标注 {site_id}（该码只发给 .gov.cn）"
+                        if verdict == "fake_site_id"
+                        else "；".join((claim.get("reasons") or [])[:1])[:200]),
+                source="claim",
+            )
+        ]
+    if verdict == "impersonation":
+        return [
+            Signal(
+                rule_id="IMP-002",
+                category="impersonation",
+                title="冒充政府机构",
+                weight=78.0,
+                confidence=0.9,
+                detail=f"自称「{who}」，该机构官方域名为 {official}",
+                source="claim",
+            )
+        ]
+    if verdict == "fabricated_agency":
+        return [
+            Signal(
+                rule_id="IMP-003",
+                category="impersonation",
+                title="自称不存在的国家机构",
+                weight=62.0,
+                confidence=0.62,
+                detail="；".join((claim.get("reasons") or [])[:2])[:200],
+                source="claim",
+            )
+        ]
+    return []
+
+
+def _apply_claim(assessment: Any, merged: dict[str, Any], thresholds: dict[str, float]) -> None:
+    """把冒充结论叠加到评分上。
+
+    claim 不给 confirmed——「机器不给 confirmed」是既有约束（那条档要进举报链）。
+    伪造标识码给 95 分 + high_risk，triage 会把它顶进 watch 并标 urgent，
+    人工一眼确认即可。
+    """
+    claim = merged.get("claim") or {}
+    if not isinstance(claim, dict):
+        return
+    verdict = str(claim.get("verdict") or "")
+    signals = _claim_signals(merged)
+    if signals:
+        assessment.signals.extend(signals)
+    if verdict in ("fake_site_id", "fake_icp"):
+        assessment.score = max(float(assessment.score or 0), 95.0)
+        assessment.verdict = "high_risk"
+        assessment.confidence = max(float(assessment.confidence or 0), 0.95)
+        assessment.notes.append("伪造政府网站标识码，按最高优先级处置")
+    elif verdict == "impersonation":
+        assessment.score = max(float(assessment.score or 0), 70.0)
+        if assessment.verdict in ("insufficient", "low"):
+            assessment.verdict = "high_risk"
+        assessment.confidence = max(float(assessment.confidence or 0), 0.85)
+        assessment.notes.append("冒充政府机构，优先人工核验")
+    elif verdict == "fabricated_agency":
+        assessment.score = max(float(assessment.score or 0), 55.0)
+        assessment.confidence = max(float(assessment.confidence or 0), 0.7)
+    elif verdict == "legit":
+        # 政府/媒体白名单命中：不是「无罪」，是「不值得排在前面」。
+        # 保留分数上限 20，让它落回冷存，但记录仍在，改版后可复查。
+        assessment.score = min(float(assessment.score or 0), 20.0)
+        assessment.notes.append("命中政府/媒体白名单")
+
+
 def assess_now(
     asset: Asset,
     *,
@@ -115,6 +210,9 @@ def assess_now(
     )
     # 维度覆盖写进 facts：triage 要据此判断「冒充 × 说服」的结构组合，
     # 纯计算入口（不落库）也必须能拿到，否则测试与线上走两套逻辑。
+    merged["coverage"] = dict(assessment.coverage)
+    # 自称/冒充是结构化事实，不走 YAML 规则，直接叠加到评分上。
+    _apply_claim(assessment, merged, ruleset.thresholds)
     merged["coverage"] = dict(assessment.coverage)
     return assessment, merged
 

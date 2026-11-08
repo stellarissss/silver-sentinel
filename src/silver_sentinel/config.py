@@ -125,6 +125,9 @@ class Settings:
     icp_cooldown_seconds: float = 900.0
     # 只对这些分级的目标查询备案，避免无差别扫描
     icp_tiers: str = "candidate,watch,confirmed"
+    # 取证默认移动 UA。目标受众是手机用户，很多落地页对桌面 UA 直接返回
+    # 「访问受限」——实测 np4w53.cn 桌面 26 字、移动 423 字。
+    http_mobile_ua: bool = True
 
     # ---------------------------------------------------------------- 图
     graph_enabled: bool = True
@@ -330,6 +333,7 @@ class Settings:
         self.icp_max_failures = _int("SILVER_ICP_MAX_FAILURES", self.icp_max_failures)
         self.icp_cooldown_seconds = _float("SILVER_ICP_COOLDOWN", self.icp_cooldown_seconds)
         self.icp_tiers = _str("SILVER_ICP_TIERS", self.icp_tiers)
+        self.http_mobile_ua = _bool("SILVER_HTTP_MOBILE_UA", self.http_mobile_ua)
 
         self.graph_enabled = _bool("SILVER_GRAPH_ENABLED", True)
         self.graph_rebuild_minutes = max(
