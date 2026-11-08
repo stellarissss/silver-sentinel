@@ -607,8 +607,13 @@ def cmd_brief(args) -> int:
 
     from sqlalchemy import func, select
 
+    from .db import init_db
     from .domain import utcnow as _utcnow
     from .models import CaptureTask, Evidence
+
+    # 新装或数据目录被清过时，先建表：brief 是运维第一入口，
+    # 不该因为「表还没建」直接抛 sqlite3 异常。
+    init_db()
 
     hours = max(1, args.hours)
     since = _utcnow() - timedelta(hours=hours)

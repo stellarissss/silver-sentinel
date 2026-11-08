@@ -388,7 +388,14 @@ def rescore(
     }
     asset.meta = meta
 
-    decision = triage.apply(asset, facts=merged, allow_downgrade=allow_downgrade)
+    # 用途闸门产生的降级必须能落地：资产可能先被判进 candidate（只有域名时），
+    # 取证后才发现是客服站/论坛。triage 默认只允许升级，这里为闸门开一次口子
+    # ——但 apply 内部仍会排除 confirmed 与人工复核过的资产。
+    purpose = merged.get("purpose")
+    gate_downgrade = isinstance(purpose, dict) and bool(purpose.get("suppressed"))
+    decision = triage.apply(
+        asset, facts=merged, allow_downgrade=allow_downgrade or gate_downgrade
+    )
     session.flush()
 
     changed = abs(float(asset.score or 0) - before["score"]) >= 0.05 or asset.tier != before["tier"]

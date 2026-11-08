@@ -277,3 +277,30 @@ def test_fuse_respects_whitelist_over_model():
     rule = PurposeResult(purpose="government", confidence=1.0, source="rule")
     out = fuse(rule, 0.99, _probs(0.99), is_government=True)
     assert out.purpose == "government"
+
+
+# ---------------------------------------------------------------- 降级能落地
+
+def test_rescore_lets_purpose_gate_downgrade(fresh_db):
+    """取证后才发现是客服站：必须能把它从 candidate 降到 cold。
+
+    triage 默认只允许升级（防止一次采集失败把 confirmed 刷回候选），
+    但用途闸门是确定性结论，不开口子就会「判出来了却降不下去」。
+    """
+    from silver_sentinel.db import session_scope
+    from silver_sentinel.scoring.reassess import rescore
+
+    with session_scope() as session:
+        asset = Asset(kind="domain", value="cs-demo.cn", normalized="cs-demo.cn",
+                      tier=TIER_CANDIDATE, score=30.0, verdict="low",
+                      meta={"triaged": True})
+        session.add(asset)
+        session.flush()
+        facts = {
+            "purpose": {"purpose": "customer_service", "label": "客服系统",
+                        "confidence": 0.9, "suppressed": True,
+                        "suppressed_reason": "用途为「客服系统」"},
+            "page_text_len": 200,
+        }
+        rescore(session, asset, facts=facts, text="在线客服 工单 坐席")
+        assert asset.tier == TIER_COLD
