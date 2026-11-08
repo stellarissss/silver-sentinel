@@ -956,7 +956,9 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         apk_info = _maybe_download_apk(asset_id, apk_hints, obs.final_url or obs.url, tier)
         if apk_info.get("ok"):
             evidence_written.append("apk")
-            _apply_apk_signal(asset_id)
+        # 下载失败也要走一遍：`apk_too_large` / `apk_unparsed` 是「有包但没拿到」
+        # 的证据，分级必须知道。只在成功时调用等于把这类站当成「没有安装包」。
+        _apply_apk_signal(asset_id)
 
     # ---- 指纹与变更
     changes = _record_snapshot(asset_id, obs, facts, apk_info)
@@ -1274,6 +1276,15 @@ def _apply_apk_signal(asset_id: int) -> None:
             f = meta.get("facts") or {}
             if f.get("apk_too_large") or f.get("apk_unparsed"):
                 triage.apply(asset, facts=f)
+                note = ""
+                if f.get("apk_too_large"):
+                    size = (f.get("apk_too_large") or {}).get("size_mb")
+                    note = f"分发 {size}MB 安装包（超自动下载上限，需人工取样）"
+                elif f.get("apk_unparsed"):
+                    note = "安装包对抗静态分析（manifest 加密/伪装）"
+                if note and note not in (asset.discovery_reason or ""):
+                    base = asset.discovery_reason or ""
+                    asset.discovery_reason = (base + "；" if base else "") + note
                 log.info("安装包未取得但需保留 asset=%s too_large=%s unparsed=%s",
                          asset_id, bool(f.get("apk_too_large")), bool(f.get("apk_unparsed")))
             return
