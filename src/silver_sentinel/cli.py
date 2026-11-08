@@ -753,6 +753,26 @@ def cmd_brief(args) -> int:
     return 0 if not problems else 1
 
 
+def cmd_eval_production(args) -> int:
+    """只读重评。上线前用它看「新规则会动谁」，比种子集上的准确率可信。"""
+    from .evalx import main as eval_main
+
+    argv: list[str] = []
+    if args.tier:
+        argv += ["--tier", args.tier]
+    if args.limit:
+        argv += ["--limit", str(args.limit)]
+    if args.no_evidence:
+        argv.append("--no-evidence")
+    if args.allow_downgrade:
+        argv.append("--allow-downgrade")
+    if args.out:
+        argv += ["--out", args.out]
+    if args.json:
+        argv.append("--json")
+    return eval_main(argv)
+
+
 def cmd_rescore(args) -> int:
     """用已取到的证据重算评分。
 
@@ -1488,6 +1508,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="连没有正文的资产也重算")
     p.add_argument("--retier", action="store_true", help="允许降档（规则口径变更后重新定级）")
     p.set_defaults(func=cmd_rescore)
+
+    p = sub.add_parser("eval-production", help="只读重评：新规则会把谁升档、把谁降档")
+    p.add_argument("--tier", default="", help="只看某个档位，逗号分隔")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--no-evidence", action="store_true", help="不补算证据（域名级快评）")
+    p.add_argument("--allow-downgrade", action="store_true", help="模拟 rescore --retier")
+    p.add_argument("--out", default="", help="逐条结果写 JSONL")
+    p.add_argument("--json", action="store_true", help="只输出 JSON")
+    p.set_defaults(func=cmd_eval_production)
 
     p = sub.add_parser("serve", help="启动 Web 控制台")
     p.add_argument("--host", default="", help="默认取 SILVER_WEB_HOST，未设则 127.0.0.1")
