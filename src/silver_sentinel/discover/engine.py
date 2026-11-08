@@ -53,6 +53,7 @@ from ..models import (
 from ..normalize import collapse_host
 from .ct import CertObservation, CertStreamClient, CTLogFollower, CtrlShSearch
 from .dnsprobe import DNSProbe, SeedGenerator
+from .harvest import EXTERNAL_SOURCES, Harvester
 from .keywords import get_library
 
 log = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ class DiscoverStats:
     cert_siblings: int = 0
     cert_cluster: int = 0
     cold_promoted: int = 0
+    harvested: int = 0
     started_at: float = field(default_factory=time.time)
 
     def as_dict(self) -> dict[str, Any]:
@@ -103,6 +105,7 @@ class DiscoverStats:
             "cert_siblings": self.cert_siblings,
             "cert_cluster": self.cert_cluster,
             "cold_promoted": self.cold_promoted,
+            "harvested": self.harvested,
             "uptime_seconds": round(uptime, 1),
             # 这两个数以前混在一起叫 rate_per_min，显示成 1.7/分，
             # 看起来像「系统几乎没在工作」——其实那是入池速度，不是采集速度。
@@ -151,6 +154,7 @@ class DiscoveryEngine:
         self._last_flush = time.time()
         self._ct_sh = CtrlShSearch()
         self._ct_sh_last: dict[str, float] = {}
+        self._harvester: Harvester | None = None
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -172,6 +176,12 @@ class DiscoveryEngine:
             self._threads.append(
                 threading.Thread(target=self._flush_loop, name="discover-flush", daemon=True)
             )
+            if settings.harvest_enabled:
+                self._threads.append(
+                    threading.Thread(
+                        target=self._harvest_loop, name="discover-harvest", daemon=True
+                    )
+                )
             self._seeds = SeedGenerator()
             self._dns = DNSProbe(settings.data_dir / "dns_cache.json")
 
@@ -428,6 +438,71 @@ class DiscoveryEngine:
             self._stop.wait(45)
 
     # ------------------------------------------------------------ 落库
+    # ------------------------------------------------------------ 外部线索
+    def _harvest_loop(self) -> None:
+        """按话术轮询外部索引（urlscan 标题检索）。
+
+        为什么不是 CT 的补充而是并列：CT 只认「域名里写了什么」，
+        而涉老诈骗的域名是随机串。这里的入口是「标题里写了什么」。
+        实测 `page.title:"个人财政补贴"` 直接命中 np4w53/hksm38/l4k9j。
+
+        启动等 90 秒：CT 跟随刚起来时要探测日志清单、建状态文件，
+        这时候再打一组外部 API，两边都容易超时。
+        """
+        try:
+            self._harvester = Harvester(per_round=settings.harvest_queries_per_round)
+        except Exception as exc:  # noqa: BLE001 配置坏了不能让发现层起不来
+            log.warning("外部线索源初始化失败：%s", exc)
+            return
+        if self._stop.wait(90):
+            return
+        while not self._stop.is_set():
+            try:
+                self._harvest_once()
+            except Exception as exc:  # noqa: BLE001 一轮失败不杀线程
+                log.warning("外部线索轮询异常：%s", exc, exc_info=True)
+            if self._stop.wait(max(300, settings.harvest_interval_seconds)):
+                return
+
+    def _harvest_once(self) -> int:
+        if self._harvester is None:
+            return 0
+        hits = self._harvester.run_round()
+        if not hits:
+            return 0
+
+        queued = 0
+        with self._pending_lock:
+            for hit in hits:
+                # 不归并到注册域：urlscan 明确告诉我们「这个 URL 上有这个标题」。
+                # s.qka91.com 是民族资产解冻的落地页，qka91.com 可能压根没建站——
+                # 归并过去等于把唯一入口弄丢了。（CT 那边归并是因为它只给域名。）
+                host = (hit.host or "").lower().strip(".")
+                if host.startswith("www."):
+                    host = host[4:]
+                if not host or "." not in host:
+                    continue
+                if self.lib.is_whitelisted(host):
+                    self.stats.whitelisted += 1
+                    continue
+                if not self.deduper.add(host):
+                    self.stats.duplicated += 1
+                    continue
+                self.pending.append(
+                    (hit.observation(), "domain", host, hit.score, [hit.query], host)
+                )
+                queued += 1
+
+        self.stats.harvested += queued
+        emit(
+            "discover.harvest",
+            hits=len(hits),
+            queued=queued,
+            stats=self._harvester.as_dict(),
+        )
+        log.info("外部线索：%d 条命中，%d 条入池", len(hits), queued)
+        return queued
+
     def _flush_loop(self) -> None:
         while not self._stop.is_set():
             self._stop.wait(2.0)
@@ -511,6 +586,15 @@ class DiscoveryEngine:
                             asset.tier = TIER_CANDIDATE
                             asset.discovery_reason = "、".join(terms[:6]) or asset.discovery_reason
                             self.stats.cold_promoted += 1
+                    # 外部线索复现：不设 triaged 门槛。
+                    # triaged 是域名级研判的产物，而外部线索的价值恰恰在「页面
+                    # 已被看到」——用域名结论否定它，等于把这条线索作废。
+                    if obs is not None and obs.source in EXTERNAL_SOURCES:
+                        meta["await_capture"] = True
+                        changed = True
+                        if asset.tier == TIER_COLD and not asset.reviewed_by:
+                            asset.tier = TIER_CANDIDATE
+                            self.stats.cold_promoted += 1
                     hosts = meta.get("hosts") or []
                     if host and host not in hosts and len(hosts) < 30:
                         meta["hosts"] = hosts + [host]
@@ -551,6 +635,9 @@ class DiscoveryEngine:
                 "discover_hint": round(score, 3),
                 "hosts": [host] if host else [],
             }
+            if obs is not None and obs.source in EXTERNAL_SOURCES:
+                # 取证前不许被域名级研判降档，否则永远等不到取证
+                meta["await_capture"] = True
             reason = "、".join(terms[:6])
             if cluster_of:
                 meta["cert_cluster"] = cluster_of

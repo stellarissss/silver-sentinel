@@ -68,3 +68,69 @@ def test_template_hash_stable_across_identical_pages(tmp_path):
     b = analyze(build_apk(tmp_path / "c2.apk", html=html))
     assert a["template_hash"] == b["template_hash"]
     assert a["template_hash"] != ""
+
+
+def test_candidate_tier_allows_large_apk(monkeypatch, fresh_db):
+    """候选档原来只让下 10MB，而真实涉老诈骗的包普遍 15~40MB。
+
+    线上实测：nuanyang 的 16.5MB 包在 candidate 档被直接拒，
+    「一个 APK 也没有」有一半来自这个阈值。
+    """
+    seen: dict[str, int] = {}
+
+    class _R:
+        ok = False
+        reason = "stub（本用例只验证阈值）"
+        url = "https://x/a.apk"
+
+    def fake_fetch(url, max_bytes, referer=""):
+        seen["max_bytes"] = max_bytes
+        return _R()
+
+    monkeypatch.setattr("silver_sentinel.capture.apk_fetch.fetch", fake_fetch)
+
+    from silver_sentinel.capture import _download_apk_locked
+    from silver_sentinel.db import session_scope
+    from silver_sentinel.models import Asset
+
+    with session_scope() as s:
+        a = Asset(kind="domain", value="x.test", normalized="x.test", tier="candidate",
+                  score=0.0, verdict="insufficient", meta={})
+        s.add(a)
+        s.flush()
+        aid = a.id
+
+    _download_apk_locked(aid, ["https://x/a.apk"], "https://x/", "candidate")
+    assert seen["max_bytes"] >= 40 * 1024 * 1024, "16.5MB 的包必须放得下"
+
+
+def test_dangerous_apk_promotes_asset(fresh_db):
+    """带无障碍 + 装包权限的包能接管手机，不该还停在候选池等页面话术。
+
+    线上实测：com.nuanyangcare.app 有 6 个危险权限和无障碍服务，
+    但页面只写了「智慧养老服务平台」——光看页面，它像个普通宣传页。
+    """
+    from silver_sentinel.capture import _apply_apk_signal
+    from silver_sentinel.db import session_scope
+    from silver_sentinel.models import Asset
+
+    with session_scope() as s:
+        a = Asset(kind="domain", value="nuanyang.test", normalized="nuanyang.test",
+                  tier="candidate", score=30.0, verdict="suspicious",
+                  meta={"apk_analysis": {
+                      "package_name": "com.nuanyangcare.app",
+                      "dangerous_permission_count": 6,
+                      "has_accessibility": True,
+                      "permissions": ["android.permission.REQUEST_INSTALL_PACKAGES"],
+                  }})
+        s.add(a)
+        s.flush()
+        aid = a.id
+
+    _apply_apk_signal(aid)
+
+    with session_scope() as s:
+        a = s.get(Asset, aid)
+        assert (a.meta or {}).get("facts", {}).get("apk_danger") is True
+        assert a.tier in ("watch", "candidate"), "至少不能掉档"
+        assert a.tier == "watch", "高危安装包应当直接进盯防"

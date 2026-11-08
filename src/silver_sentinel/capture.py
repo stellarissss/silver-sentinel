@@ -496,6 +496,12 @@ def backfill(limit: int = 30) -> int:
             (Asset.tier == TIER_WATCH, 1),
             else_=2,
         )
+        # 外部线索（urlscan / 举报）已经有人在页面上见过目标话术，
+        # 不是「域名里猜出来的」。同样档位下先抓它们。
+        source_rank = case(
+            (Asset.discovery_source.in_(("urlscan", "report", "elder_seed")), 0),
+            else_=1,
+        )
         # 冷却期未到的一律不补：dead 隔 72 小时，被墙隔 24 小时，抖动 10 分钟。
         # 之前只有「连续 3 次失败 + 6 小时」一把尺子，死域名和真线索挤在同一个
         # 队列里，谁也没跑快。
@@ -530,6 +536,7 @@ def backfill(limit: int = 30) -> int:
                 # watch 的复访比 candidate 的首访更急。
                 .order_by(
                     tier_rank,
+                    source_rank,
                     (Asset.capture_state == "pending").desc(),
                     Asset.score.desc(),
                     Asset.last_capture_at.is_(None).desc(),
@@ -903,6 +910,19 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 用途分类失败不能影响取证
             log.debug("用途分类失败 %s：%s", asset_id, exc)
 
+        # ---- 涉老判定：这个站是不是在骗老人的钱。
+        # 与「用途」正交：用途回答「这站是干什么的」，涉老回答「冲着谁来的」。
+        # 客服站也会被判用途，但不会被判涉老——两者的词表没有交集。
+        try:
+            from .elder import assess as assess_elder
+
+            elder = assess_elder(facts, text=(obs.text or "")[:40000])
+            facts["elder"] = elder.as_dict()
+        except Exception as exc:  # noqa: BLE001 涉老判定失败不能影响取证
+            log.debug("涉老判定失败 %s：%s", asset_id, exc)
+
+        # 取证完成，解除「不许降档」的保护——从此按证据说话
+        meta.pop("await_capture", None)
         meta["facts"] = facts
         meta["web_observation"] = {
             k: obs.as_dict()[k]
@@ -933,6 +953,7 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         apk_info = _maybe_download_apk(asset_id, apk_hints, obs.final_url or obs.url, tier)
         if apk_info.get("ok"):
             evidence_written.append("apk")
+            _apply_apk_signal(asset_id)
 
     # ---- 指纹与变更
     changes = _record_snapshot(asset_id, obs, facts, apk_info)
@@ -1083,7 +1104,10 @@ def _maybe_download_apk(asset_id: int, links: list[str], page_url: str, tier: st
 def _download_apk_locked(asset_id: int, links: list[str], page_url: str, tier: str) -> dict[str, Any]:
     tiers = {t.strip() for t in runtime_settings.get(runtime_settings.CAPTURE_AUTO_APK_TIERS, "watch,confirmed").split(",")}
     if tier == TIER_CANDIDATE:
-        max_mb = 10
+        # 原来是 10MB，而真实涉老诈骗的包普遍 15~40MB（uni-app 壳 + 加固）。
+        # 线上实测：nuanyang 的 16.5MB 包在 candidate 档直接被拒，
+        # 「一个 APK 也没有」有一半是这么来的。配额由每日 300MB 兜底。
+        max_mb = 50
     elif tier in tiers:
         max_mb = runtime_settings.get_int(runtime_settings.CAPTURE_APK_MAX_MB, 50)
     else:
@@ -1110,6 +1134,16 @@ def _download_apk_locked(asset_id: int, links: list[str], page_url: str, tier: s
                 )
             continue
 
+        # 静态解析：包名、危险权限、无障碍服务。这些是「这包能干什么」的
+        # 直接证据——涉老诈骗的包几乎都要读短信/无障碍/装应用。
+        analysis: dict[str, Any] = {}
+        try:
+            from .collectors import apk as apk_collector
+
+            analysis = apk_collector.analyze(result.path)
+        except Exception as exc:  # noqa: BLE001 解析失败不影响证据落盘
+            log.debug("APK 静态解析失败 %s：%s", result.url, exc)
+
         with session_scope() as s:
             # 安装包可能有几十 MB，按文件写入，避免整块进内存
             append_evidence_file(
@@ -1126,6 +1160,15 @@ def _download_apk_locked(asset_id: int, links: list[str], page_url: str, tier: s
                     "url": result.url[:300],
                     "path": result.path,
                 }
+                afacts = analysis.get("facts") or {}
+                if afacts:
+                    meta["apk_analysis"] = {
+                        "package_name": afacts.get("package_name") or "",
+                        "dangerous_permission_count": afacts.get("dangerous_permission_count") or 0,
+                        "has_accessibility": bool(afacts.get("has_accessibility")),
+                        "permissions": (afacts.get("permissions") or [])[:24],
+                        "sha256": afacts.get("file_sha256") or "",
+                    }
                 asset.meta = meta
         # 磁盘里只留一份：证据目录已按哈希存过
         try:
@@ -1181,6 +1224,41 @@ def _hamming(a: str, b: str) -> int:
         return (int(a, 16) ^ int(b, 16)).bit_count()
     except (TypeError, ValueError):
         return 0
+
+
+def _apply_apk_signal(asset_id: int) -> None:
+    """把安装包的能力变成档位。
+
+    一个带无障碍服务 + 装包权限的 APK，不需要页面话术配合就已经能接管手机：
+    读短信拿验证码、替用户点确认、再装下一个包。这类证据在「页面看起来像
+    什么」之外，所以单独提级，不等下一轮重评。
+    """
+    from . import triage
+
+    with session_scope() as s:
+        asset = s.get(Asset, asset_id)
+        if asset is None:
+            return
+        meta = dict(asset.meta or {})
+        analysis = meta.get("apk_analysis") or {}
+        if not analysis:
+            return
+        facts = dict(meta.get("facts") or {})
+        facts["apk_analysis"] = analysis
+        try:
+            danger_count = int(analysis.get("dangerous_permission_count") or 0)
+        except (TypeError, ValueError):
+            danger_count = 0
+        danger = bool(analysis.get("has_accessibility") or danger_count >= 5)
+        facts["apk_danger"] = danger
+        meta["facts"] = facts
+        asset.meta = meta
+        if danger:
+            triage.apply(asset, facts=facts)
+            log.info(
+                "安装包高危能力 asset=%s 权限=%s 无障碍=%s → %s",
+                asset_id, danger_count, analysis.get("has_accessibility"), asset.tier,
+            )
 
 
 def _record_snapshot(asset_id: int, obs, facts: dict[str, Any], apk_info: dict[str, Any]) -> list[str]:

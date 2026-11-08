@@ -81,6 +81,9 @@ def _urgency(facts: dict[str, Any], asset: Asset) -> tuple[bool, list[str]]:
     if facts.get("forces_apk_download"):
         reasons.append("强制下载安装包")
         urgent = True
+    if facts.get("apk_danger"):
+        reasons.append("安装包带无障碍/高危权限")
+        urgent = True
     if facts.get("distribution_channel") in ("sideload", "qr"):
         reasons.append("非应用商店分发")
         urgent = True
@@ -89,6 +92,12 @@ def _urgency(facts: dict[str, Any], asset: Asset) -> tuple[bool, list[str]]:
         urgent = True
     if facts.get("official_listed"):
         reasons.append("命中官方涉诈通报")
+        urgent = True
+
+    elder = facts.get("elder")
+    if isinstance(elder, dict) and elder.get("elder"):
+        tier = elder.get("priority") or "P1"
+        reasons.append(f"涉老 {tier}：{elder.get('reason') or '受众指向+证据'}")
         urgent = True
 
     # 模型结论作为「时效性」信号，不单独定性：它读到了页面原文，
@@ -112,6 +121,8 @@ def _urgency(facts: dict[str, Any], asset: Asset) -> tuple[bool, list[str]]:
 def _hard_evidence(facts: dict[str, Any], score: float, verdict: str) -> list[str]:
     """「硬证据」清单：不是加权词，而是可核查的事实。"""
     out: list[str] = []
+    if facts.get("apk_danger"):
+        out.append("安装包带无障碍/高危权限")
     if facts.get("official_listed"):
         out.append("官方通报")
     if facts.get("linked_confirmed_campaign"):
@@ -124,6 +135,9 @@ def _hard_evidence(facts: dict[str, Any], score: float, verdict: str) -> list[st
         out.append("共用签名证书")
     # 模型判到「就是这类骗局」且引用被核对过，才算一条硬证据；
     # 「unclear」永远不进这个清单。
+    elder = facts.get("elder")
+    if isinstance(elder, dict) and elder.get("priority") == "P0":
+        out.append(f"涉老 P0（{elder.get('reason') or '四要素达标'}）")
     if str(facts.get("llm_classification") or "") == "elderly_scam":
         try:
             if float(facts.get("llm_confidence") or 0) >= 0.85:
@@ -240,6 +254,35 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
         )
     if claim_verdict == "fabricated_agency":
         return TriageDecision(TIER_CANDIDATE, ["自称政府库中不存在的国家机构"])
+    # ---- 高危安装包：直接进 watch。
+    # 无障碍服务 + 装包权限 = 能读短信拿验证码、能替用户点确认、能再装下一个包。
+    # 这种能力本身就是充分条件，不需要页面话术配合。
+    if facts.get("apk_danger"):
+        analysis = facts.get("apk_analysis") or {}
+        return TriageDecision(
+            TIER_WATCH,
+            [
+                "安装包带无障碍/高危权限"
+                f"（危险权限 {analysis.get('dangerous_permission_count') or '?'} 项）"
+            ],
+            urgent=True,
+        )
+
+    # ---- 涉老：四要素凑齐的直接进 watch，**且不经过用途闸门**。
+    # 涉老诈骗的落地页在结构上就是「landing」——用「像不像经营型」去筛它，
+    # 等于把目标本身筛掉。这条必须在闸门之前。
+    elder = facts.get("elder")
+    if isinstance(elder, dict) and elder.get("priority") == "P0":
+        hits = elder.get("hits") or {}
+        detail = "、".join(
+            f"{k}:{'/'.join(v[:2])}" for k, v in hits.items() if v
+        )[:120]
+        return TriageDecision(
+            TIER_WATCH,
+            [f"涉老 P0（{elder.get('reason') or '四要素达标'}）", detail],
+            urgent=True,
+        )
+
     # ---- 用途闸门：客服站/论坛/电商/企业站不占高危队列。
     # 只降档、不删除；claim 硬证据、官方通报、APK 分发、证件类表单都会让它让位
     # （判据在 purpose.decide_suppression）。这是「词库保广、用途保细」的落点。
@@ -250,6 +293,16 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
         # 白名单命中：政府站/正规媒体不该占据待处理队列前排。
         # 不删除——记录留着，改版或域名易主后可复查。
         return TriageDecision(TIER_COLD, ["命中政府/媒体白名单"])
+
+    # ---- 待取证的外部线索：不接受域名级降档。
+    # 它们进库时是 candidate，而 quick 研判只看域名，会判「证据不足」压成 cold；
+    # backfill 只补 watch/candidate，压下去就永远等不到取证。
+    # 线上实测：6 条外部线索里有 3 条在取证前掉进 cold，队列里再没出现过。
+    if (asset.meta or {}).get("await_capture"):
+        return TriageDecision(
+            TIER_CANDIDATE,
+            ["外部线索待取证（已确认页面存在，不做域名级降档）"],
+        )
 
     urgent, urgency_reasons = _urgency(facts, asset)
     hard = _hard_evidence(facts, score, verdict)
@@ -281,10 +334,12 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
         return TriageDecision(TIER_CANDIDATE, reasons, urgent)
 
     # 分数很低：进冷存。仍保留记录——这是「宁可错杀」的成本上限。
+    # 涉老除外：哪怕只有受众指向 + 一条证据，也留在候选池让人看一眼。
+    cold_tier = TIER_CANDIDATE if isinstance(elder, dict) and elder.get("elder") else TIER_COLD
     if (asset.meta or {}).get("discover_hint", 0) >= 0.3:
-        return TriageDecision(TIER_COLD, ["发现阶段命中弱特征，暂无其他证据"])
+        return TriageDecision(cold_tier, ["发现阶段命中弱特征，暂无其他证据"])
 
-    return TriageDecision(TIER_COLD, ["证据不足"])
+    return TriageDecision(cold_tier, ["证据不足"])
 
 
 def apply(

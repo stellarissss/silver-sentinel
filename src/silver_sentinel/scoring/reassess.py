@@ -368,6 +368,15 @@ def rescore(
             facts.setdefault("features", feats)
             facts["purpose"] = purpose
 
+    # 涉老补算：老资产没有这个字段，补一次就写回，条件同上。
+    if "elder" not in facts and not existing.get("elder"):
+        try:
+            from ..elder import assess as assess_elder
+
+            facts["elder"] = assess_elder(facts, text=body or "").as_dict()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("涉老补算失败 %s：%s", asset.id, exc)
+
     assessment, merged = assess_now(asset, facts=facts or None, text=body)
     written = apply_assessment(session, asset, assessment)
 

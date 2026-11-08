@@ -108,6 +108,10 @@ class Settings:
     discover_queue_capacity: int = 50000
     # 同一注册域下的多主机是否归并成一个资产（主机清单留在 meta.hosts）
     discover_collapse_subdomains: bool = True
+    # 外部线索发现（urlscan 标题检索）：CT 只认域名里写了什么，这条路认标题
+    harvest_enabled: bool = True
+    harvest_interval_seconds: int = 3600
+    harvest_queries_per_round: int = 4
 
     # ---------------------------------------------------------------- ICP 备案
     icp_enabled: bool = True
@@ -330,6 +334,13 @@ class Settings:
         self.discover_queue_capacity = _int("SILVER_DISCOVER_QUEUE", self.discover_queue_capacity)
         self.discover_collapse_subdomains = _bool(
             "SILVER_DISCOVER_COLLAPSE_SUBDOMAINS", self.discover_collapse_subdomains
+        )
+        self.harvest_enabled = _bool("SILVER_HARVEST_ENABLED", True)
+        self.harvest_interval_seconds = _int(
+            "SILVER_HARVEST_INTERVAL", self.harvest_interval_seconds
+        )
+        self.harvest_queries_per_round = _int(
+            "SILVER_HARVEST_QUERIES", self.harvest_queries_per_round
         )
 
         self.icp_enabled = _bool("SILVER_ICP_ENABLED", True)
