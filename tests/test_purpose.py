@@ -12,7 +12,14 @@ from __future__ import annotations
 
 from silver_sentinel import triage
 from silver_sentinel.features import FEATURE_NAMES, extract
-from silver_sentinel.models import TIER_CANDIDATE, TIER_COLD, TIER_WATCH, Asset
+from silver_sentinel.models import (
+    TIER_CANDIDATE,
+    TIER_COLD,
+    TIER_CONFIRMED,
+    TIER_DISMISSED,
+    TIER_WATCH,
+    Asset,
+)
 from silver_sentinel.purpose import (
     NON_TARGET,
     PurposeResult,
@@ -304,3 +311,120 @@ def test_rescore_lets_purpose_gate_downgrade(fresh_db):
         }
         rescore(session, asset, facts=facts, text="在线客服 工单 坐席")
         assert asset.tier == TIER_COLD
+
+
+# ---------------------------------------------------------------- 已排除不被复活
+
+def test_apply_keeps_dismissed_dismissed(fresh_db):
+    """rescore --retier 不能把已排除的资产拉回队列。
+
+    线上真实问题：901 条早期排除记录（词库误报清理、站群主机名）没有
+    triaged 标记，而 rank(dismissed)=0 让「是否升级」的判断恒真。
+    一次全量重评就会把它们整批复活，队列重新被填满——比漏掉一个站更难收拾。
+    重新入队只走 triage.activate()（有新证据）。
+    """
+    from silver_sentinel.db import session_scope
+
+    with session_scope() as session:
+        asset = Asset(kind="domain", value="dead-host.duckdns.org",
+                      normalized="dead-host.duckdns.org", tier=TIER_DISMISSED,
+                      score=0.0, verdict="insufficient",
+                      dismiss_reason="共享基础设施：平台分配的随机主机名",
+                      meta={})  # 没有 triaged 标记，正是线上那 901 条的样子
+        session.add(asset)
+        session.flush()
+
+        for allow in (False, True):
+            decision = triage.apply(asset, facts={"page_text_len": 300}, allow_downgrade=allow)
+            assert asset.tier == TIER_DISMISSED
+            assert decision.tier == TIER_DISMISSED
+
+
+def test_apply_revives_dismissed_on_official_hit(fresh_db):
+    """命中官方涉诈通报时，已排除的也必须拉起来——这是唯一例外。"""
+    from silver_sentinel.db import session_scope
+
+    with session_scope() as session:
+        asset = Asset(kind="domain", value="revived.cn", normalized="revived.cn",
+                      tier=TIER_DISMISSED, score=0.0, verdict="insufficient",
+                      meta={"triaged": True})
+        session.add(asset)
+        session.flush()
+        triage.apply(asset, facts={"official_listed": True})
+        assert asset.tier == TIER_CONFIRMED
+
+
+# ---------------------------------------------------------------- 反证否决
+
+def test_gate_veto_blocks_casino_and_streaming():
+    """赌场、盗播站群内容也很长，二分类会判成「经营型」。这类站不能降档。
+
+    线上实测：gk88-casino.com.co（越南赌场）、1xbet-live-gh.com、
+    zc-douyin.cc（斗鱼体育盗播）都被模型判 operational 并准备冷存。
+    """
+    from silver_sentinel.purpose import decide_suppression
+
+    for text in (
+        "GK88 CORPORA TRANG CHỦ ĐĂNG NHẬP | casino | nổ hũ | cá cược",
+        "1xBet Ghana | 1xBet Cash Out | 1xBet Casino live | Promo Code",
+        "斗鱼体育直播 | 足球直播 | 篮球直播 | 无插件高清观看",
+        "宁夏公积金提取代办：代办提取公积金，专业中介",
+    ):
+        result = PurposeResult(purpose="operational", confidence=0.60, source="model")
+        ok, _ = decide_suppression(result, {}, None, text=text)
+        assert not ok, text
+
+
+def test_gate_veto_does_not_block_normal_corporate():
+    """反证词不能太宽：正常企业站的「代办」「直播」不该命中。"""
+    from silver_sentinel.purpose import decide_suppression
+
+    result = PurposeResult(purpose="corporate", confidence=0.8, source="rule")
+    ok, _ = decide_suppression(result, {}, None, text="关于我们 产品中心 解决方案 联系我们 招聘")
+    assert ok
+
+
+def test_model_only_operational_never_suppresses():
+    """模型独判经营型只作展示，不给排除权——它只回答「像不像落地页」。"""
+    from silver_sentinel.purpose import decide_suppression
+
+    result = PurposeResult(purpose="operational", confidence=0.60, source="model")
+    ok, why = decide_suppression(result, {}, None, text="首页 新闻 产品")
+    assert not ok and "仅模型" in why
+
+    rule = PurposeResult(purpose="customer_service", confidence=0.9, source="rule")
+    ok2, _ = decide_suppression(rule, {}, None, text="工单 坐席 在线客服")
+    assert ok2
+
+
+def test_gate_veto_catches_site_farm_naming():
+    """站群命名是结构性反证：xx-douyin.cc / xx-weixin-qq.top。
+
+    线上实测：13 个 .cc 站群域名（斗鱼体育盗播）内容里只有「热门直播」，
+    没有「体育直播」字样，靠内容词拦不住，只能看命名。
+    """
+    from silver_sentinel.purpose import _gate_veto
+
+    assert _gate_veto("zc-douyin.cc")
+    assert _gate_veto("yingchao-weixin-qq.cc")
+    assert not _gate_veto("qq.com"), "官方域不能被连字符以外的规则误伤"
+    assert not _gate_veto("www.weixin.qq.com")
+
+
+def test_gate_veto_catches_adult_and_piracy():
+    """色情/盗版/破解站内容量很大，二分类会判成经营型。
+
+    线上实测：baidu38.lol、douyin105.xyz、guangxiyijiaguoji.com.cn（盗版影视）、
+    gongxiaoshe88.com（破解软件）都曾被降档。
+    """
+    from silver_sentinel.purpose import _gate_veto
+
+    for text in (
+        "成人色导航 附近少妇群 淫穴",
+        "自拍社区 看片 3P",
+        "星晨电影网 影片库 在线观看",
+        "uu加速器无限试用 破解版下载",
+    ):
+        assert _gate_veto(text), text
+    for text in ("DeepSeek本地部署教程 运维笔记", "Xiaomi Official Store Pakistan 手机"):
+        assert not _gate_veto(text), text

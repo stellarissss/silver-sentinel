@@ -85,6 +85,32 @@ OPERATIONAL_CONFIRM = 0.15     # 模型认为 p(风险形态) 这么低 → 给�
 OPERATIONAL_STRONG = 0.10
 MODEL_AGREE_BOOST = 0.20       # 规则与模型一致时的置信加成
 
+# 「经营型」的反证。这些词不是风险判据，而是「这个站不可能是正经经营」的
+# 结构性反例——博彩、盗播、灰产中介本身就在经营，但绝不能因为「像经营型」
+# 被移出队列。线上实测：35 条被模型判为经营型并降档的资产里，混着越南赌场
+# （gk88-casino.com.co）、1xbet 镜像、斗鱼体育盗播站群（zc-douyin.cc）。
+# 用途判定负责排序，不能负责放行；有反证就不放行。
+GATE_VETO = re.compile(
+    r"casino|cá\s*c[ượ]c|cá\s*đ[ộo]|nhà\s*cái|nổ\s*hũ|1xbet|betting|sportsbook|"
+    r"博彩|赌博|赌场|娱乐城|时时彩|六合彩|彩票投注|棋牌室|彩金|投注|赔率|庄家通吃|"
+    r"体育直播|足球直播|篮球直播|无插件|高清直播|免费观看|赛事直播|直播信号|"
+    r"直播中|热门直播|免费直播|"
+    # 黑产站群命名：xx-douyin.cc / xx-weixin-qq.top。正规企业不会这么起名。
+    # 连字符是必要条件，否则会把 qq.com、weixin.qq.com 这类官方域也算进来。
+    r"-(?:douyin|weixin|qq|toutiao|kuaishou|baidu|taobao|alipay)(?:-[a-z0-9]{1,6})?"
+    r"\.[a-z]{2,6}|"
+    r"代办[\u4e00-\u9fff]{0,12}(提取|套现|退保|贷款|提现)|公积金提取|代提公积金|"
+    r"征信修复|背债|撸口子|套现|洗白|"
+    # 色情/盗版/破解：这类站内容量极大，二分类一样判「经营型」。
+    # 线上实测：baidu38.lol（色情导航）、douyin105.xyz（色情社区）、
+    # guangxiyijiaguoji.com.cn（星晨电影网盗版影视）、gongxiaoshe88.com（破解软件）。
+    r"色情|成人导航|成人色|约炮|约啪|淫穴|自慰|乱伦|偷拍|无码|黄片|里番|AV女优|"
+    r"卖淫|嫖娼|援交|福利姬|自拍社区|看片|"
+    r"电影网|影片库|影视大全|BT下载|磁力链接|迅雷下载|追剧|"
+    r"破解版|破解软件|无限试用|内购破解|私服|外挂",
+    re.I,
+)
+
 _MODEL_LOCK = threading.Lock()
 _MODEL_CACHE: dict[str, Any] = {}
 
@@ -428,8 +454,18 @@ def classify(
 _HARD_FACTS = ("fake_site_id", "fake_icp", "impersonation")
 
 
+def _gate_veto(text: str) -> str:
+    """页面里有没有「经营型」的反证词。返回命中的词，便于写理由。"""
+    m = GATE_VETO.search(text or "")
+    return m.group(0) if m else ""
+
+
 def decide_suppression(
-    result: PurposeResult, facts: dict[str, Any], feats: FeatureBundle | None = None
+    result: PurposeResult,
+    facts: dict[str, Any],
+    feats: FeatureBundle | None = None,
+    *,
+    text: str = "",
 ) -> tuple[bool, str]:
     """返回 (是否抑制高风险队列, 理由)。调用方据此降级，不删除资产。
 
@@ -452,6 +488,17 @@ def decide_suppression(
     if int(result.scam_hits or 0) >= 2:
         return False, "骗局专属词命中 ≥2，忽略用途判定"
 
+    veto = _gate_veto(text)
+    if veto:
+        return False, f"页面含「{veto}」，不适用用途排除"
+
+    # 模型独判的「经营型」没有规则依据，只在页面确实是个成规模的站点时
+    # 才给排除权（正文够长、不像单页落地）。二分类只回答「像不像落地页」：
+    # 赌场、盗播站内容都很长，一样落到这一档——所以上面那道否决先跑。
+    if result.purpose == "operational" and result.source == "model":
+        if len(text or "") < 600:
+            return False, "仅模型判定经营型且正文过短，不足以排除"
+
     if result.purpose in NON_TARGET and result.confidence >= MIN_CONFIDENCE:
         return True, f"用途为「{result.label}」，不占高危队列（保留记录，可随时复查）"
     if result.purpose in SOFT_NON_TARGET and result.confidence >= 0.70:
@@ -465,6 +512,7 @@ def analyze(
     host: str = "",
     facts: dict[str, Any] | None = None,
     use_model: bool = True,
+    text: str = "",
 ) -> PurposeResult:
     """分类 + 抑制判定，一步到位。"""
     facts = facts or {}
@@ -486,7 +534,9 @@ def analyze(
         result.scam_hits = int(feats.values.get("kw_scam", 0) or 0)
     except (TypeError, ValueError):
         result.scam_hits = 0
-    suppressed, reason = decide_suppression(result, facts, feats)
+    # host 一并送进去：站群命名（xx-douyin.cc）只有连域名一起看才拦得住
+    probe = f"{host} {text}" if host else text
+    suppressed, reason = decide_suppression(result, facts, feats, text=probe)
     if suppressed and not suppress_enabled:
         result.suppressed = False
         result.suppressed_reason = reason + "（闸门已关闭，仅记录）"

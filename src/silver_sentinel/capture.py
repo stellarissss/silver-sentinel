@@ -897,7 +897,8 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
                 apk_links=obs.apk_links,
             )
             facts["features"] = bundle.as_dict()
-            purpose = analyze_purpose(bundle, host=claim_host, facts=facts)
+            purpose = analyze_purpose(bundle, host=claim_host, facts=facts,
+                                      text=(obs.text or "")[:20000])
             facts["purpose"] = purpose.as_dict()
         except Exception as exc:  # noqa: BLE001 用途分类失败不能影响取证
             log.debug("用途分类失败 %s：%s", asset_id, exc)

@@ -7,9 +7,14 @@
 # 验收的不是「进程活着」，而是「新判据真的生效了」：
 #   1. 模型加载成功（不是静默退回规则）
 #   2. 客服站被判成客服、不占高危队列
-#   3. 落地页不被误判成经营型
-#   4. 历史资产补算后，用途分布不是全 0
-#   5. 看门狗与队列健康度没有因为这次升级变差
+#   3. HTML 解析依赖在位（bs4 缺了，判定会静默退化成只看域名）
+#   4. 冒充判定真的能抽出伪造标识码（端到端，不是只看 import）
+#   5. 落地页不被误判成经营型
+#   6. 历史资产补算后，用途分布不是全 0
+#   7. 看门狗与队列健康度没有因为这次升级变差
+#
+# 注意：脚本会自动读 systemd 单元的 EnvironmentFile。少了这一步，CLI 会落到
+# $HOME/data 的空库上「成功」却什么都没改——这也踩过。
 #
 # 只读是默认值：部署后先跑这个，确认无误再 --apply。
 
@@ -20,7 +25,7 @@ APPLY=0
 for arg in "$@"; do
   case "$arg" in
     --apply) APPLY=1 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "未知参数：$arg" >&2; exit 2 ;;
   esac
 done
@@ -43,6 +48,42 @@ fi
 PY="$(dirname "$(command -v "$SILVER_BIN")")/python"
 [ -x "$PY" ] || PY=python3
 
+# ---------------------------------------------------------------- 运行环境
+# 服务是从 systemd 的 EnvironmentFile 拿配置的；这里手工跑 CLI 如果不补上，
+# 会退回默认数据目录（$HOME/data）——在空库上「成功」却一条也没改，
+# doctor 也会报「没有心跳」。线上踩过一次，必须显式对齐。
+SERVICE="${SERVICE:-silver-sentinel}"
+UNIT_FILE="${UNIT_FILE:-/etc/systemd/system/${SERVICE}.service}"
+SVC_USER="${SVC_USER:-}"
+
+if [ -r "$UNIT_FILE" ]; then
+  if [ -z "$SVC_USER" ]; then
+    SVC_USER="$(sed -n 's/^User=//p' "$UNIT_FILE" | head -1)"
+  fi
+  if [ -z "${SILVER_DATA_DIR:-}" ]; then
+    ENV_FILE="$(sed -n 's/^EnvironmentFile=-\{0,1\}//p' "$UNIT_FILE" | head -1)"
+    if [ -n "$ENV_FILE" ] && [ -r "$ENV_FILE" ]; then
+      set -a
+      # shellcheck disable=SC1090
+      . "$ENV_FILE"
+      set +a
+    fi
+  fi
+fi
+SILVER_DATA_DIR="${SILVER_DATA_DIR:-/var/lib/silver-sentinel/data}"
+export SILVER_DATA_DIR
+
+# 数据目录属主是服务账号：以 root 直接跑会写出 root 属主的证据/锁文件，
+# 之后 worker 读不了。有服务账号就切过去。
+run_as_service() {
+  if [ "$(id -u)" = "0" ] && [ -n "$SVC_USER" ] && [ "$SVC_USER" != "root" ] \
+     && id "$SVC_USER" >/dev/null 2>&1; then
+    runuser -u "$SVC_USER" -- env SILVER_DATA_DIR="$SILVER_DATA_DIR" "$@"
+  else
+    "$@"
+  fi
+}
+
 pass=0
 fail=0
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; pass=$((pass+1)); }
@@ -50,14 +91,14 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail+1)); }
 note() { printf '    %s\n' "$1"; }
 
 echo "== 1. 版本 =="
-VER="$("$SILVER_BIN" --version 2>/dev/null || true)"
+VER="$(run_as_service "$SILVER_BIN" --version 2>/dev/null || true)"
 if [ -z "$VER" ]; then
   VER="$("$PY" -c 'import silver_sentinel as s; print(s.__version__)' 2>/dev/null || echo '?')"
 fi
 note "silver-sentinel $VER"
 
 echo "== 2. 用途模型 =="
-MODEL_JSON="$("$SILVER_BIN" model status 2>/dev/null || echo '{}')"
+MODEL_JSON="$(run_as_service "$SILVER_BIN" model status 2>/dev/null || echo '{}')"
 AVAILABLE="$(printf '%s' "$MODEL_JSON" | "$PY" -c 'import json,sys
 try: print(json.load(sys.stdin).get("available"))
 except Exception: print(False)' 2>/dev/null)"
@@ -77,7 +118,7 @@ else
 fi
 
 echo "== 3. 客服站判定（真实站点）=="
-CS_OUT="$("$SILVER_BIN" purpose https://www.53kf.com --timeout 30 2>/dev/null || echo '{}')"
+CS_OUT="$(run_as_service "$SILVER_BIN" purpose https://www.53kf.com --timeout 30 2>/dev/null || echo '{}')"
 read -r pur lab conf sup <<< "$(printf '%s' "$CS_OUT" | "$PY" -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
@@ -90,15 +131,39 @@ else
   note "若抓取失败，先确认出口代理与 chromium 可用"
 fi
 
-echo "== 4. 落地页不被误排除 =="
+echo "== 4. HTML 解析依赖（静默退化的源头）=="
+CAP="$("$PY" -c 'import bs4; print("ok")' 2>&1)"
+if [ "$CAP" = "ok" ]; then
+  ok "beautifulsoup4 可用（自称抽取/用途特征能算）"
+else
+  bad "beautifulsoup4 缺失——所有判定会退化成「只看域名」，且不报错"
+  note "pip install beautifulsoup4，或重装本版本 wheel（已写入主依赖）"
+fi
+
+echo "== 5. 冒充判定生效（伪造标识码）=="
+CLAIM="$(run_as_service "$PY" -c '
+from silver_sentinel.claim import analyze_html
+h = ("<html><head><title>财政部 惠民补贴</title></head><body>"
+     "<div>政府网站标识码：bm01000001</div>"
+     "<div>主办单位：中华人民共和国财政部</div></body></html>")
+print(analyze_html(h, "example.top").verdict)' 2>&1)"
+if [ "$CLAIM" = "fake_site_id" ]; then
+  ok "非政府域伪造标识码 → fake_site_id"
+else
+  bad "冒充判定未生效：verdict=${CLAIM:-空}"
+  note "若上一步 bs4 缺失，这一项必然失败——先修依赖"
+fi
+
+echo "== 6. 落地页不被误排除 =="
 LP_HTML="$(mktemp /tmp/ss-lp-XXXXXX.html)"
+chmod 644 "$LP_HTML"   # 可能切到服务账号执行，root 建的 0600 临时文件它读不了
 cat > "$LP_HTML" <<'HTML'
 <html><head><title>中华人民共和国财政部 惠民补贴申领</title></head>
 <body><div>财政部 民政部 主办</div>
 <div>立即领取 限时 名额 扫码 加微信 免费领取 一键申请</div>
 <form><input name="idcard" placeholder="身份证号"></form></body></html>
 HTML
-LP_OUT="$("$SILVER_BIN" purpose --html-file "$LP_HTML" --host example.top 2>/dev/null || echo '{}')"
+LP_OUT="$(run_as_service "$SILVER_BIN" purpose --html-file "$LP_HTML" --host example.top 2>/dev/null || echo '{}')"
 rm -f "$LP_HTML"
 read -r pur sup <<< "$(printf '%s' "$LP_OUT" | "$PY" -c 'import json,sys
 try: d=json.load(sys.stdin)
@@ -112,22 +177,22 @@ else
 fi
 
 if [ "$APPLY" = "1" ]; then
-  echo "== 5. 历史资产补算（rescore --retier）=="
-  note "会重算最多 3000 条，并允许降级。首次执行可能几分钟。"
-  if "$SILVER_BIN" rescore --retier --limit 3000 2>&1 | tail -5; then
+  echo "== 7. 历史资产补算（rescore --retier）=="
+  note "会重算最多 3000 条，并允许降档。首次执行可能几分钟。"
+  if run_as_service "$SILVER_BIN" rescore --retier --limit 3000 2>&1 | tail -5; then
     ok "重评完成"
   else
     bad "重评失败，看上面的错误"
   fi
 else
-  echo "== 5. 历史资产补算（跳过）=="
+  echo "== 7. 历史资产补算（跳过）=="
   note "确认前面都正常后，跑：$SILVER_BIN rescore --retier --limit 3000"
 fi
 
-echo "== 6. 态势与健康 =="
-"$SILVER_BIN" brief --hours 24 2>&1 | sed 's/^/    /' || true
+echo "== 8. 态势与健康 =="
+run_as_service "$SILVER_BIN" brief --hours 24 2>&1 | sed 's/^/    /' || true
 echo
-if "$SILVER_BIN" doctor >/dev/null 2>&1; then
+if run_as_service "$SILVER_BIN" doctor >/dev/null 2>&1; then
   ok "doctor 通过"
 else
   bad "doctor 未通过（看门狗会据此重启，先看它的输出）"

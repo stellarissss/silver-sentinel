@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -401,6 +402,24 @@ def cmd_doctor(args) -> int:
     except Exception as exc:  # noqa: BLE001
         result["icp"] = {"error": str(exc)[:160]}
 
+    # 能力探测：这些依赖缺了服务照样起来，但判定会静默退化。
+    # 线上真实踩过：wheel 漏了 beautifulsoup4，自称/用途全部算空，界面无异常，
+    # 直到导出一批评分才发现全是没有 HTML 特征的域名分。只告警、不触发重启
+    # （重启解决不了缺包，只会白白打断取证）。
+    caps: dict[str, bool] = {}
+    for mod, why in (
+        ("bs4", "自称抽取与用途特征"),
+        ("sklearn", "用途分类模型"),
+        ("playwright", "页面取证"),
+    ):
+        try:
+            importlib.import_module(mod)
+            caps[mod] = True
+        except Exception:  # noqa: BLE001
+            caps[mod] = False
+            result.setdefault("capability_warnings", []).append(f"缺少 {mod}：{why}不可用")
+    result["capabilities"] = caps
+
     result["ok"] = not result["problems"]
     if args.quiet and result["ok"]:
         return 0
@@ -543,7 +562,8 @@ def cmd_purpose(args) -> int:
 
     bundle = extract(url=f"https://{host}/" if host else "", html=html, text=text,
                      facts=facts, requests=requests, forms=forms, tls=tls, apk_links=apk_links)
-    result = analyze(bundle, host=host, facts=facts, use_model=not args.no_model)
+    result = analyze(bundle, host=host, facts=facts, use_model=not args.no_model,
+                     text=(text or html)[:20000])
     out = {
         "ok": True,
         "host": host,

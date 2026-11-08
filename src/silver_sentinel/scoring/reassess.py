@@ -247,7 +247,7 @@ def _purpose_from_evidence(session: Session, asset: Asset) -> tuple[dict[str, An
 
         bundle = extract(url=f"https://{host}/", html=html, text=body, facts=facts,
                          requests=requests, forms=forms, tls=facts.get("tls") or {})
-        purpose = analyze_purpose(bundle, host=host, facts=facts)
+        purpose = analyze_purpose(bundle, host=host, facts=facts, text=body[:20000])
         return bundle.as_dict(), purpose.as_dict()
     except Exception as exc:  # noqa: BLE001 补算失败按无用途处理
         log.debug("从证据补算用途失败 %s：%s", asset.id, exc)

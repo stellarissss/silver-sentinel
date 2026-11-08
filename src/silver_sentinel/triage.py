@@ -298,6 +298,22 @@ def apply(
     decision = decide(asset, facts=facts)
     previous = asset.tier
     meta = dict(asset.meta or {})
+
+    # dismissed 是终态：自动流程不得复活已排除的资产。
+    # 线上有 901 条早期排除记录没有 triaged 标记，而 rank(dismissed)=0 让
+    # 「升级」判断恒真——一次 rescore --retier 就能把整批拉回候选池，
+    # 队列重新被客服站/站群主机名灌满。重新入队只走 triage.activate()（有新证据）。
+    if previous == TIER_DISMISSED and decision.tier != TIER_CONFIRMED:
+        decision.tier = TIER_DISMISSED
+        decision.reasons = ["已排除资产不自动重新入队"]
+        asset.tier = TIER_DISMISSED
+        asset.dismiss_reason = asset.dismiss_reason or "已排除"
+        asset.discovery_reason = "；".join(decision.reasons)[:500]
+        meta["triaged"] = True
+        meta["triaged_at"] = utcnow().isoformat()
+        asset.meta = meta
+        return decision
+
     # 「首次分级」可以自由落档——但已确认的目标除外：
     # 它们可能来自官方通报导入，尚无 triaged 标记，不能被一次自动评估刷掉。
     first_time = (not meta.get("triaged")) and previous != TIER_CONFIRMED

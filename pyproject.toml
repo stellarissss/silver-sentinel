@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "silver-sentinel"
-version = "1.10.0"
+version = "1.10.5"
 description = "银发哨兵：涉老诈骗的持续发现、动态取证、图谱归因与处置闭环"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,6 +34,9 @@ dependencies = [
     "cryptography>=42",          # 解析 CT 日志里的 DER 证书，取 CN / SAN
     "dnspython>=2.6",            # 域名排列探测 + 内网地址判定
     "pypinyin>=0.51",            # 中文词根自动派生拼音变体（guohui / zhongke ...）
+    "beautifulsoup4>=4.12",      # 自称抽取（header/版权行/短块）与用途特征。
+                                 # 缺了不会崩，但 claim/features 会静默返回空——
+                                 # 线上真踩过：判定全退化成「只看域名」还看不出来。
     "networkx>=3.2",             # 社区发现（Louvain / 连通分量）
     "socksio>=1.0",              # SOCKS5 代理（出站隔离）
     "pillow>=10.0",              # 截图裁剪 + dHash 指纹（变更检测要用）

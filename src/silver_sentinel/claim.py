@@ -42,7 +42,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from bs4 import BeautifulSoup
+try:  # 缺依赖不能让整条判定链崩：标识码判据只用正则，仍可工作
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover - 由 doctor 的能力探测兜底告警
+    BeautifulSoup = None  # type: ignore[assignment]
 
 from .whitelist import AgencyHit, get_whitelist
 
@@ -161,17 +164,25 @@ def analyze_html(html: str, host: str = "", *, title: str = "") -> ClaimReport:
     report = ClaimReport(host=host)
     if not html:
         return report
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception as exc:  # noqa: BLE001 解析失败按无自称处理
-        log.debug("页面解析失败 %s：%s", host, exc)
-        return report
+
+    soup = None
+    if BeautifulSoup is None:
+        # 线上真实事故：wheel 漏了 beautifulsoup4，claim 与用途全部静默算空，
+        # 界面一切正常但判定退化到只看域名。这里至少保留标识码判定并留下痕迹。
+        report.reasons.append("缺少 beautifulsoup4，仅做标识码判定")
+        log.warning("缺少 beautifulsoup4：自称抽取不可用（%s）", host)
+    else:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception as exc:  # noqa: BLE001 解析失败按无自称处理
+            log.debug("页面解析失败 %s：%s", host, exc)
+            return report
 
     wl = get_whitelist()
     report.is_gov_host = wl.is_government(host)
     report.is_media_host = wl.is_media(host)
 
-    page_title = (soup.title.get_text(strip=True) if soup.title else "") or title
+    page_title = (soup.title.get_text(strip=True) if soup is not None and soup.title else "") or title
     report.title = page_title[:160]
 
     # ---- 标识码：先看 meta / 全文，再退回自称区块
@@ -183,7 +194,7 @@ def analyze_html(html: str, host: str = "", *, title: str = "") -> ClaimReport:
     else:
         report.site_id = m.group(1)
 
-    blocks = _self_claim_blocks(soup)
+    blocks = _self_claim_blocks(soup) if soup is not None else []
 
     # ---- 备案号：只在版权行附近取，避免正文里的政策文号
     for block in blocks:
