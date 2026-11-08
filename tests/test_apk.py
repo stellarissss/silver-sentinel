@@ -174,9 +174,9 @@ def test_manifest_obfuscation_is_flagged(tmp_path):
 
 def test_unparsed_apk_does_not_fall_into_cold(fresh_db):
     """加固包解析不出权限 ≠ 干净。静默沉底等于把「看不见」当成「没问题」。"""
+    from silver_sentinel import triage
     from silver_sentinel.db import session_scope
     from silver_sentinel.models import TIER_CANDIDATE, TIER_COLD, Asset
-    from silver_sentinel import triage
 
     with session_scope() as s:
         a = Asset(kind="domain", value="26537.net", normalized="26537.net", score=0.0)

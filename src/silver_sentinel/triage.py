@@ -100,6 +100,22 @@ def _urgency(facts: dict[str, Any], asset: Asset) -> tuple[bool, list[str]]:
         reasons.append(f"涉老 {tier}：{elder.get('reason') or '受众指向+证据'}")
         urgent = True
 
+    # 诱饵页带分发去向：页面本身没内容，但它正在把人往包里带。
+    # 只有「核验诱饵 + 有下载/下一跳」才升为时效性信号——空壳和收尾页不升，
+    # 否则一批「网站建设中」会把队列灌满。
+    decoy = facts.get("decoy")
+    if isinstance(decoy, dict) and decoy.get("is_decoy"):
+        reasons.append(f"诱饵页：{decoy.get('reason') or decoy.get('kind')}")
+        try:
+            weight = int(decoy.get("weight") or 0)
+        except (TypeError, ValueError):
+            weight = 0
+        if weight >= 3 and decoy.get("downstream"):
+            reasons.append(f"诱饵带 {len(decoy.get('downstream') or [])} 个分发去向")
+            urgent = True
+    if isinstance(decoy, dict) and decoy.get("honeypot"):
+        reasons.append("页面含反自动化措施（对方预期被扫描）")
+
     # 模型结论作为「时效性」信号，不单独定性：它读到了页面原文，
     # 对「现在还在拉人」比任何域名特征都敏感。只在置信度足够时计入。
     llm_class = str(facts.get("llm_classification") or "")
@@ -294,6 +310,24 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
         # 不删除——记录留着，改版或域名易主后可复查。
         return TriageDecision(TIER_COLD, ["命中政府/媒体白名单"])
 
+    # ---- 诱饵 / 分发节点：自己不是诈骗页，但把人送到诈骗页。
+    #
+    # 暖阳 26537.net 首页是「安全检测中心」，正文无涉老词，判不出涉老是
+    # **对的**；但它把老人导去了收身份证的下一跳，这个角色必须留在队列里，
+    # 否则同一个后端换一批前端域名，我们就再也找不到入口了。
+    #
+    # 只给到候选：诱饵只证明「这是个入口」，不证明「这是个诈骗站」。
+    # 有去向的诱饵不给冷存——冷存等于再也不看，而入口是会换地址的。
+    decoy = facts.get("decoy")
+    decoy = decoy if isinstance(decoy, dict) else {}
+    if decoy.get("is_decoy"):
+        from .decoy import triage_note
+
+        elder_hit = isinstance(elder, dict) and bool(elder.get("elder"))
+        suggest, why = triage_note(decoy, elder=elder_hit)
+        if suggest == TIER_CANDIDATE:
+            return TriageDecision(TIER_CANDIDATE, [why], urgent=False)
+
     # ---- 待取证的外部线索：不接受域名级降档。
     # 它们进库时是 candidate，而 quick 研判只看域名，会判「证据不足」压成 cold；
     # backfill 只补 watch/candidate，压下去就永远等不到取证。
@@ -350,6 +384,8 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
         or facts.get("apk_unparsed")
         or facts.get("apk_danger")
         or facts.get("apk_too_large")
+        # 有去向的诱饵也一样：它自己没内容，但它是入口。冷存等于放弃入口。
+        or (decoy.get("is_decoy") and decoy.get("downstream"))
     )
     cold_tier = TIER_CANDIDATE if guarded else TIER_COLD
     if (asset.meta or {}).get("discover_hint", 0) >= 0.3:

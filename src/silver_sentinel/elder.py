@@ -172,6 +172,22 @@ def assess(facts: dict[str, Any], text: str = "") -> ElderSignal:
     if apk:
         action = [f"页面分发 {apk} 个安装包"] + action
 
+    # 诱饵页：自身没有涉老词，但它把人**送到**了有涉老词的地方。
+    #
+    # 暖阳 26537.net 首页只有「安全检测中心，请稍候」——按词表一个都不命中，
+    # 于是被判「无受众指向」扔在候选池。它的正文确实没写，但它把人导去了
+    # 收身份证的下一跳，而这正是「转化动作」的定义。
+    #
+    # 只把诱饵算作动作，不因此凭空判涉老：受众指向仍然是必要条件，
+    # 否则每个用 Cloudflare 的站都会被算进来（WAF 页在 decoy 里已单独摘掉）。
+    decoy = facts.get("decoy")
+    if isinstance(decoy, dict) and decoy.get("is_decoy"):
+        from .decoy import action_evidence
+
+        note = action_evidence(decoy)
+        if note:
+            action = [note] + action
+
     score = sum(1 for x in (audience, identity, authority, action) if x)
     sig = ElderSignal(
         score=score,

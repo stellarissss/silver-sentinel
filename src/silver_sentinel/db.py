@@ -87,6 +87,8 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("capture_state", "VARCHAR(16) DEFAULT 'pending'"),
         ("capture_error", "TEXT DEFAULT ''"),
         ("capture_retry_at", "DATETIME"),
+        ("group_key", "VARCHAR(96) DEFAULT ''"),
+        ("group_kind", "VARCHAR(16) DEFAULT ''"),
     ],
     "icp_cache": [
         ("violation", "VARCHAR(16) DEFAULT 'unknown'"),
@@ -112,6 +114,7 @@ _ADDED_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_assets_discovery_source ON assets (discovery_source)",
     "CREATE INDEX IF NOT EXISTS ix_assets_tier_score ON assets (tier, score)",
     "CREATE INDEX IF NOT EXISTS ix_assets_capture_state ON assets (capture_state)",
+    "CREATE INDEX IF NOT EXISTS ix_assets_group_key ON assets (group_key)",
     "CREATE INDEX IF NOT EXISTS ix_discovery_events_normalized ON discovery_events (normalized)",
     "CREATE INDEX IF NOT EXISTS ix_discovery_events_asset_id ON discovery_events (asset_id)",
     "CREATE INDEX IF NOT EXISTS ix_graph_edges_src ON graph_edges (src)",

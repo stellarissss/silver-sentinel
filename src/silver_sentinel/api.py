@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from . import __version__, webauth
 from .analyzers import llm as llm_analyzer
@@ -179,8 +180,82 @@ def _asset_row(asset: Asset) -> dict[str, Any]:
         "capture_error": (asset.capture_error or "")[:200],
         "last_capture_at": asset.last_capture_at.isoformat() if asset.last_capture_at else None,
         "evidence_count": len([e for e in (asset.evidence or []) if e.deleted_at is None]),
+        # 同源折叠：group_key 是这批资产的共同标识，group_kind 说明凭什么归到一起
+        "group_key": asset.group_key or "",
+        "group_kind": asset.group_kind or "",
+        "group_label": ((asset.meta or {}).get("group_label") or ""),
         # 用途：列表页据此显示「客服/论坛/企业」等标签，解释它为什么不占高危队列
         "purpose": _purpose_row(asset),
+        # 诱饵/蜜罐：列表页打标，详情页出卡片。不要藏起来——
+        # 「这一页是样子货」本身就是判断它价值的关键信息。
+        "decoy": _decoy_row(asset),
+    }
+
+
+def _group_detail(session: Session, asset: Asset) -> dict[str, Any] | None:
+    """详情页的「同源」卡片：这一条属于哪一批，批里有多少涉老。
+
+    暖阳那种站的正确读法就在这里：它自己判不出涉老，但它和 77 个涉老站
+    共用同一个收单端点。只看单条，永远看不出这件事。
+    """
+    key = asset.group_key or ""
+    if not key:
+        return None
+    from .grouping import GROUP_LABELS
+
+    peers = list(
+        session.scalars(
+            select(Asset).where(Asset.group_key == key).order_by(Asset.score.desc()).limit(40)
+        )
+    )
+    elder_count = 0
+    for p in peers:
+        facts = (p.meta or {}).get("facts") or {}
+        e = facts.get("elder") if isinstance(facts, dict) else None
+        if isinstance(e, dict) and e.get("elder"):
+            elder_count += 1
+    return {
+        "key": key,
+        "kind": asset.group_kind or "",
+        "label": (asset.meta or {}).get("group_label")
+        or GROUP_LABELS.get(asset.group_kind or "", "同源"),
+        "size": len(peers),
+        "elder_count": elder_count,
+        "members": [
+            {
+                "id": p.id,
+                "value": str(p.value)[:140],
+                "kind": p.kind,
+                "score": round(float(p.score or 0), 1),
+                "tier": p.tier,
+                "verdict": p.verdict,
+                "capture_state": p.capture_state,
+                "elder": bool(
+                    isinstance(((p.meta or {}).get("facts") or {}).get("elder"), dict)
+                    and (((p.meta or {}).get("facts") or {}).get("elder") or {}).get("elder")
+                ),
+            }
+            for p in peers
+        ],
+    }
+
+
+def _decoy_row(asset: Asset) -> dict[str, Any] | None:
+    facts = (asset.meta or {}).get("facts") or {}
+    decoy = facts.get("decoy") if isinstance(facts, dict) else None
+    if not isinstance(decoy, dict):
+        return None
+    if not (decoy.get("is_decoy") or decoy.get("honeypot") or decoy.get("blocked_by")):
+        return None
+    return {
+        "is_decoy": bool(decoy.get("is_decoy")),
+        "kind": decoy.get("kind") or "",
+        "reason": decoy.get("reason") or "",
+        "weight": decoy.get("weight") or 0,
+        "downstream": list(decoy.get("downstream") or [])[:4],
+        "honeypot": bool(decoy.get("honeypot")),
+        "honeypot_reasons": list(decoy.get("honeypot_reasons") or [])[:3],
+        "blocked_by": decoy.get("blocked_by") or "",
     }
 
 
@@ -576,11 +651,16 @@ def api_assets(
     order: str = "desc",
     limit: int = Query(default=50, le=300),
     offset: int = 0,
+    collapse: bool = True,
 ) -> dict[str, Any]:
     """线索列表。默认只返回有效资产（不含已排除）。
 
     之前默认返回全部，用户一进线索库就看到 2,993 条里混着 2,150 条早已
     判定为误报的域名，既看不出重点，也解释不了「为什么这么多」。
+
+    collapse=True 时按 group_key 折叠：同一张证书 / 同一个收单端点 /
+    同一套模板的资产合成一行，代表行取组内分数最高的那条。
+    折叠只影响展示，不改数据——每条资产仍然独立取证、独立定级、独立出证据包。
     """
     with session_scope() as session:
         stmt = select(Asset)
@@ -621,22 +701,109 @@ def api_assets(
         }.get(sort, Asset.score)
         stmt = stmt.order_by(sort_col.asc() if order == "asc" else sort_col.desc(), Asset.id.desc())
 
-        rows = list(session.scalars(stmt.offset(offset).limit(limit)))
-        total = session.scalar(count_stmt) or 0
         # 每一档各有多少条。「有效 0 条」必须能立刻解释成「另有 N 条冷存」，
         # 否则用户只会看到一张空表，以为东西丢了。
         counts_stmt = select(Asset.tier, func.count(Asset.id))
         for condition in conditions:
             counts_stmt = counts_stmt.where(condition)
         tier_counts = {t: c for t, c in session.execute(counts_stmt.group_by(Asset.tier))}
+        raw_total = session.scalar(count_stmt) or 0
+
+        if not collapse:
+            rows = list(session.scalars(stmt.offset(offset).limit(limit)))
+            return {
+                "items": [_asset_row(a) for a in rows],
+                "total": raw_total,
+                "raw_total": raw_total,
+                "limit": limit,
+                "offset": offset,
+                "tier": tier,
+                "tier_counts": tier_counts,
+                "collapsed": False,
+            }
+
+        # 折叠视图：先取够一屏的行，在内存里分组再分页。
+        #
+        # 为什么不写 SQL GROUP BY：每组的代表行要取「组内分数最高的那条」，
+        # 还要带成员列表，SQL 里得套两层子查询；而 active 档实测不到 2000 行，
+        # 一次全取比这堆子查询快得多。上限 8000 是防止 all 档扫全库。
+        scan_cap = max(limit + offset, 200) * 8
+        scan_cap = min(scan_cap, 8000)
+        rows = list(session.scalars(stmt.limit(scan_cap)))
+        items, group_count = _collapse_rows(rows)
+        view_total = len(items)
         return {
-            "items": [_asset_row(a) for a in rows],
-            "total": total,
+            "items": items[offset: offset + limit],
+            "total": view_total,
+            "raw_total": raw_total,
             "limit": limit,
             "offset": offset,
             "tier": tier,
             "tier_counts": tier_counts,
+            "collapsed": True,
+            "group_count": group_count,
+            "truncated": len(rows) >= scan_cap and view_total > offset + limit,
         }
+
+
+def _collapse_rows(rows: list[Asset]) -> tuple[list[dict[str, Any]], int]:
+    """把已排序的行按 group_key 折叠，保持原来的顺序。
+
+    组在「组内第一条出现的位置」占位，这样按分数排序时，
+    一个高分组不会被低分成员拖到后面去。
+    """
+    from .grouping import GROUP_LABELS, group_row
+
+    order: list[Any] = []
+    buckets: dict[str, list[Asset]] = {}
+    meta_of: dict[str, tuple[str, str]] = {}
+
+    for a in rows:
+        key = a.group_key or ""
+        if not key:
+            order.append(_asset_row(a))
+            continue
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+            meta_of[key] = (
+                a.group_kind or "",
+                (a.meta or {}).get("group_label") or GROUP_LABELS.get(a.group_kind or "", "同源"),
+            )
+        buckets[key].append(a)
+
+    out: list[dict[str, Any]] = []
+    group_count = 0
+    for entry in order:
+        if not isinstance(entry, str):
+            out.append(entry)
+            continue
+        members = [_asset_row(a) for a in buckets[entry]]
+        # 只有 2 条的组不折叠：省下一行，却多一个徽标和一次点击，净收益是负的。
+        # 线上实测：46 组里 30 组是「×2 同证书」（同一张证书覆盖两个子域），
+        # 全折起来反而让列表更吵。成员仍然逐条显示，只把关联标出来。
+        if len(members) < 3:
+            for m in members:
+                m["group"] = {
+                    "key": entry,
+                    "kind": meta_of[entry][0],
+                    "label": meta_of[entry][1],
+                    "size": len(members),
+                    "collapsed": False,
+                    "members": [
+                        {"id": o.get("id"), "value": o.get("value"), "score": o.get("score"),
+                         "tier": o.get("tier")}
+                        for o in members if o is not m
+                    ],
+                    "max_score": max((float(o.get("score") or 0) for o in members), default=0.0),
+                    "tiers": sorted({o.get("tier") or "" for o in members}),
+                }
+                out.append(m)
+            continue
+        kind, label = meta_of[entry]
+        out.append(group_row(key=entry, kind=kind, label=label, members=members))
+        group_count += 1
+    return out, group_count
 
 
 @app.get("/api/assets/{asset_id}")
@@ -675,6 +842,7 @@ def api_asset(asset_id: int) -> dict[str, Any]:
             "normalized": asset.normalized,
             "meta": asset.meta,
             "notes": asset.notes,
+            "group": _group_detail(session, asset),
             "signals": [
                 {
                     "rule_id": s.rule_id,

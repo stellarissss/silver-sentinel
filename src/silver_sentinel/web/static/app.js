@@ -16,6 +16,10 @@ const state = {
   assetOrder: "desc",
   assetOffset: 0,
   assetLimit: 50,
+  // 同源折叠：同证书/同收单/同模板折成一行。默认开——
+  // 一张证书 91 个域名平铺出来，人工审阅看到的是九十次重复劳动。
+  assetCollapse: true,
+  expandedGroups: new Set(),
 };
 
 const VIEW_TITLES = {
@@ -714,6 +718,7 @@ async function loadAssets() {
     order: state.assetOrder,
     limit: String(state.assetLimit),
     offset: String(state.assetOffset),
+    collapse: state.assetCollapse ? "1" : "0",
   });
   if (state.verdict) params.set("verdict", state.verdict);
   if (state.query) params.set("q", state.query);
@@ -742,6 +747,15 @@ async function loadAssets() {
       });
     });
 
+    // 折叠开关。关掉之后就是原始逐条列表——排查单个域名时更需要那种视图。
+    const ct = document.querySelector("[data-collapse-toggle]");
+    if (ct) ct.addEventListener("click", () => {
+      state.assetCollapse = !state.assetCollapse;
+      state.assetOffset = 0;
+      state.expandedGroups.clear();
+      loadAssets();
+    });
+
     if (!data.items.length) {
       box.innerHTML = state.query || state.verdict
         ? `<div class="empty">没有匹配的线索。<button class="btn ghost sm" id="btn-clear-filter">清除筛选</button></div>`
@@ -762,24 +776,11 @@ async function loadAssets() {
             ${c.sort ? `data-sort="${c.sort}"` : ""}>${c.label}</th>`).join("")}
         </tr></thead>
         <tbody>
-          ${data.items.map(a => `
-            <tr data-asset="${a.id}">
-              <td>${badge(a.verdict)}</td>
-              <td class="clip">
-                <span class="cell-main">${escapeHtml(a.value)}</span>
-                ${a.campaign_name ? `<span class="cell-sub">团伙 ${escapeHtml(a.campaign_name)}</span>` : ""}
-              </td>
-              <td class="mono">${escapeHtml(KIND_LABEL[a.kind] || a.kind)}</td>
-              <td class="mono" style="color:${scoreColor(a.score)}">${a.score}</td>
-              <td class="mono">${a.confidence.toFixed(2)}</td>
-              <td class="mono"><span class="cap-dot ${escapeHtml(a.capture_state || "pending")}" title="${escapeHtml(captureTitle(a))}">${escapeHtml(captureShort(a))}</span></td>
-              <td class="mono">${fmtTime(a.last_seen)}</td>
-              <td class="mono">${a.scan_count}</td>
-            </tr>`).join("")}
+          ${data.items.map(a => assetRowHtml(a)).join("")}
         </tbody>
       </table>`;
 
-    $$("#asset-table tbody tr").forEach(tr => tr.addEventListener("click", () => openAsset(tr.dataset.asset)));
+    bindAssetRows();
     $$("#asset-table thead th[data-sort]").forEach(th => th.addEventListener("click", () => {
       const key = th.dataset.sort;
       if (state.assetSort === key) {
@@ -796,6 +797,109 @@ async function loadAssets() {
   }
 }
 
+/* ---------------- 行渲染：折叠组 / 普通行 ---------------- */
+
+function assetRowHtml(a) {
+  const g = a.group;
+  if (!g || !g.collapsed) {
+    // 2 条及以下的组不折叠，但要把「另有 N 条同源」写出来——
+    // 关联信息不该因为不值得折就消失。
+    const extra = g && g.size > 1
+      ? `<span class="chip" title="${escapeHtml(g.label)}">+${g.size - 1} 同源</span>`
+      : "";
+    return assetCells(a, extra);
+  }
+  const open = state.expandedGroups.has(g.key);
+  const kindLabel = { campaign: "同团伙", cert: "同证书", backend: "同收单", template: "同模板" }[g.kind] || g.label || "同源";
+  return `
+    <tr class="group-row${open ? " open" : ""}" data-asset="${a.id}" data-group="${escapeHtml(g.key)}">
+      <td>${badge(a.verdict)}</td>
+      <td class="clip">
+        <div class="cell-line">
+          <span class="g-toggle" data-toggle="${escapeHtml(g.key)}" title="${open ? "收起" : "展开"}这一批">${open ? "▾" : "▸"}</span>
+          <span class="cell-main">${escapeHtml(a.value)}</span>
+        </div>
+        <span class="cell-sub">
+          <span class="g-badge" title="${escapeHtml(g.label || kindLabel)}">×${g.size} ${escapeHtml(kindLabel)}</span>
+          ${g.decoy_count ? `<span class="chip warn" title="组内有 ${g.decoy_count} 条诱饵页，展开可见">含 ${g.decoy_count} 诱饵</span>` : ""}
+          ${decoyChip(a)}
+          ${a.campaign_name ? `<span class="dim">团伙 ${escapeHtml(a.campaign_name)}</span>` : ""}
+        </span>
+      </td>
+      <td class="mono">${escapeHtml(KIND_LABEL[a.kind] || a.kind)}</td>
+      <td class="mono" style="color:${scoreColor(a.score)}">${a.score}</td>
+      <td class="mono">${a.confidence.toFixed(2)}</td>
+      <td class="mono"><span class="cap-dot ${escapeHtml(a.capture_state || "pending")}" title="${escapeHtml(captureTitle(a))}">${escapeHtml(captureShort(a))}</span></td>
+      <td class="mono">${fmtTime(a.last_seen)}</td>
+      <td class="mono">${a.scan_count}</td>
+    </tr>
+    ${open ? g.members.map(m => memberRowHtml(m)).join("") : ""}`;
+}
+
+function memberRowHtml(m) {
+  const tierTxt = TIER_LABEL[m.tier] || m.tier || "";
+  return `
+    <tr class="group-member" data-asset="${m.id}">
+      <td class="mono dim">${escapeHtml(tierTxt)}</td>
+      <td class="clip">
+        <div class="cell-line">
+          <span class="m-indent">└</span>
+          <span class="cell-main mono">${escapeHtml(m.value)}</span>
+        </div>
+        ${m.decoy_kind ? `<span class="cell-sub"><span class="chip warn">诱饵</span></span>` : ""}
+      </td>
+      <td class="mono dim">${escapeHtml(KIND_LABEL[m.kind] || m.kind || "")}</td>
+      <td class="mono" style="color:${scoreColor(m.score)}">${m.score}</td>
+      <td class="mono dim" colspan="4">
+        <span class="cap-dot ${escapeHtml(m.capture_state || "pending")}">${escapeHtml(captureShort(m))}</span>
+        <span class="dim">${escapeHtml(m.verdict || "")}</span>
+      </td>
+    </tr>`;
+}
+
+function assetCells(a, groupBadge) {
+  return `
+    <tr data-asset="${a.id}">
+      <td>${badge(a.verdict)}</td>
+      <td class="clip">
+        <span class="cell-main">${escapeHtml(a.value)}</span>
+        ${groupBadge ? `<span class="cell-sub">${groupBadge}</span>` : ""}
+        <span class="cell-sub">
+          ${decoyChip(a)}
+          ${a.campaign_name ? `<span class="dim">团伙 ${escapeHtml(a.campaign_name)}</span>` : ""}
+        </span>
+      </td>
+      <td class="mono">${escapeHtml(KIND_LABEL[a.kind] || a.kind)}</td>
+      <td class="mono" style="color:${scoreColor(a.score)}">${a.score}</td>
+      <td class="mono">${a.confidence.toFixed(2)}</td>
+      <td class="mono"><span class="cap-dot ${escapeHtml(a.capture_state || "pending")}" title="${escapeHtml(captureTitle(a))}">${escapeHtml(captureShort(a))}</span></td>
+      <td class="mono">${fmtTime(a.last_seen)}</td>
+      <td class="mono">${a.scan_count}</td>
+    </tr>`;
+}
+
+function decoyChip(a) {
+  const d = a.decoy;
+  if (!d) return "";
+  if (d.blocked_by) return `<span class="chip warn" title="${escapeHtml(d.blocked_by)}">WAF 拦截</span>`;
+  if (d.honeypot) return `<span class="chip bad" title="${escapeHtml((d.honeypot_reasons || []).join("；"))}">蜜罐</span>`;
+  const label = { security_check: "核验诱饵", redirect_shell: "跳转壳", expired: "收尾页", blank_shell: "空壳", download_shell: "下载壳" }[d.kind] || "诱饵";
+  return `<span class="chip warn" title="${escapeHtml(d.reason || "")}">${escapeHtml(label)}</span>`;
+}
+
+function bindAssetRows() {
+  $$("#asset-table tbody tr[data-asset]").forEach(tr =>
+    tr.addEventListener("click", () => openAsset(tr.dataset.asset)));
+
+  $$("#asset-table .g-toggle").forEach(el => el.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const key = el.dataset.toggle;
+    if (state.expandedGroups.has(key)) state.expandedGroups.delete(key);
+    else state.expandedGroups.add(key);
+    loadAssets();
+  }));
+}
+
 function renderAssetMeta(data) {
   const el = $("#asset-meta");
   if (!el) return;
@@ -809,9 +913,15 @@ function renderAssetMeta(data) {
     ? (c.cold ? `<button class="ev-link" data-tier-jump="cold">另有 ${c.cold} 条冷存（评分不足，先记着）</button>` : "")
       + (c.dismissed ? `<button class="ev-link" data-tier-jump="dismissed">已排除 ${c.dismissed}</button>` : "")
     : "";
-  el.innerHTML = `<span>${escapeHtml(tierLabel)}</span><span>共 <b>${data.total}</b> 条</span>`
+  // 折叠后「共 12 项」和「95 条」不是一回事，两个数都得给——
+  // 否则用户会以为折叠把线索弄丢了。
+  const folded = data.collapsed && data.raw_total > data.total
+    ? `<span>${data.raw_total} 条折成 <b>${data.total}</b> 项（${data.group_count || 0} 组同源）</span>`
+    : "";
+  const toggle = `<button class="ev-link" data-collapse-toggle>${data.collapsed ? "展开全部（不折叠）" : "按同源折叠"}</button>`;
+  el.innerHTML = `<span>${escapeHtml(tierLabel)}</span><span>共 <b>${data.total}</b> 项</span>`
     + (data.total ? `<span>当前 ${from}–${to}</span>` : "")
-    + other;
+    + folded + other + toggle;
 }
 
 function renderAssetPager(data) {
@@ -849,6 +959,51 @@ function renderAssetPager(data) {
     state.assetOffset = (page - 1) * state.assetLimit;
     loadAssets();
   }));
+}
+
+/* ---------------- 同源批次卡片 ---------------- */
+
+function renderGroupCard(g) {
+  if (!g || !g.size) return "";
+  const elder = g.elder_count ? `<span class="g-badge">其中 ${g.elder_count} 条涉老</span>` : "";
+  const rows = (g.members || []).slice(0, 15).map(m => `
+    <div class="peer-row" data-asset="${m.id}">
+      <span class="mono peer-val">${escapeHtml(m.value)}</span>
+      ${m.elder ? `<span class="chip warn">涉老</span>` : ""}
+      <span class="mono dim">${escapeHtml(TIER_LABEL[m.tier] || m.tier || "")}</span>
+      <span class="mono" style="color:${scoreColor(m.score)}">${m.score}</span>
+    </div>`).join("");
+  const more = (g.members || []).length > 15
+    ? `<div class="peer-more dim">另有 ${g.members.length - 15} 条，在列表页展开这一组查看</div>` : "";
+  return `
+    <div class="section-title">同源批次
+      <span class="hint">${escapeHtml(g.label)} · ${g.size} 条</span>${elder}
+    </div>
+    <div class="peer-list">${rows}${more}</div>`;
+}
+
+/* ---------------- 诱饵 / 蜜罐卡片 ---------------- */
+
+function renderDecoyCard(d) {
+  const label = { security_check: "核验诱饵", redirect_shell: "跳转壳", expired: "收尾页", blank_shell: "空壳页", download_shell: "下载壳页" }[d.kind] || "诱饵";
+  const cls = d.honeypot ? "bad" : "warn";
+  const lines = [];
+  if (d.blocked_by) lines.push(`<div class="d">被 <b>${escapeHtml(d.blocked_by)}</b> 拦截，本页不是目标站的内容，已按失败重试。</div>`);
+  if (d.reason) lines.push(`<div class="d">${escapeHtml(d.reason)}</div>`);
+  if (d.honeypot) {
+    lines.push(`<div class="d">反自动化措施：${escapeHtml((d.honeypot_reasons || []).join("；"))}</div>`);
+  }
+  if ((d.downstream || []).length) {
+    lines.push(`<div class="d">去向：${d.downstream.map(u => `<span class="mono">${escapeHtml(u)}</span>`).join("、")}</div>`);
+  }
+  // 「诱饵不是坏消息」这件事必须写在界面上，否则复核的人会顺手把它排除掉。
+  lines.push(`<div class="d dim">诱饵不等于无关：它把访客送到下一跳，是分发链路上的节点。排除它等于放弃入口。</div>`);
+
+  return `
+    <div class="section-title">形态判定
+      <span class="hint">${escapeHtml(d.blocked_by ? "基础设施拦截" : label)}</span>
+    </div>
+    <div class="notice ${cls}"><div>${lines.join("")}</div></div>`;
 }
 
 /* ---------------- 详情抽屉 ---------------- */
@@ -893,6 +1048,9 @@ async function openAsset(id) {
       <div id="drawer-action-msg"></div>
 
       ${a.purpose && a.purpose.suppressed ? `<div class="notice">该站用途为「${escapeHtml(a.purpose.label)}」，不占高危队列：${escapeHtml(a.purpose.reason || "")}</div>` : ""}
+
+      ${renderGroupCard(a.group)}
+      ${a.decoy ? renderDecoyCard(a.decoy) : ""}
 
       <div class="section-title">证据矩阵
         <span class="hint">${(a.evidence_matrix && a.evidence_matrix.present) || 0}
@@ -1085,6 +1243,11 @@ function bindDrawerActions(a) {
         await openAsset(a.id);
       } catch (e) { toast(e.message); }
     });
+  });
+
+  // 同源批次里的兄弟条目可以直接跳过去：排查一组站时不必回列表再搜
+  body.querySelectorAll(".peer-row[data-asset]").forEach(row => {
+    row.addEventListener("click", () => openAsset(Number(row.dataset.asset)));
   });
 }
 

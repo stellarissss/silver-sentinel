@@ -120,6 +120,13 @@ class Asset(Base):
     # 网络抖动 10 分钟），避免 NXDOMAIN 这类永久失败按分钟循环烧浏览器。
     capture_retry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # ---- 同源折叠
+    # 同一张证书 / 同一收单端点 / 同一套模板的资产折成一行展示。
+    # 为什么落到列而不是只放 meta：列表页要按组聚合排序，JSON 列上做
+    # GROUP BY 在 SQLite 里要走表达式索引，几十万行会卡住。
+    group_key: Mapped[str] = mapped_column(String(96), default="", index=True)
+    group_kind: Mapped[str] = mapped_column(String(16), default="")
+
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     notes: Mapped[str] = mapped_column(Text, default="")
     reviewed_by: Mapped[str] = mapped_column(String(80), default="")

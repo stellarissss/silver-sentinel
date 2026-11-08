@@ -1028,6 +1028,62 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 端点提取失败不能影响取证
             log.debug("端点提取失败 %s：%s", asset_id, exc)
 
+        # ---- 诱饵 / 蜜罐：这一页是不是样子货。
+        #
+        # 暖阳那一批（26537.net）首页写着「安全检测中心，请稍候」，正文一个
+        # 涉老词都没有，于是被判「证据不足」扔在候选池里躺着。判断没错，
+        # 结论错了：它不是没有价值，它是**分发渠道**。
+        #
+        # 这一步要在涉老判定之前，因为诱饵的价值就是「把人送到下一跳」，
+        # 那条证据要能进 elder 的「转化动作」。反过来，WAF 挑战页也被识别成
+        # 「请稍候」，所以必须先把它从证据链里摘出去——拿它判低分等于
+        # 用「我们被墙了」证明「对方没问题」。
+        try:
+            from .decoy import assess as assess_decoy
+
+            sig = assess_decoy(
+                html=obs.html or "",
+                text=obs.text or "",
+                title=obs.title or "",
+                status=obs.status or 0,
+                final_url=obs.final_url or obs.url,
+                request_host=claim_host or probe_host,
+                html_len=obs.html_len or len(obs.html or ""),
+                forms=obs.forms,
+                second_hop=hop,
+                apk_links=obs.apk_links,
+                download_entries=obs.download_entries,
+                post_targets=facts.get("page_post_targets") or [],
+                honeypot_report=obs.honeypot,
+            )
+            facts["decoy"] = sig.as_dict()
+            if sig.is_decoy:
+                log.info("诱饵页 %s：%s", value[:40], sig.reason)
+            if sig.honeypot:
+                log.info("反自动化措施 %s：%s", value[:40], "；".join(sig.honeypot_reasons[:2]))
+
+            # 被 WAF 拦了：证据（截图/HTML）照样留，但这一趟不产生结论。
+            # 按 blocked 冷却一天再试——把它当「内容为空」判低分，会让一批
+            # 正常站永久沉底，而且再也捞不回来（capture_state 已是 captured）。
+            if sig.is_interstitial():
+                meta["facts"] = facts
+                meta["decoy"] = sig.as_dict()
+                asset.meta = meta
+                asset.capture_state = "failed"
+                asset.capture_error = f"被 {sig.blocked_by} 拦截，页面非目标内容"
+                asset.capture_retry_at = utcnow() + timedelta(
+                    hours=settings.capture_blocked_retry_hours
+                )
+                s.flush()
+                return {
+                    "ok": False,
+                    "kind": FAILURE_BLOCKED,
+                    "reason": f"被 {sig.blocked_by} 拦截（WAF 挑战页，待重试）",
+                    "status": obs.status,
+                }
+        except Exception as exc:  # noqa: BLE001 诱饵判定失败不能影响取证
+            log.debug("诱饵判定失败 %s：%s", asset_id, exc)
+
         # ---- 涉老判定：这个站是不是在骗老人的钱。
         # 与「用途」正交：用途回答「这站是干什么的」，涉老回答「冲着谁来的」。
         # 客服站也会被判用途，但不会被判涉老——两者的词表没有交集。
@@ -1065,6 +1121,29 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         s.flush()
 
     _set_capture_state(asset_id, "captured")
+
+    # ---- 同源折叠：算出这一条属于哪一批。
+    #
+    # 一次证书带 91 个域名、一个 submit.php 背后 77 个前端，列表页平铺出来
+    # 就是九十行一模一样的东西，人工复核看不出「这是一批」。
+    # 键的优先级在 grouping 里定：团伙 > 同证书 > 同收单端点 > 同模板。
+    # 没有把握就不成组——错组比不组更糟，它会把无关的站折叠成「一伙的」。
+    try:
+        from .grouping import compute as compute_group
+
+        gkey, gkind, glabel = compute_group(kind=kind, value=value, meta=meta, facts=facts)
+        with session_scope() as s:
+            row = s.get(Asset, asset_id)
+            if row is not None and (row.group_key or "") != gkey:
+                row.group_key = gkey
+                row.group_kind = gkind
+                if glabel:
+                    row_meta = dict(row.meta or {})
+                    row_meta["group_label"] = glabel
+                    row.meta = row_meta
+                s.flush()
+    except Exception as exc:  # noqa: BLE001 分组失败不能影响取证结论
+        log.debug("分组计算失败 %s：%s", asset_id, exc)
 
     # ---- 后端端点入库：一个 submit.php 背后是一整批域名。
     # 放在事务外，独立失败不影响本次取证结论。

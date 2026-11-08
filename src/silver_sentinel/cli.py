@@ -790,8 +790,172 @@ def cmd_rescore(args) -> int:
     return 0
 
 
-# ---------------------------------------------------------------- 发现
+def cmd_regroup(args) -> int:
+    """回填同源分组与诱饵判定。
 
+    线上已经取过证的一批资产没有 group_key（列是后加的），列表页仍然是
+    九十行「2026年个人财政补贴申领」平铺。这条命令按取证留下的事实重算分组；
+    --decoy 会顺带读回证据仓里的 page_text / page_html，补出诱饵标记。
+
+    只读证据、只写 group_key / group_kind / meta.facts.decoy，不改分数与档位。
+    分组是展示层的事，不该反过来影响判定。
+    """
+    from sqlalchemy import select
+
+    from .grouping import compute as compute_group
+    from .models import Asset
+
+    init_db()
+    changed = 0
+    scanned = 0
+    with session_scope() as s:
+        q = select(Asset)
+        if args.tier:
+            tiers = [t.strip() for t in args.tier.split(",") if t.strip()]
+            q = q.where(Asset.tier.in_(tiers))
+        else:
+            q = q.where(Asset.tier != "dismissed")
+        if args.limit:
+            q = q.limit(args.limit)
+        for a in s.scalars(q):
+            scanned += 1
+            meta = dict(a.meta or {})
+            facts = meta.get("facts") if isinstance(meta.get("facts"), dict) else {}
+            key, kind, label = compute_group(
+                kind=a.kind, value=a.value, meta=meta, facts=facts
+            )
+            if (a.group_key or "") != key or (a.group_kind or "") != kind:
+                a.group_key = key
+                a.group_kind = kind
+                changed += 1
+            if label and meta.get("group_label") != label:
+                meta["group_label"] = label
+                a.meta = meta
+
+    decoy_filled = 0
+    if args.decoy:
+        decoy_filled = _backfill_decoy(limit=args.decoy_limit, force=args.decoy_force)
+
+    print(json.dumps(
+        {"scanned": scanned, "group_changed": changed, "decoy_filled": decoy_filled},
+        ensure_ascii=False, indent=2,
+    ))
+    return 0
+
+
+def _backfill_decoy(limit: int = 500, *, force: bool = False) -> int:
+    """从证据仓读回页面正文，补算诱饵判定。
+
+    为什么要读证据仓而不是重抓：这批资产已经取过证了，重抓一轮要半小时
+    浏览器时间，而且对方可能已经换页——留存的 HTML 才是「当时是什么样」。
+    """
+    from sqlalchemy import select
+
+    from . import decoy as decoy_mod
+    from .models import Asset, Evidence
+
+    with session_scope() as s:
+        ids = list(
+            s.scalars(
+                select(Asset.id)
+                .where(Asset.tier.in_(("confirmed", "watch", "candidate")))
+                .order_by(Asset.score.desc())
+                .limit(limit)
+            )
+        )
+
+    filled = 0
+    for aid in ids:
+        try:
+            with session_scope() as s:
+                asset = s.get(Asset, aid)
+                if asset is None:
+                    continue
+                meta = dict(asset.meta or {})
+                # 必须浅拷贝一层再改。直接改 meta["facts"] 里的原对象，
+                # 会让 SQLAlchemy 在 flush 时认为「新旧值相同」（因为旧值
+                # 已经被同一个引用改掉了），写入静默丢失——线上实测
+                # 210 次回填只落了 11 条。
+                facts = dict(meta.get("facts") or {}) if isinstance(meta.get("facts"), dict) else {}
+                if isinstance(facts.get("decoy"), dict) and not force:
+                    continue
+                rows = list(
+                    s.scalars(
+                        select(Evidence).where(
+                            Evidence.asset_id == aid,
+                            Evidence.deleted_at.is_(None),
+                            Evidence.kind.in_(("page_html", "page_text", "forms")),
+                        )
+                    )
+                )
+                paths = {e.kind: e.path for e in rows}
+                title = str(facts.get("page_title") or "")
+                status = int(facts.get("web_status") or 0)
+                html = _read_evidence(paths.get("page_html", ""))[:400_000]
+                text = _read_evidence(paths.get("page_text", ""))[:60_000]
+                if not (html or text):
+                    continue
+                sig = decoy_mod.assess(
+                    html=html,
+                    text=text,
+                    title=title,
+                    status=status,
+                    final_url=str(facts.get("final_url") or asset.value),
+                    request_host=str(asset.value)[:80],
+                    html_len=len(html),
+                    # 回填时没有 DOM，但 facts 里有端点列表——有端点就等于有表单。
+                    # 少了这一条，核验诱饵会被判成「没有去向」。
+                    forms=[{}] * min(len(facts.get("endpoints") or []), 2),
+                    second_hop=facts.get("form_page") or {},
+                    apk_links=facts.get("apk_links") or [],
+                    download_entries=[],
+                    post_targets=facts.get("page_post_targets") or [],
+                    honeypot_report=facts.get("honeypot") or {},
+                )
+                facts["decoy"] = sig.as_dict()
+
+                # 判定链要跟着动：诱饵是「转化动作」的一条证据。
+                # 只写 decoy 不重算 elder，等于发现了新证据却不去用——
+                # 那批「安全检测中心」页正是靠这一条才够得上涉老。
+                facts.pop("elder", None)
+                try:
+                    from .elder import assess as assess_elder
+
+                    facts["elder"] = assess_elder(facts, text=text).as_dict()
+                except Exception:  # noqa: BLE001 单条判定失败保持原状
+                    pass
+
+                meta["facts"] = facts
+                asset.meta = meta
+
+                # 有去向的诱饵不给冷存：冷存等于再也不看，而入口会换地址。
+                # 只升不降——回填是补证据，不是重新审判。
+                if sig.is_decoy and sig.downstream and asset.tier == "cold":
+                    asset.tier = "candidate"
+                    asset.discovery_reason = (
+                        f"诱饵/分发节点：{sig.reason}，去向 {len(sig.downstream)} 个"
+                    )[:500]
+                filled += 1
+        except Exception:  # noqa: BLE001 单条失败不影响整批
+            continue
+    return filled
+
+
+def _read_evidence(path: str) -> str:
+    if not path:
+        return ""
+    p = Path(path)
+    if not p.is_absolute():
+        p = settings.data_dir / path
+    try:
+        if not p.is_file() or p.stat().st_size > 8_000_000:
+            return ""
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------- 发现
 
 def _pivot_cli(args) -> int:
     """手工同源扩散：给一个域名，把同证书/同 IP 的兄弟域名全列出来。
@@ -1546,6 +1710,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="连没有正文的资产也重算")
     p.add_argument("--retier", action="store_true", help="允许降档（规则口径变更后重新定级）")
     p.set_defaults(func=cmd_rescore)
+
+    p = sub.add_parser("regroup", help="回填同源分组（同证书/同收单/同模板）与诱饵标记")
+    p.add_argument("--tier", default="", help="只处理这些档位，逗号分隔")
+    p.add_argument("--limit", type=int, default=0, help="最多处理多少条（0=不限）")
+    p.add_argument("--decoy", action="store_true", help="顺带从证据仓补算诱饵判定")
+    p.add_argument("--decoy-limit", type=int, default=500, help="补算诱饵的条数上限")
+    p.add_argument("--decoy-force", action="store_true", help="覆盖已有诱饵结论（判据改了之后用）")
+    p.set_defaults(func=cmd_regroup)
 
     p = sub.add_parser("eval-production", help="只读重评：新规则会把谁升档、把谁降档")
     p.add_argument("--tier", default="", help="只看某个档位，逗号分隔")
