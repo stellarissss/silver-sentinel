@@ -69,7 +69,8 @@ _ACTION = re.compile(
     r"加微信|添加微信|扫码|扫描二维码|微信客服|企业微信|"
     r"下载安装|立即下载|安卓版|安装包|"
     r"免费领取|免费领|"
-    r"立即领取|马上领取|限时|仅剩|名额有?限|倒计时|今日截止|过期作废"
+    r"立即领取|马上领取|限时|仅剩|名额有?限|倒计时|今日截止|过期作废|"
+    r"立即申报|马上申报|立即申请|下一步|立即认证|去领取"
 )
 
 AUTHORITY_CLAIMS = frozenset({"fake_site_id", "fake_icp", "impersonation", "fabricated_agency"})
@@ -131,6 +132,24 @@ def assess(facts: dict[str, Any], text: str = "") -> ElderSignal:
     id_inputs = _num(facts.get("id_inputs") or (feats.get("id_inputs") if isinstance(feats, dict) else 0))
     if id_inputs and not identity:
         identity = [f"表单含 {id_inputs} 个证件/卡号输入框"]
+
+    # 提交端点上收到的字段，是整个系统里最硬的一条身份索取证据。
+    #
+    # 正文里的「身份证」可能只是办事指南（"请携带身份证"），但
+    # `POST https://d7k2m.cn/submit.php` 上的 `idcard` / `bankcard` 输入框
+    # 只有一个用途：把老人的姓名、身份证、卡号、预留手机号整包送走。
+    # 再加上字段名伪装（`password` 收身份证）就更是铁证——那不是疏忽，
+    # 是对着扫描器写的。
+    sensitive = facts.get("sensitive_fields") or []
+    if isinstance(sensitive, list) and sensitive:
+        note = "提交端点收「" + "/".join(str(x) for x in sensitive[:4]) + "」"
+        if note not in identity:
+            identity.insert(0, note)
+    disguised = facts.get("disguised_fields") or []
+    if isinstance(disguised, list) and disguised:
+        identity.insert(
+            0, "字段名伪装：" + "、".join(str(x) for x in disguised[:4]) + " 实际收敏感信息"
+        )
 
     # 权威冒用只认结构化判定（claim 抽的是 header/版权行里的自称，
     # 有语境），不认正文词频——正规站天天引用「民政部」「国务院」。

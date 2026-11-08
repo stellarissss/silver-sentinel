@@ -202,3 +202,41 @@ def test_login_page_describing_sms_code_is_not_identity_theft():
     """
     text = "美团商家版 官方登录入口 登录入口支持账号密码、短信验证码等多种验证方式"
     assert not assess({}, text).hits["identity"]
+
+
+# ---------------------------------------------------------------- 提交端点（v1.13）
+
+def test_backend_endpoint_fields_count_as_identity():
+    """表单提交端点收身份证/银行卡 —— 比正文里出现「身份证」三个字硬得多。
+
+    正文可能只是办事指南（"请携带身份证"），但 POST 到 d7k2m.cn/submit.php
+    的 idcard / bankcard 输入框只有一个用途。
+    """
+    facts = {"sensitive_fields": ["身份证号", "银行卡号"]}
+    text = "2026年个人财政补贴申领 立即申报"
+    sig = assess(facts, text)
+    assert sig.is_elder
+    assert sig.priority == "P0"
+    assert any("提交端点" in h for h in sig.hits["identity"])
+
+
+def test_disguised_fields_are_reported():
+    """字段名伪装（password 收身份证）单独成一条理由。"""
+    facts = {"disguised_fields": ["password", "captcha_denglu"]}
+    sig = assess(facts, "养老金补发 立即领取")
+    assert sig.is_elder
+    assert any("伪装" in h for h in sig.hits["identity"])
+
+
+def test_sensitive_fields_alone_without_audience_is_not_elder():
+    """只收身份证、但没有受众指向 —— 那是普通钓鱼，不占涉老队列。"""
+    facts = {"sensitive_fields": ["身份证号"]}
+    sig = assess(facts, "账号异常，请重新登录")
+    assert not sig.is_elder
+
+
+def test_clean_form_does_not_create_identity():
+    """正常注册表单（用户名 + 密码）不该被算成身份索取。"""
+    sig = assess({}, "注册账号即可参与社区活动")
+    assert not sig.is_elder
+    assert not sig.hits["identity"]

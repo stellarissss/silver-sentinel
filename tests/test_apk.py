@@ -191,3 +191,43 @@ def test_unparsed_apk_does_not_fall_into_cold(fresh_db):
     with session_scope() as s:
         asset = s.get(Asset, aid)
         assert asset.tier != TIER_COLD
+
+
+# ---------------------------------------------------------------- 配额随磁盘走（v1.13）
+
+def test_size_cap_scales_with_disk(monkeypatch):
+    """单包上限跟着磁盘余量走，不写死 50MB。
+
+    50MB 是「磁盘只剩 6.9G」时代的妥协。实测涉老诈骗包 80MB 很常见
+    （uni-app 壳 + 加固 + 内置浏览器内核），硬卡 50MB 等于只看得见小包。
+    """
+    from silver_sentinel import capture
+
+    monkeypatch.setattr(capture, "_disk_free_gb", lambda: 30.0)
+    assert capture._apk_size_cap("candidate") == 300
+
+    monkeypatch.setattr(capture, "_disk_free_gb", lambda: 5.0)
+    assert capture._apk_size_cap("candidate") == 150
+
+    monkeypatch.setattr(capture, "_disk_free_gb", lambda: 2.0)
+    assert capture._apk_size_cap("candidate") == 80
+
+
+def test_daily_limit_scales_with_disk(monkeypatch):
+    from silver_sentinel import capture
+
+    monkeypatch.setattr(capture, "_disk_free_gb", lambda: 30.0)
+    assert capture._apk_daily_limit_mb() == 2000
+    monkeypatch.setattr(capture, "_disk_free_gb", lambda: 2.0)
+    assert capture._apk_daily_limit_mb() == 200
+
+
+def test_low_disk_stops_download(monkeypatch, fresh_db):
+    """磁盘不足时明确拒绝，而不是下到一半 EIO。"""
+    from silver_sentinel import capture
+
+    monkeypatch.setattr(capture, "_disk_free_gb", lambda: 1.0)
+    out = capture._download_apk_locked(1, ["https://x.cn/a.apk"], "https://x.cn/", "candidate")
+    assert out["ok"] is False
+    assert out["skipped"] is True
+    assert "剩余不足" in out["reason"]

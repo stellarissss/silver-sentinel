@@ -304,6 +304,15 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
             ["外部线索待取证（已确认页面存在，不做域名级降档）"],
         )
 
+    # ---- 提交端点：页面本身往往是一片空白（只接受 POST），拿正文判它等于
+    # 用「没有内容」证明「没有问题」。它的价值在关联——一个 submit.php
+    # 背后是几十个前端域名和一整批受害者记录。留在候选池等样本回连。
+    if (asset.meta or {}).get("role") == "backend":
+        return TriageDecision(
+            TIER_CANDIDATE,
+            ["提交端点（收集敏感信息），保留以关联前端域名"],
+        )
+
     urgent, urgency_reasons = _urgency(facts, asset)
     hard = _hard_evidence(facts, score, verdict)
 

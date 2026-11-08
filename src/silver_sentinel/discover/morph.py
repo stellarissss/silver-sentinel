@@ -192,3 +192,37 @@ def assess(host: str) -> MorphScore:
 def is_random_label(label: str) -> bool:
     """便捷判定：标签是否典型随机串（阈值取实测分界 0.55）。"""
     return assess(label).score >= 0.55
+
+
+# ---------------------------------------------------------------- 批次判定
+
+BULK_MIN_DOMAINS = 8        # 少于这个数谈不上「一批」
+BULK_HOT_SCORE = 0.60       # 单个域名达到这个分算「随机串」
+BULK_HOT_RATIO = 0.60       # 一批里随机串至少占这么多
+
+
+def is_bulk_batch(domains: list[str]) -> bool:
+    """一群域名像不像「同一个生成器吐出来的」。
+
+    用例是证书 SAN：实测 np4w53.cn 那张证书挂了 90 个域名，全是
+    `oi6o45.cn` `uw2v71.cn` `tx7y28.cn` 这种。而正常站（baidu.com）的
+    SAN 里也有 50 个，但全是 `click.hm.baidu.com` `baifubao.com` 这类
+    有意义的业务域名。
+
+    判据用**比例**不用「有没有随机串」：共享主机和 CDN 的证书里也会混着
+    几个随机子域，但不会 60% 都是。
+    """
+    names = [d for d in (domains or []) if d and "." in d]
+    if len(names) < BULK_MIN_DOMAINS:
+        return False
+    # 抽样判定：一张证书可能有 90 个域名，逐个打分在 CT 主循环里是纯浪费。
+    # 12 个样本够看出命名习惯，误差在 ±8% 以内，不影响 60% 这条线。
+    sample = names if len(names) <= 12 else names[:12]
+    hot = 0
+    for d in sample:
+        try:
+            if assess(d).score >= BULK_HOT_SCORE:
+                hot += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return hot / len(sample) >= BULK_HOT_RATIO

@@ -153,7 +153,7 @@ _MAX_NETWORK = 4_000_000
 _CAPTURE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ss-capture")
 # 单次取证的硬上限。沙箱自身 45 秒超时，加上 APK 下载与截图，
 # 240 秒还没回来就一定有东西卡住了，直接换线程比干等 10 分钟强。
-_CAPTURE_TIMEOUT = 240
+_CAPTURE_TIMEOUT = 150
 
 
 # ---------------------------------------------------------------- 队列
@@ -332,9 +332,9 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
             s.scalars(
                 select(CaptureTask).where(
                     CaptureTask.state == "running",
-                    # 单条取证硬超时 240 秒；超过 10 分钟还挂着，只可能是进程被
-                    # 杀掉时留下的行。回收得越快，重启后的空窗越短。
-                    CaptureTask.started_at < now - timedelta(minutes=10),
+                    # 单条取证硬超时 150 秒；超过 5 分钟还挂着，只可能是线程被
+                    # Playwright 卡死后新线程又接了别的活。回收得越快，空窗越短。
+                    CaptureTask.started_at < now - timedelta(minutes=5),
                 )
             )
         )
@@ -632,7 +632,42 @@ def capture_asset(asset_id: int) -> dict[str, Any]:
         text = f"{result.get('reason') or ''}{result.get('error') or ''}"
         if "浏览器不可用" in text or "asyncio loop" in text or "different thread" in text:
             _reset_capture_pool()
+            _note_browser_failure()
+        else:
+            _BROWSER_FAILS[0] = 0
         return result
+
+
+# 连续多少次「浏览器不可用」就认定进程里的 Playwright 已经不可救。
+#
+# 换线程只在**第一次**有效：线上实测换完之后新线程仍然报
+# `Sync API inside the asyncio loop`，因为毒化的是进程级的 greenlet /
+# event loop 状态，不是某个线程的局部状态。继续换线程只是把同一个错误
+# 重放一遍——队列里 300 个待取证资产一动不动，日志里全是同一行。
+#
+# 这时候唯一可靠的自愈是让进程重启。systemd 30 秒内拉起来，比人工
+# 上去 kill 快得多，也比一条一条失败干净。
+_BROWSER_FAILS = [0]
+_BROWSER_FAIL_LIMIT = 3
+
+
+def _note_browser_failure() -> None:
+    _BROWSER_FAILS[0] += 1
+    if _BROWSER_FAILS[0] < _BROWSER_FAIL_LIMIT:
+        return
+    log.error(
+        "连续 %d 次浏览器不可用，进程已无法自愈，主动退出等待 systemd 重启",
+        _BROWSER_FAILS[0],
+    )
+    try:
+        emit("capture.browser_dead", restarts=_BROWSER_FAILS[0])
+    except Exception:  # noqa: BLE001
+        pass
+    # 先让 systemd 看到一个「失败」而不是「干净退出」，否则 Restart=on-failure
+    # 不会拉起它。sleep 2 秒是给 StartLimitBurst 留余量：systemd 默认
+    # 10 秒内起 5 次就判定为「启动循环」，直接送进 failed 不再尝试。
+    time.sleep(2)
+    os._exit(3)
 
 
 def _reset_capture_pool() -> None:
@@ -913,13 +948,96 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 用途分类失败不能影响取证
             log.debug("用途分类失败 %s：%s", asset_id, exc)
 
+        # ---- 证书 SAN：一个站的证书里往往写着整批域名。
+        #
+        # 放在取证流程里而不是发现层：只有已经确认要看的目标，才值得多花
+        # 一次 TLS 握手（200ms，标准库，零外部配额）。
+        try:
+            from .collectors.cert import fetch as fetch_cert
+
+            cert = fetch_cert(claim_host or probe_host, timeout=8.0)
+            if cert.ok:
+                facts["cert"] = cert.as_dict()
+                if len(cert.dns_names) > 1:
+                    facts["cert_dns_names"] = cert.dns_names
+                # Playwright 的 security_details 只给 subject/issuer，
+                # 这里补上更完整的版本（含有效期与序列号）
+                if cert.issuer and not facts.get("tls_issuer"):
+                    facts["tls_issuer"] = cert.issuer
+                if cert.subject and not facts.get("tls_subject"):
+                    facts["tls_subject"] = cert.subject
+        except Exception as exc:  # noqa: BLE001 证书取不到不影响取证
+            log.debug("证书解析失败 %s：%s", asset_id, exc)
+
+        # ---- 后端端点：数据往哪走。
+        #
+        # 首页只是一张诱饵，真正收身份证和银行卡的是第二跳。实测 np4w53 首页
+        # 连 <form> 都没有，提交地址 https://d7k2m.cn/submit.php 只写在 1.html
+        # 的 JS 里；十个同模板站共用这一个端点。
+        #
+        # 这一步必须在涉老判定之前做：第二跳的表单页才是「身份索取」的直接
+        # 证据，而首页正文里一个证件字样都没有。
+        hop = obs.second_hop or {}
+        hop_text = ""
+        try:
+            from .collectors.endpoints import extract as extract_endpoints
+
+            first = extract_endpoints(
+                obs.html or "", obs.final_url or obs.url, dom_forms=obs.forms
+            )
+            second = None
+            if hop.get("html"):
+                hop_text = str(hop.get("text") or "")
+                second = extract_endpoints(str(hop["html"]), str(hop.get("url") or ""))
+
+            merged: list = []
+            seen_keys: set[tuple[str, str]] = set()
+            for ep in (second.endpoints if second else []) + first.endpoints:
+                key = (ep.url, ep.method)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                merged.append(ep)
+
+            facts["endpoints"] = [e.as_dict() for e in merged[:10]]
+            host_union: list[str] = []
+            for src in (second.backend_hosts if second else []) + first.backend_hosts:
+                if src not in host_union:
+                    host_union.append(src)
+            facts["backend_hosts"] = host_union[:10]
+
+            # 汇总所有端点上的敏感字段类型——这是 elder 的 identity 证据
+            kinds: list[str] = []
+            for ep in merged:
+                for k in ep.sensitive:
+                    if k not in kinds:
+                        kinds.append(k)
+            facts["sensitive_fields"] = kinds
+            if any(e.disguised for e in merged):
+                facts["disguised_fields"] = sorted(
+                    {n for e in merged for n in e.disguised}
+                )
+            if hop:
+                facts["form_page"] = {
+                    "url": str(hop.get("url") or "")[:300],
+                    "title": str(hop.get("title") or "")[:200],
+                    "button": str(hop.get("button") or "")[:60],
+                    "inputs": int(hop.get("inputs") or 0),
+                    "navigated": bool(hop.get("navigated")),
+                }
+        except Exception as exc:  # noqa: BLE001 端点提取失败不能影响取证
+            log.debug("端点提取失败 %s：%s", asset_id, exc)
+
         # ---- 涉老判定：这个站是不是在骗老人的钱。
         # 与「用途」正交：用途回答「这站是干什么的」，涉老回答「冲着谁来的」。
         # 客服站也会被判用途，但不会被判涉老——两者的词表没有交集。
         try:
             from .elder import assess as assess_elder
 
-            elder = assess_elder(facts, text=(obs.text or "")[:40000])
+            # 第二跳的表单页正文合并进去：首页写「补贴已到账」，2 跳才写
+            # 「请输入身份证号 / 银行卡号」。只看首页等于只看到诱饵。
+            elder_text = ((hop_text + "\n" if hop_text else "") + (obs.text or ""))[:40000]
+            elder = assess_elder(facts, text=elder_text)
             facts["elder"] = elder.as_dict()
         except Exception as exc:  # noqa: BLE001 涉老判定失败不能影响取证
             log.debug("涉老判定失败 %s：%s", asset_id, exc)
@@ -947,6 +1065,32 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         s.flush()
 
     _set_capture_state(asset_id, "captured")
+
+    # ---- 后端端点入库：一个 submit.php 背后是一整批域名。
+    # 放在事务外，独立失败不影响本次取证结论。
+    try:
+        backends = _register_backend_assets(asset_id, value, facts)
+        if backends:
+            log.info("提交端点：%s 指向 %s", value, "、".join(backends[:4]))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("后端端点登记异常 %s：%s", asset_id, exc)
+
+    # ---- 证书 SAN 展开：一个站带出一批站。
+    # 只对确认有问题的站做（涉老 / 高危安装包 / 高分），否则每抓一个正常站
+    # 就展开一次，队列会被灌爆。
+    elder = facts.get("elder") or {}
+    worth_spread = (
+        bool(isinstance(elder, dict) and elder.get("elder"))
+        or bool(facts.get("apk_danger"))
+        or float(new_score or 0.0) >= 60
+    )
+    if worth_spread:
+        try:
+            family = _register_cert_family(value, facts)
+            if family:
+                log.info("同证书展开：%s → %d 个", value, len(family))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("同证书展开异常 %s：%s", asset_id, exc)
 
     # ---- APK 下载（在事务外做，别把长下载塞进数据库事务）
     apk_info: dict[str, Any] = {}
@@ -1106,12 +1250,247 @@ def _apk_used_today() -> int:
 _APK_LOCK = threading.Lock()
 
 
+CERT_FAMILY_LIMIT = 80
+
+
+def _register_cert_family(value: str, facts: dict[str, Any]) -> list[str]:
+    """把同一张证书上的域名入池。
+
+    这是「广泛」唯一的物理量。实测 np4w53.cn 的证书 SAN 里有 91 个域名，
+    抽 10 个测存活：9 个在线、同一个 IP、标题逐字相同。而我们库里只有 1 个。
+
+    骗子可以一天换一个域名，但换域名就得重新签证书，而重签时脚本会把整批
+    域名一起写进 SAN。证书是他们的注册表，我们只是去读它。
+
+    只对「批量签发」展开——正常站（baidu.com）的 SAN 里也有 50 个域名，
+    但那是业务域名，展开等于往库里灌垃圾。
+    """
+    from .discover.morph import is_bulk_batch
+    from .normalize import is_pivot_noise, is_shared_infra, registrable_domain
+
+    names = facts.get("cert_dns_names")
+    if not isinstance(names, list) or len(names) < 8:
+        return []
+    if not is_bulk_batch([str(n) for n in names]):
+        return []
+    if not facts.get("cert_bulk"):
+        # 判断成立就落个标记，复盘时能直接筛出「这批是一张证书带出来的」
+        facts["cert_bulk"] = True
+
+    me = registrable_domain(_host_of(value) or value)
+
+    # 扩散深度上限 2 层：A 的证书带出 B 群，B 的证书带出 C 群就停。
+    # 不设上限的话，一个高活跃团伙能在几天内把全库的证书都爬一遍，
+    # 队列被历史垃圾塞满，新线索反而排不上。
+    depth = 0
+    try:
+        with session_scope() as s:
+            row = s.execute(
+                select(Asset.meta).where(Asset.kind == "domain", Asset.value == me)
+            ).scalar_one_or_none()
+            depth = int((row or {}).get("spread_depth") or 0)
+    except Exception:  # noqa: BLE001
+        depth = 0
+    if depth >= 2:
+        return []
+
+    roots: list[str] = []
+    for raw in names:
+        host = str(raw).lower().strip(".")
+        if not host or "." not in host:
+            continue
+        root = registrable_domain(host)
+        if not root or root == me or root in roots:
+            continue
+        if is_shared_infra(root) or is_pivot_noise(root):
+            continue
+        roots.append(root)
+        # 实测一张证书最多挂 91 个域名（np4w53.cn）。限 40 会漏掉一半，
+        # 而漏掉的那一半恰恰是最新签发的（SAN 通常按注册顺序排）。
+        if len(roots) >= CERT_FAMILY_LIMIT:
+            break
+
+    created: list[str] = []
+    for root in roots:
+        try:
+            with session_scope() as s:
+                if s.execute(
+                    select(Asset.id).where(Asset.kind == "domain", Asset.value == root)
+                ).scalar_one_or_none():
+                    continue
+                s.add(
+                    Asset(
+                        kind="domain",
+                        value=root,
+                        normalized=root,
+                        tier=TIER_CANDIDATE,
+                        discovery_source="cert_san",
+                        discovery_reason=f"与 {me} 同一张证书（批量签发，共 {len(names)} 个域名）",
+                        score=0.0,
+                        verdict="insufficient",
+                        meta={
+                            "bulk_cert_of": me,
+                            "spread_depth": depth + 1,
+                            # 取证前不接受域名级降档。
+                            #
+                            # 线上实测：这 40 个域名入池后不到 8 秒就被富化流程
+                            # 重新判级（只有域名、0 分）→ 全部压进冷存。而冷存
+                            # 不排队取证，等于刚发现就扔掉。
+                            # 和 urlscan 线索是同一类东西：已经有人见过它们，
+                            # 只是还没抓页面。
+                            "await_capture": True,
+                        },
+                    )
+                )
+                s.add(
+                    DiscoveryEvent(
+                        source="cert_san",
+                        kind="domain",
+                        value=root,
+                        normalized=root,
+                        parent=me,
+                        score_hint=0.6,
+                        raw={"san_count": len(names)},
+                    )
+                )
+                created.append(root)
+        except Exception as exc:  # noqa: BLE001 单条失败不影响整批
+            log.debug("同证书入池失败 %s：%s", root, exc)
+    if created:
+        emit("capture.cert_family", origin=me, created=len(created), san=len(names))
+        log.info("同证书展开：%s 的证书带出 %d 个域名（SAN 共 %d）", me, len(created), len(names))
+    return created
+
+
+def _register_backend_assets(asset_id: int, value: str, facts: dict[str, Any]) -> list[str]:
+    """把跨域提交端点登记成资产。
+
+    为什么值得单独建一条资产：一个 `submit.php` 背后挂着几十个前端域名和一整批
+    受害者记录。只记前端域名，等于每次都从头发现「这些站是一伙的」——而骗子
+    换域名的速度比人工复核快得多。
+
+    实测：np4w53 / hksm38 / bncp24 / gtds85 / mdyj91 / pqzv19 / tfbx42 /
+    xmwk62 / zqtn56 / jrfy47 十个站，提交端点全是 `d7k2m.cn/submit.php`。
+
+    只收「确实在收敏感信息」的跨域端点，共享设施（CDN/建站平台）一律不收，
+    否则一次取证就能往库里灌几十个阿里云域名。
+    """
+    from .normalize import is_shared_infra, registrable_domain
+
+    endpoints = facts.get("endpoints")
+    if not isinstance(endpoints, list):
+        return []
+
+    me = registrable_domain(_host_of(value) or value)
+    created: list[str] = []
+    for ep in endpoints:
+        if not isinstance(ep, dict) or ep.get("same_site"):
+            continue
+        if not (ep.get("sensitive") or ep.get("disguised")):
+            continue
+        host = str(ep.get("host") or "").lower().strip(".")
+        if not host or "." not in host or is_shared_infra(host):
+            continue
+        target = registrable_domain(host)
+        if not target or target == me:
+            continue
+
+        kinds = "/".join(str(x) for x in (ep.get("sensitive") or [])[:4]) or "敏感信息"
+        try:
+            with session_scope() as s:
+                asset = s.execute(
+                    select(Asset).where(Asset.kind == "domain", Asset.value == target)
+                ).scalar_one_or_none()
+                if asset is None:
+                    asset = Asset(
+                        kind="domain",
+                        value=target,
+                        normalized=target,
+                        tier=TIER_CANDIDATE,
+                        discovery_source="backend",
+                        discovery_reason=f"{me} 的提交端点在收「{kinds}」",
+                        score=0.0,
+                        verdict="insufficient",
+                        meta={},
+                    )
+                    s.add(asset)
+                    s.flush()
+                    created.append(target)
+                    s.add(
+                        DiscoveryEvent(
+                            source="backend",
+                            kind="domain",
+                            value=target,
+                            normalized=target,
+                            parent=me,
+                            score_hint=0.72,
+                            raw={"endpoint": str(ep.get("url") or "")[:200], "fields": kinds},
+                        )
+                    )
+                    emit("capture.backend", origin=me, endpoint=target, fields=kinds)
+                meta = dict(asset.meta or {})
+                serves = list(meta.get("serves") or [])
+                if me not in serves:
+                    serves.append(me)
+                meta["serves"] = serves[:80]
+                meta["role"] = "backend"
+                meta["backend_evidence"] = {
+                    "endpoint": str(ep.get("url") or "")[:200],
+                    "method": str(ep.get("method") or "POST"),
+                    "fields": kinds,
+                    "seen_at": utcnow().isoformat(),
+                }
+                asset.meta = meta
+        except Exception as exc:  # noqa: BLE001 登记失败不影响主流程
+            log.debug("后端端点登记失败 %s：%s", target, exc)
+    return created
+
+
 def _parse_oversize(reason: str) -> int:
     """从「声明体积 80MB 超过上限 50MB」里取出体积。取不到返回 0。"""
     import re as _re
 
     m = _re.search(r"声明体积\s*(\d+)\s*MB", reason or "")
     return int(m.group(1)) if m else 0
+
+
+def _disk_free_gb() -> float:
+    """数据盘剩余空间（GB）。取不到就当成「够」，不要让 statvfs 失败挡住取证。"""
+    import os as _os
+
+    try:
+        st = _os.statvfs(str(settings.data_dir))
+        return st.f_bavail * st.f_frsize / (1024 ** 3)
+    except OSError:
+        return 999.0
+
+
+def _apk_size_cap(tier: str) -> int:
+    """单包上限（MB），按磁盘余量动态给。
+
+    原来的 50MB 是「磁盘只剩 6.9G」时代的妥协。实测涉老诈骗包 80MB 很常见
+    （uni-app 壳 + 加固 + 内置浏览器内核 + 离线视频），硬卡 50MB 等于
+    只看得见小包，而小包往往只是引流壳，真正的收割包都做大了。
+    """
+    free = _disk_free_gb()
+    if free < 3:
+        return 80
+    if free < 8:
+        return 150
+    return 300
+
+
+def _apk_daily_limit_mb() -> int:
+    """当天 APK 总配额（MB）。跟着磁盘走，而不是写一个固定数。
+
+    固定 300MB 的后果：一个 80MB 的包就吃掉四分之一，三个包当天就停摆。
+    """
+    free = _disk_free_gb()
+    if free < 3:
+        return 200
+    if free < 8:
+        return 600
+    return 2000
 
 
 def _maybe_download_apk(asset_id: int, links: list[str], page_url: str, tier: str) -> dict[str, Any]:
@@ -1122,16 +1501,22 @@ def _maybe_download_apk(asset_id: int, links: list[str], page_url: str, tier: st
 def _download_apk_locked(asset_id: int, links: list[str], page_url: str, tier: str) -> dict[str, Any]:
     tiers = {t.strip() for t in runtime_settings.get(runtime_settings.CAPTURE_AUTO_APK_TIERS, "watch,confirmed").split(",")}
     if tier == TIER_CANDIDATE:
-        # 原来是 10MB，而真实涉老诈骗的包普遍 15~40MB（uni-app 壳 + 加固）。
-        # 线上实测：nuanyang 的 16.5MB 包在 candidate 档直接被拒，
-        # 「一个 APK 也没有」有一半是这么来的。配额由每日 300MB 兜底。
-        max_mb = 50
+        # 候选档也下：真实涉老包的下载入口基本都是「点一下才跳」，
+        # 而这些站多半停在候选档（内容判定还没到 watch）。
+        max_mb = _apk_size_cap(tier)
     elif tier in tiers:
-        max_mb = runtime_settings.get_int(runtime_settings.CAPTURE_APK_MAX_MB, 50)
+        configured = runtime_settings.get_int(runtime_settings.CAPTURE_APK_MAX_MB, 0)
+        # 配了就用配置的，没配就跟着磁盘走
+        max_mb = configured or _apk_size_cap(tier)
     else:
         return {"ok": False, "skipped": True, "reason": f"{tier} 档不自动下载"}
 
-    daily_limit = runtime_settings.get_int(runtime_settings.CAPTURE_APK_DAILY_MB, 300) * 1024 * 1024
+    if _disk_free_gb() < 1.5:
+        return {"ok": False, "skipped": True, "reason": "数据盘剩余不足 1.5G，暂停下载安装包"}
+
+    daily_limit = (
+        runtime_settings.get_int(runtime_settings.CAPTURE_APK_DAILY_MB, 0) or _apk_daily_limit_mb()
+    ) * 1024 * 1024
     used = _apk_used_today()
     if used >= daily_limit:
         return {"ok": False, "skipped": True, "reason": f"今日 APK 配额已用尽（{used // 1024 // 1024}MB）"}

@@ -101,8 +101,10 @@ class CaptureWorker:
         """跑一条。返回实际执行条数。"""
         from .capture import backfill, queue_summary, run_batch
 
+        t0 = time.monotonic()
         added = backfill(limit=settings.capture_backfill_limit)
         result = run_batch(limit=1)
+        spent = time.monotonic() - t0
         ran = int(result.get("ran") or 0)
         ok = int(result.get("ok") or 0)
         self.runs += 1
@@ -113,9 +115,19 @@ class CaptureWorker:
             "added": added,
             "ran": ran,
             "ok": ok,
+            "elapsed": round(spent, 1),
             "queue": queue_summary(),
         }
-        beat("capture", runs=self.runs, ok=self.captured, failed=self.failed, ran=ran)
+        # 一轮耗时异常要留痕。线上踩过：某个站把 Playwright 卡住，整个
+        # 取证队列 12 分钟没动静，而日志里一个字都没有——只能靠人工上去
+        # ps 线程才看得出来。
+        if spent > 90:
+            log.warning(
+                "取证一轮耗时 %.0fs（added=%s ran=%s ok=%s），可能是目标把浏览器卡住了",
+                spent, added, ran, ok,
+            )
+        beat("capture", runs=self.runs, ok=self.captured, failed=self.failed,
+             ran=ran, elapsed=round(spent, 1))
         return ran
 
     def run_forever(self) -> None:
@@ -296,6 +308,9 @@ def _write_heartbeat() -> None:
             "queued": st.get("queued"),
             "cert_siblings": st.get("cert_siblings"),
             "cert_cluster": st.get("cert_cluster"),
+            # 批量签发：一张证书带出 ≥8 个随机串域名。这个数长期为 0 说明
+            # CT 里没出现过站群，或者形态判据太严。
+            "bulk_certs": st.get("bulk_certs"),
             # v1.12 形态预筛与同源扩散：这三个数决定「广泛」是不是真的在工作。
             # 形态池一直是 0 = CT 里没有随机串域名（多半是 CT 断了）；
             # ip_pool 一直是 0 = 没有高置信资产被确认（扩散无从谈起）。

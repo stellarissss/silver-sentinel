@@ -82,6 +82,138 @@ def _looks_like_download_entry(href: str) -> bool:
     return bool(_DOWNLOAD_ENTRY.search(path)) and len(path) < 80
 
 
+# 「继续往里走」的按钮文案。涉老诈骗的主按钮几乎不会跑出这几个词。
+_CTA_WORDS = (
+    "申报", "领取", "立即", "马上", "下一步", "申请", "查询", "认证",
+    "激活", "核验", "验证", "进入", "开始", "确认", "去领取", "点此",
+)
+# 点了只会浪费预算、或者把我们导向投诉入口的文案。
+_CTA_SKIP = (
+    "投诉", "举报", "客服", "关闭", "返回", "登录", "注册", "首页",
+    "隐私", "协议", "下载", "分享", "收藏", "关于",
+)
+
+
+def _follow_cta(page, obs: WebObservation, *, budget: float = 18.0) -> None:
+    """点一下页面的主行动按钮，把真实落地页抓下来。
+
+    为什么必须点：涉老诈骗的首页是一张「通告」，所有信息都在下一跳。
+    实测 np4w53.cn 首页 HTML 里没有 <form>，提交地址
+    `https://d7k2m.cn/submit.php` 只出现在 1.html 的 JS 里。不点这一下，
+    「谁在收身份证和银行卡」这条证据链就断了——而它恰好是整个系统里
+    唯一能锁定团伙（而不是某个域名）的东西。
+
+    三种导航形态都要接住：
+      - 整页跳转（location.href）
+      - XHR 后跳转（POST api.php → redirectUrl → location.href）
+      - 原地切 DOM（SPA 把表单 div 显示出来，URL 不变）
+
+    硬预算 `budget`：整段最多花这么多秒。线下实测，不设预算时遇到过
+    一个站把 Playwright 的 `page.content()` 卡住——default timeout 是
+    首次取证的 45 秒，四次串起来 200 秒，整个取证队列停摆十几分钟。
+    超预算就直接放弃第二跳，首页证据照样保留。
+    """
+    started = time.monotonic()
+
+    def _left() -> float:
+        return budget - (time.monotonic() - started)
+
+    before = page.url
+    picked = page.evaluate(
+        """(cfg) => {
+            const words = cfg.words;
+            const skip = cfg.skip;
+            const els = Array.from(document.querySelectorAll(
+                'button, a[href], input[type=submit], [onclick]'
+            ));
+            for (const el of els) {
+                const t = ((el.innerText || el.value || el.getAttribute('aria-label') || '') + '').trim();
+                if (!t || t.length > 20) continue;
+                if (skip.some(s => t.includes(s))) continue;
+                if (!words.some(w => t.includes(w))) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 20 || r.height < 10) continue;   // 隐藏诱饵不点
+                if (el.disabled) continue;
+                el.setAttribute('data-ss-cta', '1');
+                return t;
+            }
+            return '';
+        }""",
+        {"words": list(_CTA_WORDS), "skip": list(_CTA_SKIP)},
+    )
+    if not picked:
+        return
+
+    try:
+        page.locator('[data-ss-cta="1"]').first.click(timeout=5000, no_wait_after=True)
+    except Exception as exc:  # noqa: BLE001 点击失败就当没有第二跳
+        log.debug("CTA 点击失败（%s）：%s", picked, exc)
+        return
+
+    # 等跳转：URL 变化优先，其次等 DOM 出现输入框（SPA 原地切换）
+    deadline = time.monotonic() + max(3.0, min(9.0, _left()))
+    moved = False
+    inputs = 0
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(350)
+        if page.url != before:
+            moved = True
+            break
+        try:
+            inputs = page.evaluate(
+                "() => document.querySelectorAll('input:not([type=hidden]),textarea,select').length"
+            )
+        except Exception:  # noqa: BLE001
+            inputs = 0
+        if inputs:
+            break
+    # 新页可能还在渲染，再给一点时间把表单/脚本都灌进来
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=4000)
+    except Exception:  # noqa: BLE001
+        pass
+    page.wait_for_timeout(700)
+
+    if _left() < 3:
+        log.debug("第二跳预算用尽（%.1fs），放弃抓取", budget)
+        return
+    # 把页面默认超时压到剩余预算，避免 content()/inner_text() 各等 45 秒
+    try:
+        page.set_default_timeout(int(max(2.0, _left())) * 1000)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        html = page.content()
+        text = page.inner_text("body")[:8000]
+        title = page.title() or ""
+        inputs = page.evaluate(
+            "() => document.querySelectorAll('input:not([type=hidden]),textarea,select').length"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("第二跳抓取失败：%s", exc)
+        return
+
+    # 什么都没变、也没有输入框：这一跳白点了，不留记录
+    if not moved and not inputs:
+        return
+
+    obs.second_hop = {
+        "url": page.url,
+        "from": before,
+        "button": picked,
+        "title": title[:200],
+        "html": html[:180_000],
+        "text": text,
+        "navigated": moved,
+        "inputs": inputs,
+    }
+    # 第二跳里也可能有安装包链接，补进候选
+    for link in set(_APK_LINK.findall(html or "")):
+        if link not in obs.apk_links:
+            obs.apk_links.append(link)
+    obs.apk_links = obs.apk_links[:20]
+
+
 def _shrink_image(data: bytes, *, max_height: int = 6000, max_bytes: int = 1_400_000) -> bytes:
     """把全页截图裁到可接受的高度与体积。失败时原样返回，不能让截图问题拖垮取证。"""
     try:
@@ -148,6 +280,13 @@ class WebObservation:
     apk_links: list[str] = field(default_factory=list)
     # 下载入口：不是 .apk 结尾，需要再跟一次 302 才知道是不是包
     download_entries: list[str] = field(default_factory=list)
+    # 第二跳：点「立即申报」之后到达的真实页面。
+    #
+    # 涉老诈骗的首页永远是诱饵（"2026 年度补贴已到账，点击申报"），真正收
+    # 身份证和银行卡的是下一跳。实测 np4w53 首页 HTML 里连 <form> 都没有，
+    # 提交地址 https://d7k2m.cn/submit.php 只写在 1.html 的 JS 里——
+    # 不点这一下，整条「谁在收数据」的证据链就是断的。
+    second_hop: dict[str, Any] = field(default_factory=dict)
     blocked: list[str] = field(default_factory=list)
     error: str = ""
     elapsed: float = 0.0
@@ -172,6 +311,10 @@ class WebObservation:
             "downloads": self.downloads[:20],
             "apk_links": self.apk_links[:20],
             "download_entries": self.download_entries[:10],
+            "second_hop": {
+                k: (v[:12000] if isinstance(v, str) else v)
+                for k, v in (self.second_hop or {}).items()
+            },
             "blocked": self.blocked[:40],
             "cookies": self.cookies[:30],
             "error": self.error,
@@ -276,7 +419,9 @@ class WebSandbox:
             self._owner_thread = ident
             return self._browser
 
-    def observe(self, url: str, *, timeout: float | None = None) -> WebObservation:
+    def observe(
+        self, url: str, *, timeout: float | None = None, follow_cta: bool = True
+    ) -> WebObservation:
         timeout = timeout or settings.sandbox_timeout
         started = time.monotonic()
         obs = WebObservation(url=url)
@@ -509,6 +654,18 @@ class WebSandbox:
                 pass
             obs.apk_links = sorted(apk_candidates)[:20]
             obs.download_entries = list(dict.fromkeys(entries))[:10]
+
+            if follow_cta:
+                try:
+                    # 首屏已经吃掉的时间要从总预算里扣。剩不到 14 秒就别冒险——
+                    # 一次卡死会让整条取证队列停摆，比少一次第二跳严重得多。
+                    left = timeout - (time.monotonic() - started)
+                    if left >= 14:
+                        _follow_cta(page, obs, budget=min(20.0, left - 4))
+                    else:
+                        log.debug("首屏耗时 %.1fs，跳过第二跳", time.monotonic() - started)
+                except Exception as exc:  # noqa: BLE001 点不动不是取证失败
+                    log.debug("第二跳失败：%s", exc)
 
             try:
                 obs.cookies = [

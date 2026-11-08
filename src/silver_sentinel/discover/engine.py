@@ -79,6 +79,19 @@ CERT_SIBLING_CLUSTERS = frozenset(
 CERT_SIBLING_LIMIT = 8
 CERT_SIBLING_HINT = 0.28   # 低于 0.30 门槛：进冷存，不与真线索抢取证队列
 
+# ---- 批量签发批次（v1.13）
+#
+# 上面那条「兄弟域名进冷存」的规则有个致命前提：**一张证书挂几个域名**。
+# 实测涉老站群完全相反——np4w53.cn 那张 LiteSSL 证书的 SAN 里有 **90 个**域名，
+# 全是 `oi6o45.cn` `uw2v71.cn` `tx7y28.cn` 这种同一个生成器吐出来的。
+#
+# 一次签发 90 个、全部 .cn、全部同一天、全部同一个 CA，这不可能是巧合。
+# 而按老规则：只取 8 个 + 全部进冷存 + 冷存不排队取证 = 90 个里 82 个
+# 连记录都没有，剩下 8 个躺在冷存里永远等不到取证。
+BULK_CERT_LIMIT = 60         # 批量批次的展开上限（一张证书最多带 60 个回家）
+BULK_CERT_DAILY = 20         # 每天最多展开多少张批量证书，防止队列被灌爆
+BULK_CERT_HINT = 0.58        # 高于 0.30：直接进候选池排队取证
+
 # ---- 形态预筛（v1.12）：词库打空之后，还剩什么
 #
 # 涉老站群的域名是批量生成的随机串，词库必然打空。但「像随机串」本身不足以
@@ -96,6 +109,7 @@ IP_POOL_INTERVAL = 600.0     # IP 池重建 / 同源扩散间隔（秒）
 PIVOT_BUDGET = 6             # 每轮最多扩散几个资产。CertSpotter 免费 100 次/小时，
                              # 6×6=36 次留足余量；实测一批证书能带出 9~30 个域名。
 IP_HIT_SCORE = 0.78          # 同 IP 命中的发现权重：高于任何词库命中，仍留给判定层复核
+STRONG_HINT = 0.50           # 达到这个发现强度就先保护、再取证（见 _persist）
 PIVOT_HIT_SCORE = 0.70       # 同证书扩散的发现权重：证据强度略低于同 IP（证书可共享但更难伪造）
 
 
@@ -110,6 +124,7 @@ class DiscoverStats:
     db_errors: int = 0
     cert_siblings: int = 0
     cert_cluster: int = 0
+    bulk_certs: int = 0
     cold_promoted: int = 0
     harvested: int = 0
     shape_seen: int = 0
@@ -130,6 +145,7 @@ class DiscoverStats:
             "cold": self.cold,
             "db_errors": self.db_errors,
             "cert_siblings": self.cert_siblings,
+            "bulk_certs": self.bulk_certs,
             "cert_cluster": self.cert_cluster,
             "cold_promoted": self.cold_promoted,
             "harvested": self.harvested,
@@ -192,6 +208,8 @@ class DiscoveryEngine:
         self._shape_lock = threading.Lock()
         self._ippool: BadIPPool | None = None
         self._pivoter: PivotEngine | None = None
+        self._bulk_day = ""
+        self._bulk_today = 0
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -395,13 +413,21 @@ class DiscoveryEngine:
                 self._spread_cert_siblings(obs, domain)
 
     def _spread_cert_siblings(self, obs: CertObservation, origin: str) -> None:
-        """把同一张证书上的其他注册域送进冷存。
+        """把同一张证书上的其他注册域送进队列。
 
         诈骗站群常用一次签发带几十个域名，兄弟站可能还没建站、可能是后台、
         可能正文里一个词都没有。它们的价值不在内容，而在「和已知可疑域名
         共享同一张证书」——这比任何词库命中都硬。
 
-        用 `san:` 前缀独立去重：兄弟域名先以冷档进来，之后自己命中关键词时
+        分两种处理：
+
+        - **批量批次**（SAN >= 8 个且多数是随机串）：这是站群，兄弟域名直接
+          进候选池排队取证，上限放宽到 60。实测 np4w53.cn 一张证书 90 个域名，
+          抽 10 个测 9 个在线、标题逐字相同。老规则只取 8 个且全进冷存，
+          等于 90 个里 82 个连记录都没有。
+        - **零散兄弟**（共享主机、CDN 通用证书）：维持原样，进冷存不抢队列。
+
+        用 `san:` 前缀独立去重：兄弟域名先以低分进来，之后自己命中关键词时
         仍能走正常路径升级，不会被「已存在」挡在门外。
         """
         from ..normalize import is_pivot_noise
@@ -417,10 +443,14 @@ class DiscoveryEngine:
             if self.lib.is_whitelisted(root) or is_pivot_noise(root):
                 continue
             siblings.append(root)
-            if len(siblings) >= CERT_SIBLING_LIMIT:
-                break
+
         if not siblings:
             return
+
+        bulk = self._looks_like_bulk_batch(siblings) and self._bulk_budget_left()
+        limit = BULK_CERT_LIMIT if bulk else CERT_SIBLING_LIMIT
+        hint = BULK_CERT_HINT if bulk else CERT_SIBLING_HINT
+        siblings = siblings[:limit]
 
         # 兄弟域名单独标记来源：证书关联命中多少，是判断「站群密度」的指标。
         # 共用同一个 obs 会把它记成 ct_poll，事后分不清是词库捞到的还是证书带来的。
@@ -432,11 +462,46 @@ class DiscoveryEngine:
                 if not self.deduper.add("san:" + root):
                     continue
                 self.pending.append(
-                    (sib_obs, "domain", root, CERT_SIBLING_HINT, ["cert_sibling"], root)
+                    (sib_obs, "domain", root, hint, ["bulk_cert" if bulk else "cert_sibling"], root)
                 )
                 added += 1
         if added:
             self.stats.cert_siblings += added
+            if bulk:
+                self.stats.bulk_certs += 1
+                log.info(
+                    "批量签发：%s 的证书带出 %d 个域名（形态分达标的占多数）",
+                    origin, added,
+                )
+
+    def _looks_like_bulk_batch(self, siblings: list[str]) -> bool:
+        """这批兄弟域名看起来像不像「一个生成器吐出来的」。
+
+        判据不是「名字里有随机串」，而是**比例**：一张证书上 60% 以上是
+        随机串，才说明命名习惯统一。共享主机的证书一般是
+        `shop.example.com` `blog.other.cn` 这种正常名字混着来。
+        """
+        try:
+            from .morph import is_bulk_batch
+
+            return is_bulk_batch(siblings)
+        except Exception:  # noqa: BLE001 形态模块坏掉不该拖垮发现层
+            return False
+
+    def _bulk_budget_left(self) -> bool:
+        """今天还开不开放批量展开。
+
+        一张批量证书能带出 60 个候选，一天几十张就是几千条，取证队列会被
+        历史垃圾塞满、新线索反而排不上。按天限额，超了就退回「8 个进冷存」。
+        """
+        today = time.strftime("%Y-%m-%d")
+        if self._bulk_day != today:
+            self._bulk_day = today
+            self._bulk_today = 0
+        if self._bulk_today >= BULK_CERT_DAILY:
+            return False
+        self._bulk_today += 1
+        return True
 
     # ------------------------------------------------------------ DNS 探测
     def _dns_loop(self) -> None:
@@ -905,8 +970,15 @@ class DiscoveryEngine:
                 "discover_hint": round(score, 3),
                 "hosts": [host] if host else [],
             }
-            if obs is not None and obs.source in EXTERNAL_SOURCES:
-                # 取证前不许被域名级研判降档，否则永远等不到取证
+            if obs is not None and (
+                obs.source in EXTERNAL_SOURCES or score >= STRONG_HINT
+            ):
+                # 取证前不许被域名级研判降档，否则永远等不到取证。
+                #
+                # 不只外部线索：同 IP（0.78）、批量证书（0.58）、形态池命中
+                # 都属于「已经拿到结构化证据」，它们的价值在于关联，而富化
+                # 流程只看域名本身，会立刻算成 0 分压进冷存。线上实测：
+                # 40 个同证书域名入池 8 秒内全被压成 cold，一个都没取到证。
                 meta["await_capture"] = True
             reason = "、".join(terms[:6])
             note = (getattr(obs, "note", "") or "") if obs is not None else ""
