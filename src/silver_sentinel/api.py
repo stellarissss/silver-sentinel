@@ -179,6 +179,22 @@ def _asset_row(asset: Asset) -> dict[str, Any]:
         "capture_error": (asset.capture_error or "")[:200],
         "last_capture_at": asset.last_capture_at.isoformat() if asset.last_capture_at else None,
         "evidence_count": len([e for e in (asset.evidence or []) if e.deleted_at is None]),
+        # 用途：列表页据此显示「客服/论坛/企业」等标签，解释它为什么不占高危队列
+        "purpose": _purpose_row(asset),
+    }
+
+
+def _purpose_row(asset: Asset) -> dict[str, Any] | None:
+    purpose = ((asset.meta or {}).get("facts") or {}).get("purpose")
+    if not isinstance(purpose, dict) or not purpose.get("purpose"):
+        return None
+    return {
+        "purpose": purpose.get("purpose"),
+        "label": purpose.get("label") or purpose.get("purpose"),
+        "confidence": purpose.get("confidence") or 0,
+        "source": purpose.get("source") or "",
+        "suppressed": bool(purpose.get("suppressed")),
+        "reason": purpose.get("suppressed_reason") or "",
     }
 
 

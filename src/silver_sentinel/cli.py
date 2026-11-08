@@ -458,6 +458,144 @@ def cmd_claim(args) -> int:
     return 0
 
 
+def cmd_purpose(args) -> int:
+    """分析站点用途：客服/论坛/电商/企业/门户/落地页/分发页。
+
+    这是排查「为什么这个站排到前面」最快的入口。它不判风险，只回答
+    「这个站是干什么的」——客服站和论坛天然信息量大、行业词多，
+    词库分会很高，但它们不是目标。
+    """
+    from .features import extract
+    from .purpose import analyze, model_info
+
+    facts: dict = {}
+    html = text = ""
+    requests: list = []
+    forms: list = []
+    tls: dict = {}
+    apk_links: list = []
+    host = args.host or ""
+
+    if args.asset_id:
+
+        from .db import session_scope
+        from .models import Asset
+        from .scoring.reassess import _purpose_from_evidence
+
+        with session_scope() as session:
+            asset = session.get(Asset, args.asset_id)
+            if asset is None:
+                print(json.dumps({"ok": False, "error": "资产不存在"}, ensure_ascii=False))
+                return 2
+            facts = dict((asset.meta or {}).get("facts") or {})
+            host = host or asset.normalized or asset.value
+            if facts.get("purpose"):
+                print(json.dumps({"ok": True, "host": host, "source": "stored",
+                                  "purpose": facts["purpose"]}, ensure_ascii=False, indent=2))
+                return 0
+            computed = _purpose_from_evidence(session, asset)
+            if not computed:
+                print(json.dumps({"ok": False, "error": "该资产没有可用的页面证据"}, ensure_ascii=False))
+                return 1
+            feats_dict, purpose_dict = computed
+            print(json.dumps({"ok": True, "host": host, "source": "evidence",
+                              "purpose": purpose_dict, "hints": feats_dict.get("hints")},
+                             ensure_ascii=False, indent=2))
+            return 0
+
+    if args.html_file:
+        html = open(args.html_file, encoding="utf-8", errors="ignore").read()
+        text = args.text or ""
+        if not text:
+            try:
+                from bs4 import BeautifulSoup
+
+                soup = BeautifulSoup(html, "html.parser")
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text("\n")
+            except Exception:  # noqa: BLE001
+                text = ""
+    elif args.url:
+        from urllib.parse import urlsplit
+
+        from .sandbox.web import get_web_sandbox
+
+        url = args.url if args.url.startswith("http") else f"https://{args.url}"
+        obs = get_web_sandbox().observe(url, timeout=args.timeout)
+        if not (obs.html or obs.text):
+            print(json.dumps({"ok": False, "error": obs.error or "抓取失败"}, ensure_ascii=False))
+            return 1
+        html, text = obs.html, obs.text
+        requests, forms, tls, apk_links = obs.requests, obs.forms, obs.tls, obs.apk_links
+        host = host or (urlsplit(obs.final_url or url).hostname or "")
+        if html and "claim" not in facts:
+            try:
+                from .claim import analyze_html
+
+                facts["claim"] = analyze_html(html, host).as_dict()
+            except Exception:  # noqa: BLE001
+                pass
+    else:
+        print(json.dumps({"ok": False, "error": "需要 url / --html-file / --asset-id 之一"},
+                         ensure_ascii=False))
+        return 2
+
+    bundle = extract(url=f"https://{host}/" if host else "", html=html, text=text,
+                     facts=facts, requests=requests, forms=forms, tls=tls, apk_links=apk_links)
+    result = analyze(bundle, host=host, facts=facts, use_model=not args.no_model)
+    out = {
+        "ok": True,
+        "host": host,
+        "purpose": result.as_dict(),
+        "top_features": {
+            k: round(v, 2)
+            for k, v in sorted(bundle.values.items(), key=lambda kv: abs(kv[1]), reverse=True)[:12]
+            if v
+        },
+        "hints": bundle.hints,
+        "model": model_info(),
+        "text_len": int(bundle.values.get("text_len", 0)),
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_model(args) -> int:
+    """用途模型的查看 / 训练 / 评估。训练走 tools/train_purpose.py。"""
+    from .purpose import model_info
+
+    if args.action == "status":
+        info = model_info()
+        info["rule_baseline"] = "始终可用（模型缺失时自动接管）"
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0 if info.get("available") else 1
+
+    import subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    script = _Path(__file__).resolve().parents[2] / "tools" / "train_purpose.py"
+    if not script.exists():
+        print(json.dumps({"ok": False, "error": f"找不到训练脚本 {script}"}, ensure_ascii=False))
+        return 2
+    cmd = [_sys.executable, str(script)]
+    if args.data:
+        cmd += ["--data", args.data]
+    if args.min_class:
+        cmd += ["--min-class", str(args.min_class)]
+    if args.action == "train":
+        if args.out:
+            cmd += ["--out", args.out]
+        if args.report:
+            cmd += ["--report", args.report]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+    print(proc.stdout)
+    if proc.stderr.strip():
+        print(proc.stderr[-2000:], file=_sys.stderr)
+    return proc.returncode
+
+
 def cmd_brief(args) -> int:
     """一段时间内的侦查 / 取证态势。
 
@@ -523,6 +661,11 @@ def cmd_brief(args) -> int:
                 Asset.tier.in_(("candidate", "watch", "confirmed")),
             )
         ) or 0
+        # 用途分布：解释「新增很多但 watch 很少」。meta 是 JSON，跨库解析
+        # 交给 Python——SQLite 的 json_extract 在 Postgres 上不通用。
+        purpose_meta = list(
+            s.scalars(select(Asset.meta).where(Asset.first_seen >= since)).all()
+        )
 
     total = captured + failed
     rate = f"{captured / total * 100:.1f}%" if total else "—"
@@ -541,6 +684,30 @@ def cmd_brief(args) -> int:
     print(f"  新增盯防  {watch_new:>6}")
     print(f"  待取证    {pending:>6}   {DIM}队列里还排着的资产{RESET}")
 
+    purpose_counts: dict[str, int] = {}
+    suppressed_n = 0
+    labeled = 0
+    for meta in purpose_meta:
+        purpose = ((meta or {}).get("facts") or {}).get("purpose") if isinstance(meta, dict) else None
+        if not isinstance(purpose, dict):
+            continue
+        name = str(purpose.get("purpose") or "unknown")
+        labeled += 1
+        purpose_counts[name] = purpose_counts.get(name, 0) + 1
+        if purpose.get("suppressed"):
+            suppressed_n += 1
+    if purpose_counts:
+        from .purpose import PURPOSE_LABELS
+
+        order = ("customer_service", "forum", "ecommerce", "corporate", "portal",
+                 "app_dist", "landing", "unknown")
+        parts = [
+            f"{PURPOSE_LABELS.get(k, k)} {purpose_counts[k]}"
+            for k in order if purpose_counts.get(k)
+        ]
+        print(f"  用途分布  {DIM}{'  '.join(parts)}{RESET}")
+        print(f"  用途降级  {suppressed_n:>6}   {DIM}客服/论坛/电商/企业不占高危队列{RESET}")
+
     problems = []
     if not new_assets and not pending:
         problems.append("没有任何新资产——发现链路可能停了")
@@ -548,6 +715,13 @@ def cmd_brief(args) -> int:
         problems.append("有待取证资产但没有完成——取证线程可能卡住")
     if real_failed > max(20, captured):
         problems.append("真线索的失败数超过完成数——目标侧在集体拒连，检查出口 IP 是否被拉黑")
+    # 闸门过宽会静默吃掉召回：一段时间里绝大多数新资产都被判成「非目标」，
+    # 要么是真的在抓客服站（词库召回跑偏），要么是闸门误判（该关掉查）。
+    if labeled >= 50 and suppressed_n / labeled >= 0.75:
+        problems.append(
+            f"用途闸门降级比例 {suppressed_n / labeled:.0%}（{suppressed_n}/{labeled}）——"
+            "检查是否在大量收客服/论坛站，或用 SILVER_PURPOSE_SUPPRESS=0 临时关闸"
+        )
     for item in problems:
         print(f"  {YEL}⚠ {item}{RESET}")
     return 0 if not problems else 1
@@ -1259,6 +1433,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--html-file", help="分析本地 HTML 文件")
     p.add_argument("--title", help="配合 --text 使用的标题")
     p.set_defaults(func=cmd_claim)
+
+    p = sub.add_parser("purpose", help="分析站点用途（客服/论坛/电商/企业/门户/落地页）")
+    p.add_argument("url", nargs="?", help="站点 URL 或域名")
+    p.add_argument("--host", help="覆盖判定用的域名")
+    p.add_argument("--html-file", help="分析本地 HTML 文件")
+    p.add_argument("--text", help="配合 --html-file 使用的正文")
+    p.add_argument("--asset-id", type=int, help="分析库内资产（用已存证据，不联网）")
+    p.add_argument("--no-model", action="store_true", help="只用规则基线")
+    p.add_argument("--timeout", type=float, default=25.0)
+    p.set_defaults(func=cmd_purpose)
+
+    p = sub.add_parser("model", help="用途模型：status / train / eval")
+    p.add_argument("action", choices=["status", "train", "eval"])
+    p.add_argument("--data", default="", help="数据集路径（默认 data/purpose_seed.jsonl）")
+    p.add_argument("--out", default="", help="模型输出路径")
+    p.add_argument("--report", default="", help="评估报告输出路径")
+    p.add_argument("--min-class", type=int, default=4, help="少于此样本数的类别不参与训练")
+    p.add_argument("--timeout", type=float, default=900.0)
+    p.set_defaults(func=cmd_model)
 
     p = sub.add_parser("brief", help="侦查态势：一段时间内的发现 / 取证 / 证据增量")
     p.add_argument("--hours", type=int, default=24, help="统计窗口（小时），默认 24")

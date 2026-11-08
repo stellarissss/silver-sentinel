@@ -194,6 +194,8 @@ mods = [
     "silver_sentinel.runtime_settings",
     "silver_sentinel.report.bundle",
     "silver_sentinel.discover.engine",
+    "silver_sentinel.features",
+    "silver_sentinel.purpose",
 ]
 for m in mods:
     importlib.import_module(m)

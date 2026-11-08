@@ -200,6 +200,60 @@ def _claim_from_evidence(session: Session, asset: Asset) -> dict[str, Any] | Non
         return None
 
 
+def _purpose_from_evidence(session: Session, asset: Asset) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """从已落库证据补算用途。历史资产没有 features/purpose，重评时补一次。
+
+    只在离线重评用；取证热路径自己会算，不需要走这里。返回 (features, purpose)。
+    """
+    if asset.kind not in ("domain", "url"):
+        return None
+    try:
+        from ..claim import analyze_html
+        from ..evidence import latest_text_row, read_text
+        from ..features import extract
+        from ..normalize import registrable_domain
+        from ..purpose import analyze as analyze_purpose
+
+        html_row = latest_text_row(session, asset.id, kind="page_html")
+        text_row = latest_text_row(session, asset.id, kind="page_text")
+        if html_row is None and text_row is None:
+            return None
+        html = read_text(html_row, limit=900_000) if html_row is not None else ""
+        body = read_text(text_row, limit=200_000) if text_row is not None else ""
+
+        # 证据 note 里带了最终 URL（可能被跳转过），优先用它
+        note = str(getattr(html_row or text_row, "note", "") or "")
+        m = re.search(r"https?://([^/\s]+)", note)
+        host = (m.group(1).lower() if m else "") or registrable_domain(asset.normalized or asset.value)
+
+        facts: dict[str, Any] = dict((asset.meta or {}).get("facts") or {})
+        if html and "claim" not in facts:
+            facts["claim"] = analyze_html(html, host).as_dict()
+
+        requests: list[dict[str, Any]] = []
+        forms: list[dict[str, Any]] = []
+        try:
+            import json as _json
+
+            net_row = latest_text_row(session, asset.id, kind="network")
+            if net_row is not None:
+                payload = _json.loads(read_text(net_row, limit=2_000_000) or "{}")
+                requests = payload.get("requests") or []
+            form_row = latest_text_row(session, asset.id, kind="forms")
+            if form_row is not None:
+                forms = _json.loads(read_text(form_row, limit=500_000) or "[]")
+        except Exception:  # noqa: BLE001 网络/表单证据坏了不影响主判
+            pass
+
+        bundle = extract(url=f"https://{host}/", html=html, text=body, facts=facts,
+                         requests=requests, forms=forms, tls=facts.get("tls") or {})
+        purpose = analyze_purpose(bundle, host=host, facts=facts)
+        return bundle.as_dict(), purpose.as_dict()
+    except Exception as exc:  # noqa: BLE001 补算失败按无用途处理
+        log.debug("从证据补算用途失败 %s：%s", asset.id, exc)
+        return None
+
+
 def assess_now(
     asset: Asset,
     *,
@@ -299,11 +353,20 @@ def rescore(
     # 历史资产没跑过「自称」抽取（本轮才上线）。重评时顺手从 page_html 补一次，
     # 否则要等 24 小时复访才生效，批量重评等于白跑。
     facts = dict(facts or {})
-    existing = ((asset.meta or {}).get("facts") or {}).get("claim")
-    if "claim" not in facts and not existing:
+    existing = ((asset.meta or {}).get("facts") or {})
+    if "claim" not in facts and not existing.get("claim"):
         html_claim = _claim_from_evidence(session, asset)
         if html_claim:
             facts["claim"] = html_claim
+
+    # 历史资产没有用途判定：从 page_html/page_text/network/forms 补算一次。
+    # 只补一次——算完写回 meta，下次直接读，不会每小时重复解析 HTML。
+    if "purpose" not in facts and not existing.get("purpose"):
+        computed = _purpose_from_evidence(session, asset)
+        if computed:
+            feats, purpose = computed
+            facts.setdefault("features", feats)
+            facts["purpose"] = purpose
 
     assessment, merged = assess_now(asset, facts=facts or None, text=body)
     written = apply_assessment(session, asset, assessment)

@@ -129,6 +129,14 @@ class Settings:
     # 「访问受限」——实测 np4w53.cn 桌面 26 字、移动 423 字。
     http_mobile_ua: bool = True
 
+    # ---------------------------------------------------------------- 用途分类
+    # 词库保广、用途保细：用途只影响排序，不产生风险分，也不删除资产。
+    purpose_enabled: bool = True
+    # 关闭后只记录用途、不降级——灰度或线上异常时的一键回退开关。
+    purpose_suppress: bool = True
+    # 用途模型路径（默认包内 data/purpose_model.joblib）。缺失自动退回规则。
+    purpose_model: str = ""
+
     # ---------------------------------------------------------------- 图
     graph_enabled: bool = True
     # 建图间隔（分钟）。图结构变化远慢于取证，每轮全量重建纯属空转。
@@ -334,6 +342,9 @@ class Settings:
         self.icp_cooldown_seconds = _float("SILVER_ICP_COOLDOWN", self.icp_cooldown_seconds)
         self.icp_tiers = _str("SILVER_ICP_TIERS", self.icp_tiers)
         self.http_mobile_ua = _bool("SILVER_HTTP_MOBILE_UA", self.http_mobile_ua)
+        self.purpose_enabled = _bool("SILVER_PURPOSE_ENABLED", self.purpose_enabled)
+        self.purpose_suppress = _bool("SILVER_PURPOSE_SUPPRESS", self.purpose_suppress)
+        self.purpose_model = _str("SILVER_PURPOSE_MODEL", self.purpose_model)
 
         self.graph_enabled = _bool("SILVER_GRAPH_ENABLED", True)
         self.graph_rebuild_minutes = max(

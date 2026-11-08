@@ -161,6 +161,43 @@ def _composite(asset: Asset, facts: dict[str, Any] | None = None) -> list[str]:
     return []
 
 
+def _purpose_gate(facts: dict[str, Any], score: float, claim_verdict: str) -> TriageDecision | None:
+    """用途闸门。返回 None 表示不干预。
+
+    两档处理：
+    - 强非目标（客服/论坛/电商/企业/新闻/政府）→ 冷存；
+    - 弱非目标（行业门户）→ 候选，保留复访（门户常被仿冒成「政策资讯站」）。
+    评分 ≥75 的强非目标也只降到候选：宁可多看，不可漏掉一个高分目标。
+    """
+    purpose = facts.get("purpose")
+    if not isinstance(purpose, dict) or not purpose.get("suppressed"):
+        return None
+    if claim_verdict in ("fake_site_id", "fake_icp", "impersonation"):
+        return None
+    name = str(purpose.get("purpose") or "")
+    label = str(purpose.get("label") or name)
+    reason = str(purpose.get("suppressed_reason") or f"用途为「{label}」")
+    try:
+        confidence = float(purpose.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < 0.55:
+        return None
+
+    from .purpose import NON_TARGET, SOFT_NON_TARGET
+
+    if name in NON_TARGET:
+        if score >= 75:
+            return TriageDecision(
+                TIER_CANDIDATE,
+                [f"{reason}；但评分 {score:.0f}，保留在候选池待复核"],
+            )
+        return TriageDecision(TIER_COLD, [reason])
+    if name in SOFT_NON_TARGET:
+        return TriageDecision(TIER_CANDIDATE, [reason])
+    return None
+
+
 def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | None = None) -> TriageDecision:
     facts = facts or (asset.meta or {}).get("facts", {}) or {}
     verdict = verdict or asset.verdict or "insufficient"
@@ -203,6 +240,12 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
         )
     if claim_verdict == "fabricated_agency":
         return TriageDecision(TIER_CANDIDATE, ["自称政府库中不存在的国家机构"])
+    # ---- 用途闸门：客服站/论坛/电商/企业站不占高危队列。
+    # 只降档、不删除；claim 硬证据、官方通报、APK 分发、证件类表单都会让它让位
+    # （判据在 purpose.decide_suppression）。这是「词库保广、用途保细」的落点。
+    gate = _purpose_gate(facts, score, claim_verdict)
+    if gate is not None:
+        return gate
     if claim_verdict == "legit" and score < 80:
         # 白名单命中：政府站/正规媒体不该占据待处理队列前排。
         # 不删除——记录留着，改版或域名易主后可复查。

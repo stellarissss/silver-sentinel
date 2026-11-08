@@ -848,10 +848,11 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
         # ---- 自称与冒充：词库看「用了什么词」，这里看「说自己是哪个机构」。
         # 这是词库识别不了的：骗子的用词和正规站完全一样（补贴/养老/民政），
         # 但它必须声称自己是财政部，而财政部的官方域名只有一个。
+        # 提到外面：用途分类也要用它；若放在 try 里，claim 一抛异常这里就未定义。
+        claim_host = _host_of(obs.final_url or obs.url) or probe_host
         try:
             from .claim import analyze_html
 
-            claim_host = _host_of(obs.final_url or obs.url) or probe_host
             claim = analyze_html(obs.html or "", claim_host).as_dict()
             facts["claim"] = claim
             # 页面自己写的备案号，和「本域名实际备案」是两件事。
@@ -877,6 +878,29 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
                     log.debug("备案号比对失败：%s", exc)
         except Exception as exc:  # noqa: BLE001 抽取失败不能影响取证
             log.debug("自称抽取失败 %s：%s", asset_id, exc)
+
+        # ---- 用途分类：先回答「这个站是干什么的」。
+        # 词库保广（发现阶段宁多收），用途保细（进队列后把客服站/论坛/电商
+        # 挡在高危队列外）。它只影响排序，不产生风险分，也不删除资产。
+        try:
+            from .features import extract as extract_features
+            from .purpose import analyze as analyze_purpose
+
+            bundle = extract_features(
+                url=obs.final_url or obs.url,
+                html=obs.html or "",
+                text=obs.text or "",
+                facts=facts,
+                requests=obs.requests,
+                forms=obs.forms,
+                tls=obs.tls,
+                apk_links=obs.apk_links,
+            )
+            facts["features"] = bundle.as_dict()
+            purpose = analyze_purpose(bundle, host=claim_host, facts=facts)
+            facts["purpose"] = purpose.as_dict()
+        except Exception as exc:  # noqa: BLE001 用途分类失败不能影响取证
+            log.debug("用途分类失败 %s：%s", asset_id, exc)
 
         meta["facts"] = facts
         meta["web_observation"] = {

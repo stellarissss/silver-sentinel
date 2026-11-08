@@ -369,6 +369,7 @@ async function loadOverview() {
       <div class="row-main">
         <strong>${escapeHtml(a.value)}</strong>
         <span>${escapeHtml(a.tier_label || a.tier)} · ${escapeHtml(KIND_LABEL[a.kind] || a.kind)} · ${fmtTime(a.last_seen)} · 取证 ${captureShort(a)}</span>
+        ${a.purpose ? `<span class="tag" title="${escapeHtml(a.purpose.reason || "")}">${escapeHtml(a.purpose.label)}${a.purpose.suppressed ? " · 不占队列" : ""}</span>` : ""}
       </div>
       <div class="row-meta">${badge(a.verdict)}</div>
       <div class="score-chip"><b>${a.score}</b></div>
@@ -863,6 +864,7 @@ async function openAsset(id) {
         <div class="hero-top">${badge(a.verdict)}
           <span class="tag ${a.capture_state === "captured" ? "green" : ""}">${escapeHtml(captureShort(a))}</span>
           ${a.campaign ? `<span class="tag">团伙 ${escapeHtml(a.campaign.name)}</span>` : ""}
+          ${a.purpose ? `<span class="tag" title="${escapeHtml(a.purpose.reason || "")}">用途：${escapeHtml(a.purpose.label)}${a.purpose.confidence ? ` ${(a.purpose.confidence * 100).toFixed(0)}%` : ""}${a.purpose.source === "model" ? " · 模型" : ""}</span>` : ""}
         </div>
         <div class="result-title">${escapeHtml(a.value)}</div>
         ${a.normalized && a.normalized !== a.value
@@ -889,6 +891,8 @@ async function openAsset(id) {
         <button class="btn danger sm" data-act="tier" data-tier="dismissed">标记已排除</button>
       </div>
       <div id="drawer-action-msg"></div>
+
+      ${a.purpose && a.purpose.suppressed ? `<div class="notice">该站用途为「${escapeHtml(a.purpose.label)}」，不占高危队列：${escapeHtml(a.purpose.reason || "")}</div>` : ""}
 
       <div class="section-title">证据矩阵
         <span class="hint">${(a.evidence_matrix && a.evidence_matrix.present) || 0}
