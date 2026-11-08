@@ -53,6 +53,34 @@ _PRIVATE_NETS = [
 _APK_LINK = re.compile(r"https?://[^\s\"'<>]+\.apk(?:\?[^\s\"'<>]*)?", re.IGNORECASE)
 _INTERESTING_EXT = (".apk", ".ipa", ".exe", ".zip", ".rar", ".dmg")
 
+# 「下载入口」路径特征：点进去才 302 到真实包，链接本身不以 .apk 结尾。
+# 实测 26537.net 的按钮是 `/go/download1`、`/go/download2` 两条通道。
+_DOWNLOAD_ENTRY = re.compile(
+    r"/(?:go|dl|down|download|app|apk|az|anzhuo|android|xz|get)[/._-]?",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_download_entry(href: str) -> bool:
+    """这条链接像不像「再跳一次才能拿到包」的入口。
+
+    只认路径特征，不看扩展名——扩展名那一路由 _INTERESTING_EXT 负责。
+    """
+    if not href or not href.lower().startswith(("http://", "https://")):
+        return False
+    low = href.lower()
+    if any(x in low for x in (".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico")):
+        return False
+    if any(x in low for x in ("/login", "/about", "/privacy", "/terms", "/help", "/news")):
+        return False
+    try:
+        from urllib.parse import urlsplit
+
+        path = urlsplit(low).path or "/"
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(_DOWNLOAD_ENTRY.search(path)) and len(path) < 80
+
 
 def _shrink_image(data: bytes, *, max_height: int = 6000, max_bytes: int = 1_400_000) -> bytes:
     """把全页截图裁到可接受的高度与体积。失败时原样返回，不能让截图问题拖垮取证。"""
@@ -118,6 +146,8 @@ class WebObservation:
     downloads: list[str] = field(default_factory=list)
     cookies: list[dict[str, Any]] = field(default_factory=list)
     apk_links: list[str] = field(default_factory=list)
+    # 下载入口：不是 .apk 结尾，需要再跟一次 302 才知道是不是包
+    download_entries: list[str] = field(default_factory=list)
     blocked: list[str] = field(default_factory=list)
     error: str = ""
     elapsed: float = 0.0
@@ -141,6 +171,7 @@ class WebObservation:
             "forms": self.forms[:20],
             "downloads": self.downloads[:20],
             "apk_links": self.apk_links[:20],
+            "download_entries": self.download_entries[:10],
             "blocked": self.blocked[:40],
             "cookies": self.cookies[:30],
             "error": self.error,
@@ -460,6 +491,11 @@ class WebSandbox:
 
             # 从 HTML 与运行时 DOM 里找安装包链接
             apk_candidates = set(_APK_LINK.findall(html or ""))
+            # 「下载入口」：不是 .apk 结尾，点进去才 302 到真实包。
+            # 实测 26537.net（暖邻）的下载按钮就是 <a href="/go/download1">，
+            # 直接指向 https://xxx.zrudqa.cn/pqkfeoc.apk。只认 .apk 的规则
+            # 在这里必然打空——线上「一个 APK 也没有」有一半是这么来的。
+            entries: list[str] = []
             try:
                 hrefs = page.evaluate(
                     "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href).slice(0,400)"
@@ -467,9 +503,12 @@ class WebSandbox:
                 for href in hrefs or []:
                     if any(ext in href.lower() for ext in _INTERESTING_EXT):
                         apk_candidates.add(href)
+                    elif _looks_like_download_entry(href):
+                        entries.append(href)
             except Exception:  # noqa: BLE001
                 pass
             obs.apk_links = sorted(apk_candidates)[:20]
+            obs.download_entries = list(dict.fromkeys(entries))[:10]
 
             try:
                 obs.cookies = [

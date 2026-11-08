@@ -335,9 +335,21 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
 
     # 分数很低：进冷存。仍保留记录——这是「宁可错杀」的成本上限。
     # 涉老除外：哪怕只有受众指向 + 一条证据，也留在候选池让人看一眼。
-    cold_tier = TIER_CANDIDATE if isinstance(elder, dict) and elder.get("elder") else TIER_COLD
+    # 加固包同样除外：解析不出来不等于干净，静默沉底等于把「看不见」当成「没问题」。
+    guarded = (
+        (isinstance(elder, dict) and elder.get("elder"))
+        or facts.get("apk_unparsed")
+        or facts.get("apk_danger")
+        or facts.get("apk_too_large")
+    )
+    cold_tier = TIER_CANDIDATE if guarded else TIER_COLD
     if (asset.meta or {}).get("discover_hint", 0) >= 0.3:
         return TriageDecision(cold_tier, ["发现阶段命中弱特征，暂无其他证据"])
+    if facts.get("apk_unparsed"):
+        return TriageDecision(cold_tier, ["安装包对抗静态分析（manifest 加密/伪装），权限未知"])
+    if facts.get("apk_too_large"):
+        size = (facts.get("apk_too_large") or {}).get("size_mb")
+        return TriageDecision(cold_tier, [f"分发 {size}MB 安装包（超出自动下载上限），需人工取样"])
 
     return TriageDecision(cold_tier, ["证据不足"])
 

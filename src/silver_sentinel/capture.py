@@ -498,9 +498,12 @@ def backfill(limit: int = 30) -> int:
         )
         # 外部线索（urlscan / 举报）已经有人在页面上见过目标话术，
         # 不是「域名里猜出来的」。同样档位下先抓它们。
+        # 同 IP 命中最靠前：那台服务器上已经躺着一条确认过的涉老站，
+        # 比任何文本线索都硬——它不需要「猜中话术」，只需要一次 DNS。
         source_rank = case(
-            (Asset.discovery_source.in_(("urlscan", "report", "elder_seed")), 0),
-            else_=1,
+            (Asset.discovery_source == "ip_pool", 0),
+            (Asset.discovery_source.in_(("urlscan", "report", "elder_seed", "cert_sibling")), 1),
+            else_=2,
         )
         # 冷却期未到的一律不补：dead 隔 72 小时，被墙隔 24 小时，抖动 10 分钟。
         # 之前只有「连续 3 次失败 + 6 小时」一把尺子，死域名和真线索挤在同一个
@@ -1015,6 +1018,11 @@ def _merge_apk_candidates(obs) -> list[str]:
     `onclick`，真正发出去的请求才带 .apk。只扫 DOM 会漏掉一大半。
     """
     found: list[str] = list(obs.apk_links or [])
+    # 下载入口（/go/download1 这种）排在真 .apk 之后：
+    # 它们要多跳一次才知道是不是包，先给确定是包的机会。
+    for entry in getattr(obs, "download_entries", []) or []:
+        if entry not in found:
+            found.append(entry)
     for item in getattr(obs, "requests", []) or []:
         url = str(item.get("url") or "")
         if _APK_URL_RE.match(url) and url not in found:
@@ -1096,6 +1104,14 @@ def _apk_used_today() -> int:
 _APK_LOCK = threading.Lock()
 
 
+def _parse_oversize(reason: str) -> int:
+    """从「声明体积 80MB 超过上限 50MB」里取出体积。取不到返回 0。"""
+    import re as _re
+
+    m = _re.search(r"声明体积\s*(\d+)\s*MB", reason or "")
+    return int(m.group(1)) if m else 0
+
+
 def _maybe_download_apk(asset_id: int, links: list[str], page_url: str, tier: str) -> dict[str, Any]:
     with _APK_LOCK:
         return _download_apk_locked(asset_id, links, page_url, tier)
@@ -1132,6 +1148,18 @@ def _download_apk_locked(asset_id: int, links: list[str], page_url: str, tier: s
                     json.dumps({"stage": "apk", "url": link, "reason": result.reason}, ensure_ascii=False).encode(),
                     note=f"安装包下载失败：{result.reason}"[:200], extension=".json", mime="application/json",
                 )
+                # 体积超限不是「没有包」，而是「有包但装不下」。
+                # 实测 26537.net（暖邻）声明 80MB、加固、manifest 加密——
+                # 这三点凑一起本身就是结论，不该因为磁盘限制就被当成什么都没发生。
+                oversize = _parse_oversize(result.reason)
+                if oversize:
+                    asset = s.get(Asset, asset_id)
+                    if asset is not None:
+                        meta = dict(asset.meta or {})
+                        facts = dict(meta.get("facts") or {})
+                        facts["apk_too_large"] = {"size_mb": oversize, "url": link[:300]}
+                        meta["facts"] = facts
+                        asset.meta = meta
             continue
 
         # 静态解析：包名、危险权限、无障碍服务。这些是「这包能干什么」的
@@ -1242,6 +1270,12 @@ def _apply_apk_signal(asset_id: int) -> None:
         meta = dict(asset.meta or {})
         analysis = meta.get("apk_analysis") or {}
         if not analysis:
+            # 没解析出权限不等于没事：包太大没下来（或压根没下）也要让分级知道。
+            f = meta.get("facts") or {}
+            if f.get("apk_too_large") or f.get("apk_unparsed"):
+                triage.apply(asset, facts=f)
+                log.info("安装包未取得但需保留 asset=%s too_large=%s unparsed=%s",
+                         asset_id, bool(f.get("apk_too_large")), bool(f.get("apk_unparsed")))
             return
         facts = dict(meta.get("facts") or {})
         facts["apk_analysis"] = analysis
@@ -1251,13 +1285,28 @@ def _apply_apk_signal(asset_id: int) -> None:
             danger_count = 0
         danger = bool(analysis.get("has_accessibility") or danger_count >= 5)
         facts["apk_danger"] = danger
+
+        # 「解析不出来」不等于「干净」。
+        # 实测 26537.net（暖邻）分发的 84MB 包：manifest 被做成目录、真文件改成
+        # 大写藏在根目录并加密，静态解析拿到 0 权限。正常 App 不会这么干——
+        # 这是专门用来躲自动化审计的。所以这里给「无法确认」单独一个事实，
+        # 让 triage 知道该包既不能当无害，也不能凭权限表提级。
+        try:
+            size = int(analysis.get("file_size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        unparsed = bool(analysis.get("manifest_obfuscated")) and size > 2 * 1024 * 1024
+        facts["apk_unparsed"] = unparsed
+        if unparsed:
+            log.info("安装包对抗静态分析 asset=%s size=%dMB（manifest 加密/伪装）", asset_id, size // 1024 // 1024)
+
         meta["facts"] = facts
         asset.meta = meta
-        if danger:
+        if danger or unparsed:
             triage.apply(asset, facts=facts)
             log.info(
-                "安装包高危能力 asset=%s 权限=%s 无障碍=%s → %s",
-                asset_id, danger_count, analysis.get("has_accessibility"), asset.tier,
+                "安装包高危能力 asset=%s 权限=%s 无障碍=%s 对抗=%s → %s",
+                asset_id, danger_count, analysis.get("has_accessibility"), unparsed, asset.tier,
             )
 
 

@@ -64,6 +64,8 @@ class CertObservation:
     log_url: str
     entry_index: int
     source: str = "ct_poll"
+    # 非证书来源（形态/IP 池/外部线索）附加的一句话说明，落库时进 discovery_reason
+    note: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +77,7 @@ class CertObservation:
             "log_url": self.log_url,
             "entry_index": self.entry_index,
             "source": self.source,
+            "note": self.note[:200],
         }
 
 

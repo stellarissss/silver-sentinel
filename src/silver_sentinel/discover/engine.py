@@ -54,7 +54,10 @@ from ..normalize import collapse_host
 from .ct import CertObservation, CertStreamClient, CTLogFollower, CtrlShSearch
 from .dnsprobe import DNSProbe, SeedGenerator
 from .harvest import EXTERNAL_SOURCES, Harvester
+from .ippool import BadIPPool
 from .keywords import get_library
+from .morph import assess as morph_assess
+from .pivot import PivotEngine
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +79,25 @@ CERT_SIBLING_CLUSTERS = frozenset(
 CERT_SIBLING_LIMIT = 8
 CERT_SIBLING_HINT = 0.28   # 低于 0.30 门槛：进冷存，不与真线索抢取证队列
 
+# ---- 形态预筛（v1.12）：词库打空之后，还剩什么
+#
+# 涉老站群的域名是批量生成的随机串，词库必然打空。但「像随机串」本身不足以
+# 定罪，所以这一层只做两件事：
+#   1) 把形态分够的域名收进一个小池子（不落库，不占队列）；
+#   2) 对池子做 DNS 解析，只有**解析到已知涉老 IP** 的才真正入池。
+#
+# 精度优先：第一版只放行 IP 命中，不放行「形态分高」本身。
+# 实测 204.194.55.233 一台机器挂两个同模板涉老站，这条信号足够硬。
+SHAPE_MIN_SCORE = 0.62       # 进形态池的门槛（实测正例 0.74~0.92，负例 ≤0.31）
+SHAPE_POOL_LIMIT = 4000      # 池子上限，满了丢最低分
+SHAPE_BATCH = 90             # 每轮解析多少个
+SHAPE_INTERVAL = 25.0        # 轮询间隔（秒）
+IP_POOL_INTERVAL = 600.0     # IP 池重建 / 同源扩散间隔（秒）
+PIVOT_BUDGET = 6             # 每轮最多扩散几个资产。CertSpotter 免费 100 次/小时，
+                             # 6×6=36 次留足余量；实测一批证书能带出 9~30 个域名。
+IP_HIT_SCORE = 0.78          # 同 IP 命中的发现权重：高于任何词库命中，仍留给判定层复核
+PIVOT_HIT_SCORE = 0.70       # 同证书扩散的发现权重：证据强度略低于同 IP（证书可共享但更难伪造）
+
 
 @dataclass
 class DiscoverStats:
@@ -90,6 +112,11 @@ class DiscoverStats:
     cert_cluster: int = 0
     cold_promoted: int = 0
     harvested: int = 0
+    shape_seen: int = 0
+    shape_resolved: int = 0
+    ip_hits: int = 0
+    ip_pool: int = 0
+    pivot_hits: int = 0
     started_at: float = field(default_factory=time.time)
 
     def as_dict(self) -> dict[str, Any]:
@@ -106,6 +133,11 @@ class DiscoverStats:
             "cert_cluster": self.cert_cluster,
             "cold_promoted": self.cold_promoted,
             "harvested": self.harvested,
+            "shape_seen": self.shape_seen,
+            "shape_resolved": self.shape_resolved,
+            "ip_hits": self.ip_hits,
+            "ip_pool": self.ip_pool,
+            "pivot_hits": self.pivot_hits,
             "uptime_seconds": round(uptime, 1),
             # 这两个数以前混在一起叫 rate_per_min，显示成 1.7/分，
             # 看起来像「系统几乎没在工作」——其实那是入池速度，不是采集速度。
@@ -155,6 +187,11 @@ class DiscoveryEngine:
         self._ct_sh = CtrlShSearch()
         self._ct_sh_last: dict[str, float] = {}
         self._harvester: Harvester | None = None
+        # 形态池：CT 里「词库没命中但长得像批量生成」的域名，等 DNS 确认
+        self._shape_pool: deque[tuple[float, str]] = deque(maxlen=SHAPE_POOL_LIMIT)
+        self._shape_lock = threading.Lock()
+        self._ippool: BadIPPool | None = None
+        self._pivoter: PivotEngine | None = None
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -182,6 +219,14 @@ class DiscoveryEngine:
                         target=self._harvest_loop, name="discover-harvest", daemon=True
                     )
                 )
+            self._ippool = BadIPPool(settings.data_dir / "bad_ips.json")
+            self._pivoter = PivotEngine()
+            self._threads.append(
+                threading.Thread(target=self._shape_loop, name="discover-shape", daemon=True)
+            )
+            self._threads.append(
+                threading.Thread(target=self._ippool_loop, name="discover-ippool", daemon=True)
+            )
             self._seeds = SeedGenerator()
             self._dns = DNSProbe(settings.data_dir / "dns_cache.json")
 
@@ -324,6 +369,9 @@ class DiscoveryEngine:
             result = self.lib.match_domain(host)
             # 一个词都没命中 = 与我们的关注面无关，直接丢弃（这是唯一会丢的分支）
             if not result.hits and result.score < COLD_THRESHOLD:
+                # v1.12：丢之前先看一眼形态。站群域名是随机串，词库天生看不见，
+                # 但它们的「名字长相」留在 CT 里。这里只入形态池，不入库。
+                self._offer_shape(host)
                 self.stats.cold += 1
                 continue
             # 只有「载体词」的域名（app./m./www. 这种前缀命中）价值为零：
@@ -450,7 +498,12 @@ class DiscoveryEngine:
         这时候再打一组外部 API，两边都容易超时。
         """
         try:
-            self._harvester = Harvester(per_round=settings.harvest_queries_per_round)
+            self._harvester = Harvester(
+                per_round=settings.harvest_queries_per_round,
+                # 游标落盘：不这样的话每次部署都从头开始跑前几个词。
+                # 线上实测十轮全是 subsidy 簇，另外 25 个词一次都没出去过。
+                state_path=settings.data_dir / "harvest_state.json",
+            )
         except Exception as exc:  # noqa: BLE001 配置坏了不能让发现层起不来
             log.warning("外部线索源初始化失败：%s", exc)
             return
@@ -502,6 +555,223 @@ class DiscoveryEngine:
         )
         log.info("外部线索：%d 条命中，%d 条入池", len(hits), queued)
         return queued
+
+    # ------------------------------------------------------------ 形态预筛
+    def _offer_shape(self, host: str) -> None:
+        """词库没命中的域名，交给形态学看一眼。只入池，不落库。"""
+        if self._stop.is_set():
+            return
+        verdict = morph_assess(host)
+        if verdict.score < SHAPE_MIN_SCORE:
+            return
+        if not self.deduper.add("shape:" + host):
+            return
+        with self._shape_lock:
+            self._shape_pool.append((verdict.score, host))
+        self.stats.shape_seen += 1
+
+    def _shape_loop(self) -> None:
+        """把形态池里的域名做一次 DNS，只有落在已知涉老 IP 上的才升级。
+
+        为什么不是「形态分高就抓页面」：CT 每天几万个随机串，全抓等于自己
+        造一个分布式扫描器，既慢又打草惊蛇。DNS 查询不进对方 web 日志，
+        30 QPS 能覆盖全量，成本几乎为零。
+
+        等 3 分钟再起：给 IP 池一点时间从已确认资产里长出来。
+        """
+        if self._stop.wait(180):
+            return
+        while not self._stop.is_set():
+            try:
+                self._shape_once()
+            except Exception as exc:  # noqa: BLE001 一轮失败不杀线程
+                log.warning("形态预筛异常：%s", exc)
+            if self._stop.wait(SHAPE_INTERVAL):
+                return
+
+    def _shape_once(self) -> int:
+        if self._dns is None or self._ippool is None:
+            return 0
+        with self._shape_lock:
+            if not self._shape_pool:
+                return 0
+            batch = [self._shape_pool.pop() for _ in range(min(SHAPE_BATCH, len(self._shape_pool)))]
+        hosts = [h for _s, h in batch]
+        hits = 0
+        for res in self._dns.probe_many(hosts):
+            if not res.a_records:
+                continue
+            self.stats.shape_resolved += 1
+            for ip in res.a_records:
+                entry = self._ippool.lookup(ip)
+                if entry is None:
+                    continue
+                self._ippool.note_hit(ip, res.domain)
+                self._enqueue_ip_hit(res.domain, ip, entry.assets[:1])
+                hits += 1
+                break
+        self.stats.ip_hits += hits
+        self.stats.ip_pool = len(self._ippool)
+        if hits:
+            log.info("形态预筛：%d/%d 命中已知涉老 IP", hits, len(hosts))
+            emit("discover.ip_hit", hosts=len(hosts), hits=hits, pool=len(self._ippool))
+        return hits
+
+    def _enqueue_ip_hit(self, host: str, ip: str, siblings: list[str]) -> None:
+        note = f"与已确认涉老站共用服务器 {ip}"
+        if siblings:
+            note += f"（同机：{siblings[0]}）"
+        self._enqueue_external(host, "ip_pool", note, IP_HIT_SCORE)
+
+    def _enqueue_external(self, host: str, source: str, note: str, score: float) -> bool:
+        """把外部线索（同 IP / 同证书 / 举报）送进待落库队列。
+
+        与 CT 共用同一条落库路径，但带 note——落库时会写成 discovery_reason，
+        复核的人能一眼看到「为什么这条值得看」。
+        """
+        host = (host or "").lower().strip(".")
+        if host.startswith("www."):
+            host = host[4:]
+        if not host or "." not in host:
+            return False
+        if self.lib.is_whitelisted(host):
+            self.stats.whitelisted += 1
+            return False
+        if not self.deduper.add(f"{source}:" + host):
+            self.stats.duplicated += 1
+            return False
+        obs = CertObservation(
+            domain=host,
+            all_domains=[host],
+            issuer="",
+            not_before="",
+            fingerprint="",
+            log_url="",
+            entry_index=0,
+            source=source,
+            note=note,
+        )
+        with self._pending_lock:
+            self.pending.append((obs, "domain", host, score, [source], host))
+        return True
+
+    def _ippool_loop(self) -> None:
+        """定期把「高置信资产」解析到的 IP 收进池，再用本地 DNS 缓存反查同机域名。
+
+        反查这一步不花钱：我们为别的目的查过的 DNS 本身就是一张同服表。
+        """
+        if self._stop.wait(240):
+            return
+        while not self._stop.is_set():
+            try:
+                self._rebuild_ippool()
+                self._pivot_once()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("IP 池／同源扩散失败：%s", exc)
+            if self._stop.wait(IP_POOL_INTERVAL):
+                return
+
+    def _pivot_once(self, *, budget: int = PIVOT_BUDGET) -> int:
+        """对高置信资产做证书／同 IP 扩散，一次最多 3 个，慢慢来。
+
+        为什么限额：CertSpotter 免费额度 100 次/小时，扩散是「有空才做」的
+        后台活。实测一个 .com.cn 站群的证书能带出 30 个域名，3 次就够补一天。
+        """
+        if self._pivoter is None:
+            return 0
+        todo: list[tuple[int, str, list[str]]] = []
+        with session_scope() as session:
+            rows = session.execute(
+                select(Asset.id, Asset.value, Asset.meta).where(
+                    Asset.tier.in_((TIER_WATCH, TIER_CONFIRMED)),
+                    Asset.kind == "domain",
+                )
+            ).all()
+        for asset_id, value, meta in rows:
+            meta = meta or {}
+            facts = meta.get("facts") or {}
+            elder = facts.get("elder") or {}
+            priority = elder.get("priority") if isinstance(elder, dict) else ""
+            is_elder = bool(elder.get("elder")) if isinstance(elder, dict) else False
+            # 只对**涉老**的高置信资产扩散。
+            #
+            # 踩过的坑：条件里带了 `apk_danger`，结果把 apidevel.org（印尼赌博站，
+            # 一个无障碍权限就够 apk_danger）当成了扩散源，一次拉进 35 个子域
+            # ——bio./cdn./admin./pixel. 全是没用的基础设施。这套系统是涉老哨兵，
+            # 赌博站的团伙规模再大也不该占队列。
+            if not (is_elder and priority in ("P0", "P1")):
+                continue
+            if meta.get("pivot_at"):
+                continue
+            todo.append((asset_id, value, [str(ip) for ip in (facts.get("ips") or [])]))
+            if len(todo) >= budget:
+                break
+
+        added = 0
+        for asset_id, value, ips in todo:
+            try:
+                hits = self._pivoter.expand(value, ips=ips)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("扩散失败 %s：%s", value, exc)
+                continue
+            kept = 0
+            for hit in hits:
+                if self._enqueue_external(hit.domain, hit.source, hit.detail, PIVOT_HIT_SCORE):
+                    kept += 1
+            added += kept
+            with session_scope() as session:
+                asset = session.get(Asset, asset_id)
+                if asset is not None:
+                    meta = dict(asset.meta or {})
+                    meta["pivot_at"] = utcnow().isoformat()
+                    meta["pivot_hits"] = kept
+                    asset.meta = meta
+            if kept:
+                emit("discover.pivot", origin=value, hits=len(hits), queued=kept)
+                log.info("同源扩散：%s 带出 %d 个域名（共命中 %d）", value, kept, len(hits))
+        self.stats.pivot_hits += added
+        return added
+
+    def _rebuild_ippool(self) -> int:
+        if self._ippool is None:
+            return 0
+        added = 0
+        with session_scope() as session:
+            rows = session.execute(
+                select(Asset.value, Asset.tier, Asset.meta).where(
+                    Asset.tier.in_((TIER_WATCH, TIER_CONFIRMED)),
+                    Asset.kind == "domain",
+                )
+            ).all()
+        for value, tier, meta in rows:
+            facts = (meta or {}).get("facts") or {}
+            elder = facts.get("elder") or {}
+            priority = elder.get("priority") if isinstance(elder, dict) else ""
+            # 只收「危害已明确」的资产。普通 watch 可能是误报（实测 8 条里 4 条是
+            # 反诈曝光站、广告站、代办灰产），把它们放进池子等于往池里倒噪声。
+            if not (tier == TIER_CONFIRMED or priority == "P0" or facts.get("apk_danger")):
+                continue
+            for ip in facts.get("ips") or []:
+                reason = "涉老 P0" if priority == "P0" else ("安装包高危" if facts.get("apk_danger") else "已确认")
+                if self._ippool.observe(
+                    str(ip), asset=value, reason=reason, asn=str(facts.get("asn") or "")
+                ):
+                    added += 1
+                    # 本地被动 DNS：同一个 IP 上还解析过谁
+                    for sibling in self._dns.cache.reverse(str(ip)) if self._dns else []:
+                        if sibling == value or self.lib.is_whitelisted(sibling):
+                            continue
+                        if self._ippool.observe(
+                            str(ip), asset=value, reason=reason + "（同机反查）"
+                        ):
+                            pass
+                        self._enqueue_ip_hit(sibling, str(ip), [value])
+        if added:
+            self._ippool.prune_dirty()
+            log.info("IP 池更新：%d 个新 IP，池内 %d 条", added, len(self._ippool))
+            emit("discover.ippool", added=added, size=len(self._ippool))
+        self.stats.ip_pool = len(self._ippool)
+        return added
 
     def _flush_loop(self) -> None:
         while not self._stop.is_set():
@@ -639,6 +909,9 @@ class DiscoveryEngine:
                 # 取证前不许被域名级研判降档，否则永远等不到取证
                 meta["await_capture"] = True
             reason = "、".join(terms[:6])
+            note = (getattr(obs, "note", "") or "") if obs is not None else ""
+            if note:
+                reason = note + ("；" + reason if reason else "")
             if cluster_of:
                 meta["cert_cluster"] = cluster_of
                 reason = (reason + "；" if reason else "") + f"同证书：{cluster_of}"

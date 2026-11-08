@@ -134,3 +134,60 @@ def test_dangerous_apk_promotes_asset(fresh_db):
         assert (a.meta or {}).get("facts", {}).get("apk_danger") is True
         assert a.tier in ("watch", "candidate"), "至少不能掉档"
         assert a.tier == "watch", "高危安装包应当直接进盯防"
+
+
+# ---------------------------------------------------------------- 下载入口（v1.12）
+
+def test_download_entry_detected_from_href():
+    """26537.net 的按钮是 /go/download1，不以 .apk 结尾。
+
+    只认 .apk 的规则在这里必然打空——线上「一个 APK 也没有」有一半是这么来的。
+    """
+    from silver_sentinel.sandbox.web import _looks_like_download_entry as f
+
+    assert f("https://26537.net/go/download1")
+    assert f("https://x.cn/download")
+    assert f("https://x.cn/getapp")
+    assert not f("https://x.cn/about")
+    assert not f("https://x.cn/static/a.js")
+    assert not f("https://x.cn/privacy")
+
+
+def test_manifest_obfuscation_is_flagged(tmp_path):
+    """manifest 被做成目录 + 大写诱饵 = 对抗静态分析。"""
+    import zipfile
+
+    from silver_sentinel.collectors.apk import analyze
+
+    path = tmp_path / "evil.apk"
+    with zipfile.ZipFile(path, "w") as zf:
+        # 诱饵：大写、体积大、内容是噪声
+        zf.writestr("ANDROIDMANIFEST.XML", b"\x00" * 300_000)
+        # 正常 APK 不会把 manifest 做成目录
+        zf.writestr("AndroidManifest.xml/AndroidManifest.xml", b"<?xml version='1.0'?><x/>")
+        zf.writestr("classes.dex", b"dex\n035\x00" + b"\x00" * 200)
+
+    facts = analyze(path)["facts"]
+    assert facts["manifest_obfuscated"] is True
+    assert facts["apk_ok"] is False
+
+
+def test_unparsed_apk_does_not_fall_into_cold(fresh_db):
+    """加固包解析不出权限 ≠ 干净。静默沉底等于把「看不见」当成「没问题」。"""
+    from silver_sentinel.db import session_scope
+    from silver_sentinel.models import TIER_CANDIDATE, TIER_COLD, Asset
+    from silver_sentinel import triage
+
+    with session_scope() as s:
+        a = Asset(kind="domain", value="26537.net", normalized="26537.net", score=0.0)
+        s.add(a)
+        s.flush()
+        aid = a.id
+    with session_scope() as s:
+        asset = s.get(Asset, aid)
+        d = triage.apply(asset, facts={"apk_unparsed": True})
+        assert d.tier == TIER_CANDIDATE
+        assert "对抗静态分析" in " ".join(d.reasons)
+    with session_scope() as s:
+        asset = s.get(Asset, aid)
+        assert asset.tier != TIER_COLD

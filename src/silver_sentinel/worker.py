@@ -287,14 +287,24 @@ def _write_heartbeat() -> None:
         from .discover.engine import get_engine
 
         dstat = get_engine().status()
+        st = dstat.get("stats") or {}
         discover = {
             "running": dstat.get("running"),
             "lag": dstat.get("followers_total_lag"),
             "frozen": dstat.get("followers_frozen"),
-            "seen": (dstat.get("stats") or {}).get("seen"),
-            "queued": (dstat.get("stats") or {}).get("queued"),
-            "cert_siblings": (dstat.get("stats") or {}).get("cert_siblings"),
-            "cert_cluster": (dstat.get("stats") or {}).get("cert_cluster"),
+            "seen": st.get("seen"),
+            "queued": st.get("queued"),
+            "cert_siblings": st.get("cert_siblings"),
+            "cert_cluster": st.get("cert_cluster"),
+            # v1.12 形态预筛与同源扩散：这三个数决定「广泛」是不是真的在工作。
+            # 形态池一直是 0 = CT 里没有随机串域名（多半是 CT 断了）；
+            # ip_pool 一直是 0 = 没有高置信资产被确认（扩散无从谈起）。
+            "shape_seen": st.get("shape_seen"),
+            "shape_resolved": st.get("shape_resolved"),
+            "ip_hits": st.get("ip_hits"),
+            "ip_pool": st.get("ip_pool"),
+            "pivot_hits": st.get("pivot_hits"),
+            "harvested": st.get("harvested"),
         }
     except Exception as exc:  # noqa: BLE001
         discover = {"error": str(exc)[:200]}

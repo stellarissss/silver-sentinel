@@ -793,6 +793,39 @@ def cmd_rescore(args) -> int:
 # ---------------------------------------------------------------- 发现
 
 
+def _pivot_cli(args) -> int:
+    """手工同源扩散：给一个域名，把同证书/同 IP 的兄弟域名全列出来。
+
+    线上最有用的排查动作。实测 `discover pivot hksm38.com.cn` 一次带出 10 个
+    同模板活跃诈骗站，全部是 `xxxx00.com.cn` 形式的随机串。
+    """
+    from .discover.morph import assess
+    from .discover.pivot import PivotEngine
+
+    seeds = list(args.values or [])
+    if not seeds:
+        print("需要至少一个域名，例如：discover pivot hksm38.com.cn", file=sys.stderr)
+        return 2
+
+    ips: list[str] = []
+    if args.ip:
+        ips = [x.strip() for x in args.ip.split(",") if x.strip()]
+
+    engine = PivotEngine()
+    total = 0
+    for seed in seeds:
+        hits = engine.expand(seed, ips=ips, use_ip=bool(ips))
+        print(f"\n{BOLD}{seed}{RESET}  带出 {len(hits)} 个")
+        for h in hits:
+            tag = "证书" if h.source == "cert_sibling" else "同IP"
+            m = assess(h.domain)
+            print(f"  {CYA}{h.domain:26s}{RESET} 形态 {m.score:.2f} · {tag} · {DIM}{h.detail[:60]}{RESET}")
+        total += len(hits)
+    print(f"\n合计 {total} 个候选域名。要入库：discover inject {' '.join(seeds[:1])} … 或等后台扩散自动跑。")
+    print(json.dumps(engine.as_dict(), ensure_ascii=False))
+    return 0
+
+
 def _reconcile(args) -> int:
     """按当前词库复算存量资产，把旧版子串匹配的误报降级。
 
@@ -921,6 +954,9 @@ def cmd_discover(args) -> int:
             return 2
         print(json.dumps(get_engine().inject(values, note=args.note or ""), ensure_ascii=False))
         return 0
+
+    if args.action == "pivot":
+        return _pivot_cli(args)
 
     if args.action == "reconcile":
         return _reconcile(args)
@@ -1386,15 +1422,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("discover", help="发现引擎：CT 监控 / 词库 / 注入 / 历史补漏")
     p.add_argument(
         "action",
-        choices=["run", "status", "words", "inject", "search", "reconcile"],
+        choices=["run", "status", "words", "inject", "search", "reconcile", "pivot"],
         help="run 常驻运行，status 看吞吐，words 看词库覆盖，inject 导入清单，"
-             "search 翻 crt.sh 历史，reconcile 按新词库复算存量",
+             "search 翻 crt.sh 历史，reconcile 按新词库复算存量，"
+             "pivot 从一个站做同证书/同 IP 扩散（手工排查用）",
     )
     p.add_argument("values", nargs="*", help="inject 的域名，或 search 的词根")
     p.add_argument("--file", help="从文件批量导入（每行一个域名，# 开头为注释）")
     p.add_argument("--note", help="导入备注，会写进发现流水")
     p.add_argument("--minutes", type=float, default=0, help="run 的时长（分钟），0 为常驻")
     p.add_argument("--apply", action="store_true", help="reconcile 时真正写库（默认只报告）")
+    p.add_argument("--ip", help="pivot 时附带查询的服务器 IP，逗号分隔")
     p.set_defaults(func=cmd_discover)
 
     # ------------------------------------------------------------ 流水线与图

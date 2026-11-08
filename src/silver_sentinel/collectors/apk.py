@@ -299,6 +299,41 @@ def _scan_blobs(zf: zipfile.ZipFile) -> dict[str, Any]:
     }
 
 
+def _locate_manifest(zf: zipfile.ZipFile, names: list[str]) -> tuple[str, dict[str, Any], bool]:
+    """找出真正的 AndroidManifest.xml，并判断这个包有没有在做「反分析」。
+
+    返回 (选中的条目名, 解析结果, 是否对抗)。
+    对抗特征（命中任一即 True）：
+      - 存在名为 `AndroidManifest.xml/` 的目录（正常 APK 不会把 manifest 做成目录）
+      - 根目录有大小写变体（ANDROIDMANIFEST.XML）当诱饵
+      - 所有候选都解析不出包名
+    """
+    lowered = [n for n in names if n.lower() == "androidmanifest.xml"]
+    dirs = [n for n in names if n.lower().startswith("androidmanifest.xml/")]
+    decoys = [n for n in names if n.upper() == "ANDROIDMANIFEST.XML"]
+    obfuscated = bool(dirs)
+
+    # 候选按体积升序：真 manifest 很少超过 2MB，加密块和诱饵往往更大
+    cands = [n for n in lowered if not n.endswith("/")]
+    try:
+        cands.sort(key=lambda n: zf.getinfo(n).file_size)
+    except KeyError:
+        pass
+
+    for name in cands:
+        try:
+            info = zf.getinfo(name)
+            if info.file_size > 8 * 1024 * 1024:  # 8MB 的 manifest 不可能是真的
+                continue
+            parsed = parse_manifest(zf.read(name))
+        except Exception:  # noqa: BLE001 单个候选坏了就试下一个
+            continue
+        if parsed.get("ok") and parsed.get("package"):
+            return name, parsed, obfuscated or bool(decoys)
+
+    return (cands[0] if cands else ""), {}, True
+
+
 def analyze(path: str | Path, extra_keywords: list[str] | None = None) -> dict[str, Any]:
     """返回 {facts, text, urls, keywords, template_hash, sha256}。"""
     path = Path(path)
@@ -321,6 +356,8 @@ def analyze(path: str | Path, extra_keywords: list[str] | None = None) -> dict[s
         "packer": "",
         "dex_count": 0,
         "apk_ok": False,
+        # 反分析痕迹：manifest 被做成目录 / 换了大小写当诱饵 / 加密
+        "manifest_obfuscated": False,
     }
 
     text_parts: list[str] = []
@@ -330,10 +367,13 @@ def analyze(path: str | Path, extra_keywords: list[str] | None = None) -> dict[s
 
     try:
         with zipfile.ZipFile(path) as zf:
-            manifest_name = next((n for n in zf.namelist() if n.lower() == "androidmanifest.xml"), "")
-            manifest = {}
-            if manifest_name:
-                manifest = parse_manifest(zf.read(manifest_name))
+            names = zf.namelist()
+            # `AndroidManifest.xml` 被做成目录、真 manifest 换成大写塞在别处——
+            # 实测 26537.net 分发的 84MB 包就是这么干的：根目录有个 34KB 的
+            # 加密 `ANDROIDMANIFEST.XML`，而 `AndroidManifest.xml/` 底下塞了
+            # 几百个假 xml 当诱饵。按名字取第一个会拿到加密块，解析全空。
+            manifest_name, manifest, obfuscated = _locate_manifest(zf, names)
+            facts["manifest_obfuscated"] = obfuscated
 
             blob_info = _scan_blobs(zf)
             cert = _cert_info(zf)

@@ -162,6 +162,28 @@ class DNSCache:
         with self._lock:
             self._flush()
 
+    def reverse(self, ip: str) -> list[str]:
+        """本地被动 DNS：缓存里有哪些域名解析到了这个 IP。
+
+        这是「不花钱的同源调查」——我们为了别的目的查过的 DNS，
+        反过来就是一张「谁和谁同服务器」的表。比任何外部反查 API 都稳，
+        因为它只包含我们亲眼见过的事实。
+        """
+        ip = (ip or "").strip()
+        if not ip:
+            return []
+        out: list[str] = []
+        now = time.time()
+        for domain, row in self._data.items():
+            if now - row.get("ts", 0) > self.ttl:
+                continue
+            if ip in (row.get("a") or []):
+                out.append(domain)
+        return out
+
+    def __len__(self) -> int:
+        return len(self._data)
+
 
 class DNSProbe:
     def __init__(self, cache_path: Path | None = None, *, qps: float = 30.0, workers: int = 16) -> None:

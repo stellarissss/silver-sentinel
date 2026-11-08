@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from silver_sentinel.discover.harvest import (
+    RAW_QUERIES,
     TITLE_QUERIES,
     Harvester,
     HarvestHit,
@@ -102,10 +103,55 @@ def test_one_failed_query_does_not_kill_the_round(monkeypatch):
 
 
 def test_rotation_covers_all_queries():
+    """轮换要覆盖全部查询词，不能只跑前几个。
+
+    高产出词在轮换表里出现两次（权重 2），所以按表长跑一整圈才算覆盖。
+    """
     h = Harvester(UrlscanSource(size=1, pause=0), per_round=1)
-    total = sum(len(v) for v in TITLE_QUERIES.values())
-    seen = {h.next_queries()[0][1] for _ in range(total)}
-    assert len(seen) == total, "轮换要覆盖全部查询词，不能只跑前几个"
+    seen = {h.next_queries()[0][1] for _ in range(len(h._flat))}
+    all_words = {q for qs in TITLE_QUERIES.values() for q in qs}
+    assert all_words <= seen, f"漏掉的词：{all_words - seen}"
+    missing_raw = {q for qs in RAW_QUERIES.values() for q in qs}
+    assert missing_raw <= {q[4:] for q in seen if q.startswith("raw:")}
+
+
+def test_cursor_survives_restart(tmp_path):
+    """游标必须落盘。线上十轮全跑 subsidy 前四个词，就是因为重启归零。"""
+    state = tmp_path / "harvest_state.json"
+    first = Harvester(UrlscanSource(size=1, pause=0), per_round=3, state_path=state)
+    got = [q for _c, q in first.next_queries()]
+    second = Harvester(UrlscanSource(size=1, pause=0), per_round=3, state_path=state)
+    assert [q for _c, q in second.next_queries()] != got, "重启后不该从头发车"
+
+
+def test_raw_queries_use_lucene_expression(monkeypatch):
+    """带有 raw: 前缀的查询直接当表达式，不再包 page.title。"""
+    seen = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": []}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, *a, **kw):
+            seen["q"] = kw.get("params", {}).get("q")
+            return _Resp()
+
+    monkeypatch.setattr("silver_sentinel.discover.harvest.httpx.Client", _Client)
+    UrlscanSource(pause=0).fetch("raw:page.url:apk AND page.language:zh")
+    assert seen["q"] == "page.url:apk AND page.language:zh"
 
 
 # ---------------------------------------------------------------- 落库
