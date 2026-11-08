@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -169,6 +170,36 @@ def _apply_claim(assessment: Any, merged: dict[str, Any], thresholds: dict[str, 
         assessment.notes.append("命中政府/媒体白名单")
 
 
+def _claim_from_evidence(session: Session, asset: Asset) -> dict[str, Any] | None:
+    """从已存的 page_html 补一次自称抽取。
+
+    只在重评时调用（离线、批量），不进入取证热路径。
+    """
+    if asset.kind not in ("domain", "url"):
+        return None
+    try:
+        from ..claim import analyze_html
+        from ..evidence import latest_text_row, read_text
+        from ..normalize import registrable_domain
+
+        row = latest_text_row(session, asset.id, kind="page_html")
+        if row is None:
+            return None
+        html = read_text(row, limit=400_000)
+        if not html:
+            return None
+        host = registrable_domain(asset.normalized or asset.value)
+        # 证据的 note 里带了最终 URL（可能被跳转过），有就用它，没有就用资产域名
+        note = str(getattr(row, "note", "") or "")
+        m = re.search(r"https?://([^/\s]+)", note)
+        if m:
+            host = m.group(1).lower()
+        return analyze_html(html, host).as_dict()
+    except Exception as exc:  # noqa: BLE001 补算失败按无自称处理
+        log.debug("从证据补算自称失败 %s：%s", asset.id, exc)
+        return None
+
+
 def assess_now(
     asset: Asset,
     *,
@@ -265,7 +296,16 @@ def rescore(
         body = text
     before = {"score": float(asset.score or 0.0), "verdict": asset.verdict, "tier": asset.tier}
 
-    assessment, merged = assess_now(asset, facts=facts, text=body)
+    # 历史资产没跑过「自称」抽取（本轮才上线）。重评时顺手从 page_html 补一次，
+    # 否则要等 24 小时复访才生效，批量重评等于白跑。
+    facts = dict(facts or {})
+    existing = ((asset.meta or {}).get("facts") or {}).get("claim")
+    if "claim" not in facts and not existing:
+        html_claim = _claim_from_evidence(session, asset)
+        if html_claim:
+            facts["claim"] = html_claim
+
+    assessment, merged = assess_now(asset, facts=facts or None, text=body)
     written = apply_assessment(session, asset, assessment)
 
     meta = dict(asset.meta or {})
