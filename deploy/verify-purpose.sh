@@ -25,8 +25,18 @@ for arg in "$@"; do
   esac
 done
 
+# install.sh 把程序装在 $APP_DIR/.venv（兼容旧版的 venv/），没有做全局软链。
+# 先自己找一遍，别让人为了跑一次验收去查 systemd 单元。
 if ! command -v "$SILVER_BIN" >/dev/null 2>&1; then
-  echo "找不到 $SILVER_BIN。用 SILVER_BIN=/opt/silver-sentinel/venv/bin/silver-sentinel 指定。" >&2
+  for cand in \
+    "${APP_DIR:-/opt/silver-sentinel}/.venv/bin/silver-sentinel" \
+    "${APP_DIR:-/opt/silver-sentinel}/venv/bin/silver-sentinel" \
+    /opt/silver-sentinel/.venv/bin/silver-sentinel; do
+    if [ -x "$cand" ]; then SILVER_BIN="$cand"; break; fi
+  done
+fi
+if ! command -v "$SILVER_BIN" >/dev/null 2>&1 && [ ! -x "$SILVER_BIN" ]; then
+  echo "找不到 silver-sentinel。用 SILVER_BIN=/opt/silver-sentinel/.venv/bin/silver-sentinel 指定。" >&2
   exit 2
 fi
 

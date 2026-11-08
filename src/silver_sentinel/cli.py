@@ -582,13 +582,14 @@ def cmd_model(args) -> int:
     cmd = [_sys.executable, str(script)]
     if args.data:
         cmd += ["--data", args.data]
-    if args.min_class:
-        cmd += ["--min-class", str(args.min_class)]
     if args.action == "train":
         if args.out:
             cmd += ["--out", args.out]
         if args.report:
             cmd += ["--report", args.report]
+    if args.action == "eval":
+        # 评估不能顺手把线上模型换掉——那是一次没有评审的上线。
+        cmd += ["--no-save"]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
     print(proc.stdout)
     if proc.stderr.strip():
@@ -1454,7 +1455,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data", default="", help="数据集路径（默认 data/purpose_seed.jsonl）")
     p.add_argument("--out", default="", help="模型输出路径")
     p.add_argument("--report", default="", help="评估报告输出路径")
-    p.add_argument("--min-class", type=int, default=4, help="少于此样本数的类别不参与训练")
     p.add_argument("--timeout", type=float, default=900.0)
     p.set_defaults(func=cmd_model)
 

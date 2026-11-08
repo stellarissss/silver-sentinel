@@ -104,6 +104,7 @@ def main() -> int:
     ap.add_argument("--out", default="src/silver_sentinel/data/purpose_model.joblib")
     ap.add_argument("--report", default="")
     ap.add_argument("--test-size", type=float, default=0.25)
+    ap.add_argument("--no-save", action="store_true", help="只评估，不覆盖线上模型")
     args = ap.parse_args()
 
     data_path = Path(args.data)
@@ -200,12 +201,14 @@ def main() -> int:
     out_path = Path(args.out)
     if not out_path.is_absolute():
         out_path = ROOT / out_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    import joblib
+    if args.no_save:
+        print(f"\n已评估（{best_name}）：{len(y)} 条样本，未写入模型（--no-save）")
+    else:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        import joblib
 
-    joblib.dump(payload, out_path)
-
-    print(f"\n已训练（{best_name}）：{len(y)} 条样本，输出 {out_path}")
+        joblib.dump(payload, out_path)
+        print(f"\n已训练（{best_name}）：{len(y)} 条样本，输出 {out_path}")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     print("\n交叉验证分类报告：")
     print(classification_report(y, best_pred, zero_division=0))

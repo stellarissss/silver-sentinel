@@ -67,7 +67,8 @@ ssh "${SSH_ARGS[@]}" -o ConnectTimeout=12 "$TARGET" "mkdir -p $REMOTE_DIR" \
   || die "SSH 连不上 $TARGET（检查地址、端口、密钥或安全组）"
 
 log "传输安装包"
-tar czf - -C "$ROOT/deploy" install.sh watchdog.sh -C "$(dirname "$WHEEL")" "$(basename "$WHEEL")" \
+tar czf - -C "$ROOT/deploy" install.sh watchdog.sh verify-purpose.sh \
+    -C "$(dirname "$WHEEL")" "$(basename "$WHEEL")" \
   | ssh "${SSH_ARGS[@]}" "$TARGET" "tar xzf - -C $REMOTE_DIR" \
   || die "传输失败"
 
@@ -77,3 +78,11 @@ ssh "${SSH_ARGS[@]}" -t "$TARGET" \
   "cd $REMOTE_DIR && (id -u | grep -qx 0 && bash install.sh $REMOTE_DIR/$(basename "$WHEEL") || sudo bash install.sh $REMOTE_DIR/$(basename "$WHEEL"))"
 
 log "完成"
+cat <<EOF
+
+下一步（服务器上执行，只读验收）：
+  ssh $TARGET 'bash $REMOTE_DIR/verify-purpose.sh'
+
+确认无误后补算历史资产用途并允许降级：
+  ssh $TARGET 'bash $REMOTE_DIR/verify-purpose.sh --apply'
+EOF
