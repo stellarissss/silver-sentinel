@@ -1576,6 +1576,11 @@ def _download_apk_locked(asset_id: int, links: list[str], page_url: str, tier: s
                     "path": result.path,
                 }
                 afacts = analysis.get("facts") or {}
+                # 包真的拿到手了，之前那条「超限」记录就过期了。留着它会让
+                # 分级理由一直写着「需人工取样」，而其实已经解析过。
+                expired = dict(meta.get("facts") or {})
+                if expired.pop("apk_too_large", None) is not None:
+                    meta["facts"] = expired
                 if afacts:
                     meta["apk_analysis"] = {
                         "package_name": afacts.get("package_name") or "",
@@ -1583,6 +1588,19 @@ def _download_apk_locked(asset_id: int, links: list[str], page_url: str, tier: s
                         "has_accessibility": bool(afacts.get("has_accessibility")),
                         "permissions": (afacts.get("permissions") or [])[:24],
                         "sha256": afacts.get("file_sha256") or "",
+                        # 下面这几项决定「这个包能不能被信任」：
+                        # manifest 解不出来时上面四个字段全是空的，看起来像
+                        # 「一个干净的包」，实际是加固对抗。线上实测 26537.net
+                        # 的 80MB 包把 AndroidManifest.xml 做成目录 + 加密，
+                        # 解析返回 package_name="" / 0 权限，如果只存前四项，
+                        # 下游会把它当无害包放走。
+                        "file_size": afacts.get("file_size") or 0,
+                        "manifest_obfuscated": bool(afacts.get("manifest_obfuscated")),
+                        "apk_ok": bool(afacts.get("apk_ok")),
+                        "cert_sha256": afacts.get("cert_sha256") or "",
+                        "signer": afacts.get("signer") or "",
+                        "packer": afacts.get("packer") or "",
+                        "dex_count": afacts.get("dex_count") or 0,
                     }
                 asset.meta = meta
         # 磁盘里只留一份：证据目录已按哈希存过
