@@ -857,17 +857,15 @@ function memberRowHtml(m) {
     </tr>`;
 }
 
-function assetCells(a, groupBadge) {
+function assetCells(a, extra) {
+  const sub = `${extra || ""}${decoyChip(a)}`
+    + (a.campaign_name ? `<span class="dim">团伙 ${escapeHtml(a.campaign_name)}</span>` : "");
   return `
     <tr data-asset="${a.id}">
       <td>${badge(a.verdict)}</td>
       <td class="clip">
         <span class="cell-main">${escapeHtml(a.value)}</span>
-        ${groupBadge ? `<span class="cell-sub">${groupBadge}</span>` : ""}
-        <span class="cell-sub">
-          ${decoyChip(a)}
-          ${a.campaign_name ? `<span class="dim">团伙 ${escapeHtml(a.campaign_name)}</span>` : ""}
-        </span>
+        ${sub ? `<span class="cell-sub">${sub}</span>` : ""}
       </td>
       <td class="mono">${escapeHtml(KIND_LABEL[a.kind] || a.kind)}</td>
       <td class="mono" style="color:${scoreColor(a.score)}">${a.score}</td>
