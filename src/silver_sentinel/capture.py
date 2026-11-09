@@ -502,7 +502,9 @@ def backfill(limit: int = 30) -> int:
         # 比任何文本线索都硬——它不需要「猜中话术」，只需要一次 DNS。
         source_rank = case(
             (Asset.discovery_source == "ip_pool", 0),
-            (Asset.discovery_source.in_(("urlscan", "report", "elder_seed", "cert_sibling")), 1),
+            (Asset.discovery_source.in_((
+                "urlscan", "report", "elder_seed", "cert_sibling", "ct_bulk", "ct_burst"
+            )), 1),
             else_=2,
         )
         # 冷却期未到的一律不补：dead 隔 72 小时，被墙隔 24 小时，抖动 10 分钟。
@@ -1097,6 +1099,17 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
             facts["elder"] = elder.as_dict()
         except Exception as exc:  # noqa: BLE001 涉老判定失败不能影响取证
             log.debug("涉老判定失败 %s：%s", asset_id, exc)
+
+        # ---- 主体实体：钱交给谁、联系谁。
+        # 用与涉老判定同一份正文（首页 + 第二跳），落地页的收款信息常在第二跳。
+        # 主体比 IP 硬：证书会重签、IP 会换，收款卡和微信号不会天天换。
+        try:
+            from .entities import as_dict as entities_as_dict
+            from .entities import from_text as extract_entities
+
+            facts["entities"] = entities_as_dict(extract_entities(elder_text))
+        except Exception as exc:  # noqa: BLE001 实体抽取失败不能影响取证
+            log.debug("主体实体抽取失败 %s：%s", asset_id, exc)
 
         # 取证完成，解除「不许降档」的保护——从此按证据说话
         meta.pop("await_capture", None)

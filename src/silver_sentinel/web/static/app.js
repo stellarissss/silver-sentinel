@@ -822,7 +822,7 @@ function assetRowHtml(a) {
         <span class="cell-sub">
           <span class="g-badge" title="${escapeHtml(g.label || kindLabel)}">×${g.size} ${escapeHtml(kindLabel)}</span>
           ${g.decoy_count ? `<span class="chip warn" title="组内有 ${g.decoy_count} 条诱饵页，展开可见">含 ${g.decoy_count} 诱饵</span>` : ""}
-          ${decoyChip(a)}
+          ${schemeChips(a)}${decoyChip(a)}
           ${a.campaign_name ? `<span class="dim">团伙 ${escapeHtml(a.campaign_name)}</span>` : ""}
         </span>
       </td>
@@ -858,7 +858,8 @@ function memberRowHtml(m) {
 }
 
 function assetCells(a, extra) {
-  const sub = `${extra || ""}${decoyChip(a)}`
+  const sub = `${extra || ""}${decoyChip(a)}${schemeChips(a)}`
+    + (a.entity_count ? `<span class="chip" title="页面里的联系方式/收款主体">主体 ${a.entity_count}</span>` : "")
     + (a.campaign_name ? `<span class="dim">团伙 ${escapeHtml(a.campaign_name)}</span>` : "");
   return `
     <tr data-asset="${a.id}">
@@ -874,6 +875,39 @@ function assetCells(a, extra) {
       <td class="mono">${fmtTime(a.last_seen)}</td>
       <td class="mono">${a.scan_count}</td>
     </tr>`;
+}
+
+// 主体实体卡片：钱交给谁、联系谁。同一微信号/收款卡跨站复用同一节点，
+// 这比 IP 更硬——证书会重签、IP 会换，收款账户不会天天换。
+const ENTITY_LABEL = {
+  phones: "手机号", landlines: "座机", qq: "QQ", wechat: "微信",
+  bank_cards: "银行卡", wallets: "钱包", payees: "收款人", banks: "开户行",
+  companies: "公司主体",
+};
+function renderEntityCard(a) {
+  const ent = (((a.meta || {}).facts || {}).entities || {});
+  const keys = Object.keys(ENTITY_LABEL).filter((k) => (ent[k] || []).length);
+  if (!keys.length) return "";
+  const blocks = keys.map((k) => `<div class="meta-cell">
+      <div class="k">${ENTITY_LABEL[k]}</div>
+      <div class="v">${(ent[k] || []).slice(0, 6).map((v) => escapeHtml(String(v))).join("<br>")}</div>
+    </div>`).join("");
+  return `<div class="section-title">主体实体 <span class="hint">${ent.count || keys.length} 项 · 跨站复用同一节点</span></div>
+    <div class="meta-grid">${blocks}</div>`;
+}
+
+// 涉老骗局类型（只读分类）：把「以仿冒政府网站为主」拆成可看的多类标签，
+// 人工复核一眼能看出这批线索覆盖了哪几类、哪一类还没抓到。
+const SCHEME_LABEL = {
+  "仿冒政府补贴": "仿冒补贴", "养老投资": "养老投资", "保健品会销": "保健品会销",
+  "冒充身份": "冒充身份", "民族资产解冻": "资产解冻",
+};
+function schemeChips(a) {
+  const list = a.elder_schemes || [];
+  if (!list.length) return "";
+  return list.slice(0, 2).map((s) =>
+    `<span class="chip warn" title="涉老骗局类型：${escapeHtml(s)}">${escapeHtml(SCHEME_LABEL[s] || s)}</span>`
+  ).join("");
 }
 
 function decoyChip(a) {
@@ -1032,6 +1066,8 @@ async function openAsset(id) {
         <div class="meta-cell"><div class="k">上次取证</div><div class="v">${a.last_capture_at ? fmtTime(a.last_capture_at) : "未取证"}</div></div>
         <div class="meta-cell"><div class="k">扫描次数</div><div class="v">${a.scan_count}</div></div>
       </div>
+
+      ${renderEntityCard(a)}
 
       <div class="row actions drawer-acts">
         <button class="btn primary sm" data-act="capture">立即取证</button>

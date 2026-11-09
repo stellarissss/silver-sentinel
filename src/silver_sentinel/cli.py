@@ -13,6 +13,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import settings
 from .db import init_db, session_scope, verify_chain
@@ -21,6 +22,9 @@ from .intake import scan
 from .models import Asset
 from .respond import advise, build, export_bundle
 from .scoring.engine import load_ruleset
+
+if TYPE_CHECKING:
+    from .discover.engine import CertObservation
 
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
 RED, ORG, YEL, GRN, CYA = "\033[31m", "\033[38;5;208m", "\033[33m", "\033[32m", "\033[36m"
@@ -419,6 +423,43 @@ def cmd_doctor(args) -> int:
             caps[mod] = False
             result.setdefault("capability_warnings", []).append(f"缺少 {mod}：{why}不可用")
     result["capabilities"] = caps
+
+    # 证据完整性：只做 exist()，不解密——看门狗每 2 分钟跑一次，
+    # 把 1.7 万个密文全解一遍会把磁盘打满。真丢失才算故障。
+    try:
+        from .evidence import audit
+
+        ev = audit(with_blobs=False)
+        result["evidence"] = {
+            "total": ev["total"], "plain": ev["plain"], "vault": ev["vault"],
+            "missing": ev["missing"], "dup_rows": ev["dup_rows"],
+        }
+        if ev["missing"]:
+            result["problems"].append(f"{ev['missing']} 条证据明文与密文均不可读")
+    except Exception as exc:  # noqa: BLE001
+        result["evidence"] = {"error": str(exc)[:160]}
+
+    # 同盘「远端」：这不是备份，只是同一份密文的第二份拷贝。
+    # 只告警不报错——功能上没坏，坏的是磁盘和「以为有备份」的错觉。
+    if settings.vault_enabled:
+        try:
+            from .vault import get_vault
+
+            v = get_vault()
+            same = v.backend_same_device()
+            result["vault"] = {
+                "backend": settings.vault_backend,
+                "target": settings.vault_target,
+                "same_device": same,
+                "skip_copy": settings.vault_skip_same_device_copy,
+            }
+            if same and not settings.vault_skip_same_device_copy:
+                result["vault_warning"] = (
+                    "证据仓「远端」与数据目录同盘：不是备份且多占一倍空间，"
+                    "建议设置 SILVER_VAULT_SKIP_SAME_DEVICE_COPY=1 后执行 vault dedupe --apply"
+                )
+        except Exception as exc:  # noqa: BLE001
+            result["vault"] = {"error": str(exc)[:160]}
 
     result["ok"] = not result["problems"]
     if args.quiet and result["ok"]:
@@ -1073,6 +1114,82 @@ def _reconcile(args) -> int:
     return 0
 
 
+def _ct_event_to_observation(raw) -> CertObservation | None:
+    """把 `discovery_events.raw` 还原成 CertObservation。
+
+    `raw` 是 JSON 列：SQLAlchemy 取出来是 dict，而早期流水/原生 sqlite
+    读出来是 JSON 字符串。两种都得认，否则整批会被静默跳过。
+    """
+    from .discover.engine import CertObservation
+
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw or "{}")
+        except (ValueError, TypeError):
+            return None
+    elif isinstance(raw, dict):
+        data = raw
+    else:
+        return None
+    if not isinstance(data, dict):
+        return None
+    domain = str(data.get("domain") or "").strip()
+    if not domain:
+        return None
+    try:
+        entry_index = int(data.get("entry_index") or 0)
+    except (TypeError, ValueError):
+        entry_index = 0
+    return CertObservation(
+        domain=domain,
+        all_domains=list(data.get("all_domains") or []),
+        issuer=str(data.get("issuer") or ""),
+        not_before=str(data.get("not_before") or ""),
+        fingerprint=str(data.get("fingerprint") or ""),
+        log_url=str(data.get("log_url") or "ct_poll"),
+        entry_index=entry_index,
+        source="ct_poll",
+    )
+
+
+def _replay_ct_cli(args) -> int:
+    """把 `discovery_events` 里的历史 CT 观测回放给站群聚合器。
+
+    实时 CT 流只能看见正在签发的证书，8~9 月那批长期运营的前缀族签完后
+    就再也不会出现；但当时的原始观测一直存在流水表里，从没被关联成族。
+    这个命令让它们走一遍前缀族聚合，把已存在但沉底的站群域名提回候选池。
+    """
+    from sqlalchemy import select
+
+    from .db import init_db, session_scope
+    from .discover.engine import DiscoveryEngine
+    from .models import DiscoveryEvent
+
+    init_db()
+    limit = max(0, getattr(args, "limit", 0) or 0)
+    with session_scope() as session:
+        stmt = (
+            select(DiscoveryEvent.raw)
+            .where(DiscoveryEvent.source == "ct_poll")
+            .order_by(DiscoveryEvent.id)
+        )
+        if limit:
+            stmt = stmt.limit(limit)
+        raws = list(session.execute(stmt).scalars())
+
+    observations = [
+        o for o in (_ct_event_to_observation(raw) for raw in raws) if o is not None
+    ]
+
+    print(f"历史 CT 观测 {len(observations)} 条待回放（source=ct_poll）")
+    if args.dry_run:
+        print("dry-run：未写库")
+        return 0
+    result = DiscoveryEngine().replay_ct_observations(observations)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_discover(args) -> int:
     """发现引擎的运维入口。
 
@@ -1086,6 +1203,9 @@ def cmd_discover(args) -> int:
     if args.action == "status":
         print(json.dumps(get_engine().status(), ensure_ascii=False, indent=2))
         return 0
+
+    if args.action == "replay-ct":
+        return _replay_ct_cli(args)
 
     if args.action == "words":
         from collections import defaultdict
@@ -1388,6 +1508,31 @@ def cmd_replica(args) -> int:
 
 
 
+def cmd_evidence(args) -> int:
+    """证据体检：记录、明文、密文三者对齐。
+
+    这条命令存在的理由：开了「上传后删明文」之后，`row.path` 指向的文件
+    本来就不存在，密文在 `data/vault/blobs/`。只看路径会把正常证据全报成
+    丢失（线上排查就这么误判过一次，以为 2.3 万条只剩 142 个文件）。
+    """
+    from .evidence import audit, gc_orphans, repair
+
+    init_db()
+    action = args.action
+    if action == "audit":
+        out = audit()
+    elif action == "repair":
+        out = repair(fix=not args.dry_run)
+        if not args.dry_run:
+            out["after"] = audit(with_blobs=False)
+    elif action == "gc":
+        out = gc_orphans(dry_run=args.dry_run)
+    else:  # pragma: no cover - argparse 已限制取值
+        return 2
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_vault(args) -> int:
     """加密证据仓：初始化、固化、拉取、校验、导出账本。"""
     from .vault import get_vault
@@ -1424,6 +1569,8 @@ def cmd_vault(args) -> int:
         result = vault.sync_once()
     elif action == "verify":
         result = vault.verify(deep=not args.fast)
+    elif action == "dedupe":
+        result = vault.dedupe_remote(dry_run=not args.apply)
     elif action == "export":
         if not args.out:
             print("需要 --out 指定导出目录")
@@ -1586,10 +1733,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("discover", help="发现引擎：CT 监控 / 词库 / 注入 / 历史补漏")
     p.add_argument(
         "action",
-        choices=["run", "status", "words", "inject", "search", "reconcile", "pivot"],
+        choices=["run", "status", "words", "inject", "search", "reconcile", "pivot", "replay-ct"],
         help="run 常驻运行，status 看吞吐，words 看词库覆盖，inject 导入清单，"
              "search 翻 crt.sh 历史，reconcile 按新词库复算存量，"
-             "pivot 从一个站做同证书/同 IP 扩散（手工排查用）",
+             "pivot 从一个站做同证书/同 IP 扩散，"
+             "replay-ct 把历史 CT 流水按前缀族重新聚合成站群批次",
     )
     p.add_argument("values", nargs="*", help="inject 的域名，或 search 的词根")
     p.add_argument("--file", help="从文件批量导入（每行一个域名，# 开头为注释）")
@@ -1597,6 +1745,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--minutes", type=float, default=0, help="run 的时长（分钟），0 为常驻")
     p.add_argument("--apply", action="store_true", help="reconcile 时真正写库（默认只报告）")
     p.add_argument("--ip", help="pivot 时附带查询的服务器 IP，逗号分隔")
+    p.add_argument("--limit", type=int, default=0, help="replay-ct 最多回放多少条（0=全部）")
+    p.add_argument("--dry-run", action="store_true", help="replay-ct 只统计不写库")
     p.set_defaults(func=cmd_discover)
 
     # ------------------------------------------------------------ 流水线与图
@@ -1641,14 +1791,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--with-db", action="store_true", help="同时同步数据库快照")
     p.set_defaults(func=cmd_replica)
 
+    p = sub.add_parser("evidence", help="证据体检：明文/密文/丢失/重复/孤儿")
+    p.add_argument("action", choices=["audit", "repair", "gc"])
+    p.add_argument("--dry-run", action="store_true", help="只报告，不落改动")
+    p.set_defaults(func=cmd_evidence)
+
     p = sub.add_parser("vault", help="加密证据仓：固化、拉取、校验、导出账本")
-    p.add_argument("action", choices=["init", "status", "push", "pull", "sync", "verify", "export", "import"])
+    p.add_argument("action", choices=["init", "status", "push", "pull", "sync", "verify", "export", "import", "dedupe"])
     p.add_argument("--out", help="export 的目标目录")
     p.add_argument("--src", help="import 的账本目录")
     p.add_argument("--limit", type=int, default=500, help="单次最多处理多少条")
     p.add_argument("--passphrase", help="init 时用口令派生密钥（留空则随机生成）")
     p.add_argument("--force", action="store_true", help="init 时覆盖已有密钥（危险）")
     p.add_argument("--fast", action="store_true", help="verify 只校验账本链，不解密抽样")
+    p.add_argument("--apply", action="store_true", help="dedupe 真正删除（默认只报告）")
     p.set_defaults(func=cmd_vault)
 
     p = sub.add_parser("opsec", help="出站防护：状态 / 分类检查 / 脱敏")

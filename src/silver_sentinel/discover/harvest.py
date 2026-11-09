@@ -145,7 +145,9 @@ ROTATION = tuple(TITLE_QUERIES)
 # 这些来源明确「有人在页面上见过目标内容」，不是从域名里猜的。
 # 它们在取证之前不接受域名级降档——quick 研判只看域名，用它否定外部线索
 # 等于把发现层的成果直接丢掉（线上实测：6 条线索 3 条被压成 cold 再不取证）。
-EXTERNAL_SOURCES = frozenset({"urlscan", "report", "elder_seed", "ip_pool", "cert_sibling"})
+EXTERNAL_SOURCES = frozenset(
+    {"urlscan", "report", "elder_seed", "ip_pool", "cert_sibling", "ct_bulk", "ct_burst"}
+)
 
 # 标题里出现这些，多半是正经机构，收但降权（不是丢——判据会再看一遍）
 _INSTITUTIONAL = (

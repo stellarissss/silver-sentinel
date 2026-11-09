@@ -76,3 +76,81 @@ def test_ct_log_list_payload_survives_unexpected_compression(monkeypatch):
             raise ValueError("'utf-8' codec can't decode byte 0x1f in position 0")
 
     assert _json_payload(Resp()) == payload
+
+
+# ---------------------------------------------------------------- 批量证书主动扫描
+
+
+def _rand_host(i: int, tld: str = "cn") -> str:
+    """生成器吐出来的名字：短、字母数字混排、读不出来。i 保证唯一。"""
+    import hashlib
+
+    h = hashlib.sha1(f"seed{i}".encode()).hexdigest()
+    letter = lambda j: chr(97 + int(h[j:j + 2], 16) % 26)  # noqa: E731
+    digit = lambda j: str(int(h[j:j + 2], 16) % 10)  # noqa: E731
+    return f"{letter(0)}{digit(2)}{letter(4)}{letter(6)}{digit(8)}.{tld}"
+
+
+def _bulk_obs(count: int = 20, fp: str = "c" * 64, offset: int = 0) -> CertObservation:
+    domains = [_rand_host(offset + i) for i in range(count)]
+    return CertObservation(
+        domain=domains[0],
+        all_domains=domains,
+        issuer="CN=LiteSSL,O=LiteSSL,C=CN",
+        not_before="2026-11-01T00:00:00+00:00",
+        fingerprint=fp,
+        log_url="https://ct.example/log",
+        entry_index=9,
+    )
+
+
+def test_bulk_cert_adopted_without_any_keyword_hit(fresh_db):
+    """证书形状本身就是线索：不靠域名命中任何词库。
+
+    线上的 88/94 条涉老都来自两张证书，且是因为「先抓到站、再读证书」才
+    发现的。这条通道的判据只看 SAN 形状，能发现一个词都不命中的新站群。
+    """
+    engine = DiscoveryEngine()
+    obs = _bulk_obs()
+    engine._on_ct_batch([obs])
+
+    assert engine.stats.bulk_adopted > 0
+    queued = [row for row in engine.pending if row[4] == ["bulk_cert_scan"]]
+    assert queued, "应有一批通过批量证书入池"
+    assert all(row[3] == 0.58 for row in queued)
+    assert all((row[0].source == "ct_bulk") for row in queued)
+
+
+def test_bulk_cert_is_deduped_by_fingerprint(fresh_db):
+    """一张 90 域名证书会产生 90 条观测，不能采纳 90 次。"""
+    engine = DiscoveryEngine()
+    obs = _bulk_obs()
+    engine._on_ct_batch([obs, obs, obs])
+    assert engine.stats.bulk_scanned == 1
+
+
+def test_normal_multi_san_cert_is_ignored(fresh_db):
+    """正常业务证书（baidu 那种）不该被当站群：名字都读得出来。"""
+    engine = DiscoveryEngine()
+    domains = [
+        "click.hm.baidu.com", "baifubao.com", "map.baidu.com", "tieba.baidu.com",
+        "zhidao.baidu.com", "wenku.baidu.com", "image.baidu.com", "news.baidu.com",
+        "baiducontent.com", "bdstatic.com",
+    ]
+    obs = CertObservation(
+        domain="baidu.com", all_domains=domains, issuer="CN=GlobalSign",
+        not_before="2026-01-01T00:00:00+00:00", fingerprint="d" * 64,
+        log_url="https://ct.example/log", entry_index=1,
+    )
+    engine._on_ct_batch([obs])
+    assert engine.stats.bulk_adopted == 0
+
+
+def test_bulk_scan_respects_daily_budget(fresh_db):
+    """一天最多采纳 BULK_SCAN_DAILY 张，防止取证队列被批量证书灌爆。"""
+    from silver_sentinel.discover.engine import BULK_SCAN_DAILY
+
+    engine = DiscoveryEngine()
+    for i in range(BULK_SCAN_DAILY + 3):
+        engine._on_ct_batch([_bulk_obs(fp=f"{i:064d}", offset=i * 100)])
+    assert engine.stats.bulk_scanned == BULK_SCAN_DAILY

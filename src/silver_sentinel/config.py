@@ -228,6 +228,9 @@ class Settings:
     vault_secret_key: str = ""
     vault_bucket: str = "silver-sentinel-vault"
     vault_remove_plaintext: bool = False  # 上传并校验后删除本地明文
+    # 「远端」是 dir 且与数据目录同盘时，push 只是把同一份密文再写一遍：
+    # 既不是备份（盘坏一起坏），又白占一倍空间。打开后不再复制。
+    vault_skip_same_device_copy: bool = False
     vault_verify_blobs: bool = True
 
     # ---------------------------------------------------------------- 副本
@@ -416,6 +419,7 @@ class Settings:
         self.vault_secret_key = _str("SILVER_VAULT_SECRET_KEY", "")
         self.vault_bucket = _str("SILVER_VAULT_BUCKET", "silver-sentinel-vault")
         self.vault_remove_plaintext = _bool("SILVER_VAULT_REMOVE_PLAINTEXT", False)
+        self.vault_skip_same_device_copy = _bool("SILVER_VAULT_SKIP_SAME_DEVICE_COPY", False)
         self.vault_verify_blobs = _bool("SILVER_VAULT_VERIFY", True)
 
         self.replica_enabled = _bool("SILVER_REPLICA_ENABLED", False)

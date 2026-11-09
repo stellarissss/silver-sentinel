@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .db import compute_chain_hash
+from .db import compute_chain_hash, session_scope
 from .domain import utcnow
 from .models import Evidence
 
@@ -41,6 +41,27 @@ def chain_tip(session: Session) -> str:
     return row.chain_hash if row else ""
 
 
+def _same_content(session: Session, asset_id: int, kind: str, digest: str) -> Evidence | None:
+    """同一资产的同类证据，内容一模一样就不再插一行。
+
+    取证是周期性的：一个挂了 Cloudflare 的站每轮都落一份
+    「Attention Required!」截图，一个小时就能攒出几十条一模一样的记录。
+    文件本体靠 sha256 只存一份，但链上每来一次就多一行——线上 2.3 万行里
+    有 4100 行是这种重复，占了 18%，查起来全是噪声。
+    """
+    return session.scalars(
+        select(Evidence)
+        .where(
+            Evidence.asset_id == asset_id,
+            Evidence.kind == kind,
+            Evidence.sha256 == digest,
+            Evidence.deleted_at.is_(None),
+        )
+        .order_by(Evidence.id.desc())
+        .limit(1)
+    ).first()
+
+
 def append(
     session: Session,
     asset_id: int,
@@ -50,8 +71,14 @@ def append(
     note: str = "",
     extension: str = ".bin",
     mime: str = "",
+    dedupe: bool = True,
 ) -> Evidence:
     digest = hashlib.sha256(data).hexdigest()
+    if dedupe:
+        existing = _same_content(session, asset_id, kind, digest)
+        if existing is not None:
+            return existing
+
     target = settings.evidence_dir / f"{digest}{extension}"
     if not target.exists():
         target.write_bytes(data)
@@ -66,6 +93,7 @@ def append(
         size=len(data),
         captured_at=captured,
         path=str(target.relative_to(settings.data_dir)) if target.is_relative_to(settings.data_dir) else str(target),
+        storage="plain",
         note=note,
         mime=mime or MIME_BY_EXT.get(extension.lower(), ""),
     )
@@ -83,6 +111,7 @@ def append_file(
     note: str = "",
     *,
     mime: str = "",
+    dedupe: bool = True,
 ) -> Evidence:
     """按文件写入证据。
 
@@ -96,6 +125,11 @@ def append_file(
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     hexdigest = digest.hexdigest()
+    if dedupe:
+        existing = _same_content(session, asset_id, kind, hexdigest)
+        if existing is not None:
+            return existing
+
     target = settings.evidence_dir / f"{hexdigest}{extension}"
     if not target.exists():
         shutil.copyfile(path, target)
@@ -112,6 +146,7 @@ def append_file(
         path=str(target.relative_to(settings.data_dir))
         if target.is_relative_to(settings.data_dir)
         else str(target),
+        storage="plain",
         note=note,
         mime=mime or MIME_BY_EXT.get(extension.lower(), ""),
     )
@@ -188,14 +223,24 @@ def read_text(row: Evidence | None, limit: int = 200_000) -> str:
 
 
 def read_status(row: Evidence) -> str:
-    """plain | vault | missing。给健康检查与排障用。"""
+    """plain | vault | missing。给健康检查与排障用。
+
+    先看 storage 再探文件：开了「上传后删明文」之后，`row.path` 指向的文件
+    本来就不该存在，只按路径判断会把 1.7 万条正常证据全报成丢失。
+    """
+    from .vault import blob_path
+
+    if getattr(row, "storage", "") == "vault" and blob_path(row.sha256).is_file():
+        return "vault"
     path = path_of(row)
     try:
         if path.is_file():
             return "plain"
     except OSError:
         pass
-    return "vault" if _decrypt(row.sha256) else "missing"
+    if blob_path(row.sha256).is_file():
+        return "vault"
+    return "missing"
 
 
 def materialize(row: Evidence) -> Path | None:
@@ -346,3 +391,175 @@ def purge_trash(older_than_days: int = 7) -> dict:
         except OSError:
             continue
     return {"removed": removed, "freed_bytes": freed}
+
+
+# ---------------------------------------------------------------- 体检与修复
+#
+# 背景：开了「上传后删明文」之后，`row.path` 指向的文件被主动删掉，密文在
+# `data/vault/blobs/xx/<sha>.ssv`。任何只看 path 的检查都会把正常证据认成丢失。
+# 这里把「记录 / 明文 / 密文」三者一次对齐，并给出可执行的修复动作。
+
+
+def audit(*, with_blobs: bool = True) -> dict:
+    """清点证据：明文、密文、真丢失、重复行、孤儿密文。"""
+    from .vault import blob_path
+
+    stats = {"total": 0, "plain": 0, "vault": 0, "missing": 0, "deleted": 0}
+    by_kind: dict[str, dict[str, int]] = {}
+    seen: dict[tuple[int, str, str], int] = {}
+    dup_rows = 0
+    missing_ids: list[int] = []
+    referenced: set[str] = set()
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                Evidence.id, Evidence.asset_id, Evidence.kind, Evidence.sha256,
+                Evidence.path, Evidence.storage, Evidence.deleted_at,
+            )
+        ).all()
+
+    for ev_id, asset_id, kind, sha, path, _storage, deleted_at in rows:
+        stats["total"] += 1
+        if deleted_at is not None:
+            stats["deleted"] += 1
+            continue
+        referenced.add(sha)
+        key = (asset_id, kind, sha)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            dup_rows += 1
+
+        p = Path(path or "")
+        if not p.is_absolute():
+            p = settings.data_dir / p
+        if p.is_file():
+            state = "plain"
+        elif blob_path(sha).is_file():
+            state = "vault"
+        else:
+            state = "missing"
+            if len(missing_ids) < 200:
+                missing_ids.append(ev_id)
+        stats[state] += 1
+        bucket = by_kind.setdefault(kind, {"plain": 0, "vault": 0, "missing": 0})
+        bucket[state] += 1
+
+    out = dict(stats)
+    out["by_kind"] = by_kind
+    out["dup_rows"] = dup_rows
+    out["unique_contents"] = len(seen)
+    out["missing_ids"] = missing_ids
+    if with_blobs:
+        root = settings.data_dir / "vault" / "blobs"
+        blobs = {p.name[:-4] for p in root.rglob("*.ssv")} if root.is_dir() else set()
+        out["blobs"] = len(blobs)
+        out["orphan_blobs"] = len(blobs - referenced)
+    return out
+
+
+def repair(*, fix: bool = True, batch: int = 400) -> dict:
+    """把 storage 字段与实际存储对齐；真丢失的单列出来。
+
+    只改元数据，不动文件、不删记录——链仍然完整，只是「文件在哪」这件事
+    第一次被写清楚了。
+
+    分批提交：常驻服务一直在取证写库，一次性 UPDATE 2.3 万行会把写锁占住
+    十几秒，取证队列直接报 database is locked（线上第一次跑就这么失败的）。
+    每批独立事务 + 冲突重试，让它能在服务不停的情况下跑完。
+    """
+    import time as _time
+
+    from .vault import blob_path
+
+    changed = {"to_vault": 0, "to_plain": 0}
+    missing: list[dict] = []
+    last_id = 0
+    total = 0
+
+    while True:
+        ready: list[tuple[int, str]] = []
+        with session_scope() as session:
+            rows = session.execute(
+                select(Evidence.id, Evidence.asset_id, Evidence.kind, Evidence.sha256,
+                       Evidence.path, Evidence.storage)
+                .where(Evidence.id > last_id, Evidence.deleted_at.is_(None))
+                .order_by(Evidence.id)
+                .limit(batch)
+            ).all()
+            if not rows:
+                break
+            last_id = rows[-1][0]
+            total += len(rows)
+            for ev_id, asset_id, kind, sha, path, storage in rows:
+                p = Path(path or "")
+                if not p.is_absolute():
+                    p = settings.data_dir / p
+                if p.is_file():
+                    want = "plain"
+                elif blob_path(sha).is_file():
+                    want = "vault"
+                else:
+                    want = "missing"
+                    if len(missing) < 500:
+                        missing.append(
+                            {"id": ev_id, "asset_id": asset_id, "kind": kind,
+                             "sha256": sha, "path": path}
+                        )
+                    continue
+                if storage != want:
+                    ready.append((ev_id, want))
+
+        if fix and ready:
+            for attempt in range(5):
+                try:
+                    with session_scope() as session:
+                        for ev_id, want in ready:
+                            session.execute(
+                                Evidence.__table__.update()
+                                .where(Evidence.id == ev_id)
+                                .values(storage=want)
+                            )
+                    break
+                except Exception as exc:  # noqa: BLE001 锁冲突重试，别的错误照抛
+                    if "locked" not in str(exc).lower() or attempt == 4:
+                        raise
+                    _time.sleep(0.5 * (attempt + 1))
+        for want in (w for _, w in ready):
+            changed["to_vault" if want == "vault" else "to_plain"] += 1
+
+    out = {
+        "scanned": total,
+        "fixed": changed if fix else {},
+        "missing": missing,
+        "missing_count": len(missing),
+    }
+    return out
+
+
+def gc_orphans(*, dry_run: bool = True) -> dict:
+    """清掉没有任何证据记录引用的密文。
+
+    孤儿来自「压进密文仓后证据行被硬删」或早期重复上传。留着只是占盘，
+    删掉不影响任何可读性——它们的 sha 已经不在任何链上。
+    """
+    from .vault import blob_path  # noqa: F401  (保持导入一致性)
+
+    root = settings.data_dir / "vault" / "blobs"
+    if not root.is_dir():
+        return {"removed": 0, "freed_bytes": 0, "dry_run": dry_run}
+    with session_scope() as session:
+        referenced = {s for (s,) in session.execute(select(Evidence.sha256).distinct())}
+    removed = freed = 0
+    for path in root.rglob("*.ssv"):
+        if path.name[:-4] in referenced:
+            continue
+        try:
+            size = path.stat().st_size
+            if not dry_run:
+                path.unlink()
+            removed += 1
+            freed += size
+        except OSError:
+            continue
+    return {"removed": removed, "freed_bytes": freed, "dry_run": dry_run}

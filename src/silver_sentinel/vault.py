@@ -187,6 +187,13 @@ class Backend:
         except Exception:  # noqa: BLE001
             return False
 
+    def size(self, name: str) -> int | None:
+        """远端对象大小。用于「同名同大小就算重复」的判定，避免整份读回来。"""
+        return None
+
+    def delete(self, name: str) -> bool:
+        raise NotImplementedError
+
 
 class DirBackend(Backend):
     name = "dir"
@@ -215,6 +222,23 @@ class DirBackend(Backend):
             return []
         pfx = Path(prefix).name
         return [str(p.relative_to(self.root)) for p in sorted(parent.glob(pfx + "*")) if p.is_file()]
+
+    def size(self, name: str) -> int | None:
+        path = self.root / name
+        try:
+            return path.stat().st_size if path.is_file() else None
+        except OSError:
+            return None
+
+    def delete(self, name: str) -> bool:
+        path = self.root / name
+        try:
+            if path.is_file():
+                path.unlink()
+                return True
+        except OSError:
+            return False
+        return False
 
 
 class S3Backend(Backend):
@@ -246,6 +270,13 @@ class S3Backend(Backend):
             return obj["Body"].read()
         except Exception:  # noqa: BLE001
             return None
+
+    def delete(self, name: str) -> bool:
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=name)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def list(self, prefix: str = "") -> list[str]:
         out: list[str] = []
@@ -435,6 +466,11 @@ class VaultState:
         }
 
 
+def blob_path(sha256: str) -> Path:
+    """本地密文路径。唯一权威定义，evidence 层也用它判断「文件还在不在」。"""
+    return settings.data_dir / "vault" / "blobs" / sha256[:2] / f"{sha256}.ssv"
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -507,6 +543,34 @@ class Vault:
             self.backend = make_backend()
         return self.backend
 
+    def backend_same_device(self) -> bool:
+        """「远端」和本地密文在同一个文件系统上。
+
+        这时候 push 只是把已经存在的密文原样再写一遍：盘坏了一起坏，
+        既不是备份，又白占一倍空间（线上 1.6G 变 3.3G，磁盘 92%）。
+        判定为真时不再复制，只记本地位置。
+        """
+        if settings.vault_backend != "dir" or not settings.vault_target:
+            return False
+
+        def _dev(path: Path) -> int | None:
+            # 目标目录可能还没建（首次 push 之前），往上找第一个存在的祖先
+            probe = path
+            while True:
+                try:
+                    return probe.stat().st_dev
+                except OSError:
+                    if probe.parent == probe:
+                        return None
+                    probe = probe.parent
+
+        target = Path(settings.vault_target).resolve()
+        local = (settings.data_dir / "vault").resolve()
+        if target == local:
+            return True
+        a, b = _dev(target), _dev(local)
+        return a is not None and a == b
+
     def _file_lock(self):
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         fh = open(settings.data_dir / "vault.lock", "w")
@@ -571,7 +635,7 @@ class Vault:
         return f"blobs/{sha256[:2]}/{sha256}.ssv"
 
     def _local_blob_path(self, sha256: str) -> Path:
-        return self.local_blob_dir / sha256[:2] / f"{sha256}.ssv"
+        return blob_path(sha256)
 
     def seal_local(self, sha256: str, data: bytes) -> bytes:
         blob = _seal_with_length(data, self.keys.key, sha256)
@@ -588,16 +652,23 @@ class Vault:
         return data
 
     def materialize(self, sha256: str) -> Path | None:
-        """需要读原始证据时（人工复核、导出），把明文临时还原到 evidence 目录。"""
+        """需要读原始证据时（人工复核、导出），把明文临时还原。
+
+        落到 `tmp/` 而不是 evidence 目录：证据已经脱敏过一次，
+        再写回证据目录等于让它重新裸奔在磁盘上，下一次备份又带走一份。
+        """
         with session_scope() as session:
             row = session.scalars(select(Evidence).where(Evidence.sha256 == sha256).limit(1)).first()
             ext = Path(row.path).suffix if row and row.path else ".bin"
-        target = settings.evidence_dir / f"{sha256}{ext}"
-        if target.is_file():
-            return target
+        plain = settings.evidence_dir / f"{sha256}{ext}"
+        if plain.is_file():
+            return plain
         data = self.open_local(sha256)
         if data is None:
             return None
+        tmp_dir = settings.data_dir / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        target = tmp_dir / f"{sha256}{ext}"
         target.write_bytes(data)
         return target
 
@@ -654,13 +725,20 @@ class Vault:
                             "seal", row.sha256, size=len(data), alg="AES-256-GCM", key_id=self.keys.key_id
                         )
                         if settings.vault_remove_plaintext:
+                            # 先记账再删文件：删失败也不会让「文件在哪」变成未知。
+                            row.storage = "vault"
                             try:
                                 path.unlink()
                                 self._append_custody("redact-plaintext", row.sha256, path=str(path.name))
                             except OSError:
                                 pass
 
-                    locator = backend.put(self._blob_name(row.sha256), blob)
+                    copied = not (settings.vault_skip_same_device_copy and self.backend_same_device())
+                    if copied:
+                        locator = backend.put(self._blob_name(row.sha256), blob)
+                    else:
+                        # 密文已经在本地 vault/blobs 里，再往同盘「远端」写一份纯属浪费
+                        locator = "local:" + self._blob_name(row.sha256)
                     asset = self._asset_of(session, row.asset_id)
                     entry = self._append_manifest(
                         {
@@ -698,19 +776,65 @@ class Vault:
                         "upload", row.sha256, backend=backend.name, locator=locator, entry=entry["hash"]
                     )
                     pushed += 1
-                    bytes_sent += len(blob)
+                    if copied:
+                        bytes_sent += len(blob)
                     done.add(row.sha256)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
 
-        if pushed:
+        if pushed and not (settings.vault_skip_same_device_copy and self.backend_same_device()):
             self._publish_ledger()
         self.state.last_push = utcnow().isoformat()
         self.state.pushed += pushed
         self.state.pushed_bytes += bytes_sent
         self._save_state()
         return {"ok": True, "pushed": pushed, "bytes": bytes_sent, "node": self.node_id}
+
+    def dedupe_remote(self, *, dry_run: bool = True, limit: int = 0) -> dict[str, Any]:
+        """删掉远端与本地重复的密文副本。
+
+        只处理后端是 dir 且与本地同盘的情况——这种「远端」不是备份，
+        是同盘第二份；留着只占空间。删除条件严格：本地必须有同 sha 的密文，
+        且大小完全一致。本地没有的远端对象一律不动，避免删出真丢失。
+        """
+        if settings.vault_backend != "dir":
+            return {"ok": False, "reason": "只处理 dir 后端", "removed": 0}
+        backend = self._backend()
+        removed = freed = kept = 0
+        targets: list[str] = []
+        for name in backend.list("blobs/"):
+            sha = Path(name).stem
+            local = blob_path(sha)
+            if not local.is_file():
+                kept += 1
+                continue
+            size = backend.size(name)
+            try:
+                local_size = local.stat().st_size
+            except OSError:
+                kept += 1
+                continue
+            if size is not None and size != local_size:
+                kept += 1
+                continue
+            targets.append(name)
+        for name in targets:
+            if limit and removed >= limit:
+                break
+            size = backend.size(name) or 0
+            if dry_run:
+                removed += 1
+                freed += size
+                continue
+            try:
+                if backend.delete(name):
+                    removed += 1
+                    freed += size
+            except NotImplementedError:
+                return {"ok": False, "reason": "后端不支持删除", "removed": removed}
+        return {"ok": True, "dry_run": dry_run, "removed": removed,
+                "freed_bytes": freed, "kept_remote_only": kept}
 
     def _publish_ledger(self) -> None:
         backend = self._backend()
@@ -1090,6 +1214,8 @@ class Vault:
             "enabled": settings.vault_enabled,
             "backend": settings.vault_backend,
             "target_set": bool(settings.vault_target),
+            "target_same_device": self.backend_same_device(),
+            "skip_same_device_copy": settings.vault_skip_same_device_copy,
             "node": self.node_id,
             "key_id": self.keys.key_id if self._key_present() else "missing",
             "evidence_total": count,

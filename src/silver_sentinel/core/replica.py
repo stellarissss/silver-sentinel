@@ -294,12 +294,17 @@ class Replica:
         try:
             import sqlite3
 
-            src = sqlite3.connect(str(db_path))
-            dst = sqlite3.connect(str(snapshot))
-            with dst:
-                src.backup(dst)
-            src.close()
-            dst.close()
+            # 只读源 + 分批复制：4.4G 库一次 backup 会长时间占住源库读快照，
+            # 期间其他连接的写入反复撞 SQLITE_BUSY_SNAPSHOT（busy_timeout
+            # 对这种情况无效）。分批 + 间隔让写事务有机会插进来。
+            src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
+            dst = sqlite3.connect(str(snapshot), timeout=30)
+            try:
+                with dst:
+                    src.backup(dst, pages=512, sleep=0.01)
+            finally:
+                src.close()
+                dst.close()
         except Exception as exc:  # noqa: BLE001
             log.warning("数据库快照失败：%s", exc)
             return False

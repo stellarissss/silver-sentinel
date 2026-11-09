@@ -99,6 +99,7 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("deleted_at", "DATETIME"),
         ("deleted_by", "VARCHAR(80) DEFAULT ''"),
         ("delete_reason", "TEXT DEFAULT ''"),
+        ("storage", "VARCHAR(8) DEFAULT ''"),
     ],
     "watch_targets": [
         ("asset_id", "INTEGER"),
@@ -122,6 +123,8 @@ _ADDED_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_graph_edges_rel ON graph_edges (rel)",
     "CREATE INDEX IF NOT EXISTS ix_graph_nodes_type ON graph_nodes (type)",
     "CREATE INDEX IF NOT EXISTS ix_evidence_deleted_at ON evidence (deleted_at)",
+    # 去重查询按 (asset, kind, sha) 走：同一份内容重复取证时不该再插一行
+    "CREATE INDEX IF NOT EXISTS ix_evidence_asset_kind_sha ON evidence (asset_id, kind, sha256)",
     "CREATE INDEX IF NOT EXISTS ix_watch_targets_asset_id ON watch_targets (asset_id)",
 ]
 

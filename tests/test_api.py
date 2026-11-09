@@ -92,6 +92,34 @@ def test_assets_listing_and_filter(fresh_db):
         assert all(a["verdict"] == "confirmed" for a in confirmed)
 
 
+def test_asset_rows_expose_schemes_and_entities(fresh_db):
+    """v1.16：列表/详情要能按骗局类型与主体实体分组，字段必须真的出去。"""
+    from silver_sentinel.db import session_scope
+    from silver_sentinel.models import Asset
+
+    with session_scope() as s:
+        a = Asset(
+            kind="domain", value="yanglao-invest.cn", normalized="yanglao-invest.cn",
+            tier="watch", score=72.0,
+            meta={"facts": {
+                "elder": {"elder": True, "priority": "P0",
+                          "schemes": ["养老投资", "仿冒政府补贴"]},
+                "entities": {"wechat": ["fuli88"], "phones": ["13800138000"], "count": 2},
+            }},
+        )
+        s.add(a)
+        s.flush()
+        aid = a.id
+
+    with _client() as c:
+        items = c.get("/api/assets?tier=all").json()["items"]
+        row = next(x for x in items if x["id"] == aid)
+        assert row["elder_schemes"] == ["养老投资", "仿冒政府补贴"]
+        assert row["entity_count"] == 2
+        detail = c.get(f"/api/assets/{aid}").json()
+        assert detail["meta"]["facts"]["entities"]["wechat"] == ["fuli88"]
+
+
 def test_watch_crud(fresh_db):
     with _client() as c:
         created = c.post("/api/watch", json={"kind": "keyword", "value": "领鸡蛋", "interval_minutes": 60}).json()

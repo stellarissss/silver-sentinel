@@ -189,7 +189,30 @@ def _asset_row(asset: Asset) -> dict[str, Any]:
         # 诱饵/蜜罐：列表页打标，详情页出卡片。不要藏起来——
         # 「这一页是样子货」本身就是判断它价值的关键信息。
         "decoy": _decoy_row(asset),
+        # 涉老骗局类型（只读分类）与主体实体：把「以仿冒政府网站为主」
+        # 这个结论拆开看，人工复核能按类型、按收款主体分组。
+        "elder_schemes": _elder_schemes(asset),
+        "entity_count": _entity_count(asset),
     }
+
+
+def _elder_schemes(asset: Asset) -> list[str]:
+    facts = (asset.meta or {}).get("facts") or {}
+    e = facts.get("elder") if isinstance(facts, dict) else None
+    if not isinstance(e, dict):
+        return []
+    return [str(x) for x in (e.get("schemes") or [])][:6]
+
+
+def _entity_count(asset: Asset) -> int:
+    facts = (asset.meta or {}).get("facts") or {}
+    ent = facts.get("entities") if isinstance(facts, dict) else None
+    if not isinstance(ent, dict):
+        return 0
+    try:
+        return int(ent.get("count") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _group_detail(session: Session, asset: Asset) -> dict[str, Any] | None:

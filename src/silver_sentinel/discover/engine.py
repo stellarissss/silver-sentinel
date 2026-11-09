@@ -51,11 +51,13 @@ from ..models import (
     KeywordHit,
 )
 from ..normalize import collapse_host
+from .burst import BurstDetector, family_key
 from .ct import CertObservation, CertStreamClient, CTLogFollower, CtrlShSearch
 from .dnsprobe import DNSProbe, SeedGenerator
 from .harvest import EXTERNAL_SOURCES, Harvester
 from .ippool import BadIPPool
 from .keywords import get_library
+from .morph import BULK_MIN_DOMAINS
 from .morph import assess as morph_assess
 from .pivot import PivotEngine
 
@@ -108,6 +110,30 @@ SHAPE_INTERVAL = 25.0        # 轮询间隔（秒）
 IP_POOL_INTERVAL = 600.0     # IP 池重建 / 同源扩散间隔（秒）
 PIVOT_BUDGET = 6             # 每轮最多扩散几个资产。CertSpotter 免费 100 次/小时，
                              # 6×6=36 次留足余量；实测一批证书能带出 9~30 个域名。
+# ---- 批量证书主动扫描（v1.15）
+#
+# 上一条「批量签发」只在**已知可疑站**的证书上展开：先命中关键词 → 取证 →
+# 读它自己的证书 → 才发现 90 个兄弟域名。线上 94 条涉老里 88 条来自两张证书，
+# 全部源自同一个种子——发现能力押在一个点上。
+#
+# CT 流里其实躺着所有证书的 SAN。判据（≥8 个域名 + 60% 随机串）不依赖任何
+# 关键词，可以独立跑：把「谁一次签了 90 个随机域名」当成发现信号，而不是
+# 「谁的名字像养老」。一个生成器一天能注册上百个，这是产量最高的一条路。
+BULK_SCAN_DAILY = 12         # 每天最多采纳多少张这样的证书
+BULK_SCAN_LIMIT = 12         # 每张最多带几个域名进候选池（其余靠证书展开）
+BULK_SCAN_HINT = 0.58        # 高于 STRONG_HINT，进池即受取证保护
+# ---- 批量单域名证书（v1.16）
+#
+# v1.15 上面这条上线一天 `bulk_assets=0`：现场 CT 观测的 all_domains 几乎都是
+# 1~2 个域名。现代站群用 LE / GTS 批量签发**单域名证书**，一个生成器几分钟
+# 注册上百个域名、每个单独签一张，证书 SAN 里根本看不到「一批」。
+# 离线重放 8000 条生产 CT 事件后确认：主力是「固定字母前缀 + 变数字」的
+# 长期运营族（yl####.com / cctv|com / mz|top），按签发时刻分桶会把它切碎。
+# 主判据改前缀族、同时段同签名降为补充，见 discover/burst.py。
+BURST_DAILY = 12             # 每天最多采纳多少批单域名站群
+BURST_SCORE_HINT = 0.58      # 与多 SAN 批次同权，进池即受取证保护
+CT_MANAGER_INTERVAL = 180.0  # 冻结日志检查间隔：原 1800s，实测 12:50 报冻结、13:02 仍未换
+
 IP_HIT_SCORE = 0.78          # 同 IP 命中的发现权重：高于任何词库命中，仍留给判定层复核
 STRONG_HINT = 0.50           # 达到这个发现强度就先保护、再取证（见 _persist）
 PIVOT_HIT_SCORE = 0.70       # 同证书扩散的发现权重：证据强度略低于同 IP（证书可共享但更难伪造）
@@ -125,6 +151,10 @@ class DiscoverStats:
     cert_siblings: int = 0
     cert_cluster: int = 0
     bulk_certs: int = 0
+    bulk_scanned: int = 0
+    bulk_adopted: int = 0
+    burst_batches: int = 0
+    burst_adopted: int = 0
     cold_promoted: int = 0
     harvested: int = 0
     shape_seen: int = 0
@@ -146,6 +176,10 @@ class DiscoverStats:
             "db_errors": self.db_errors,
             "cert_siblings": self.cert_siblings,
             "bulk_certs": self.bulk_certs,
+            "bulk_scanned": self.bulk_scanned,
+            "bulk_adopted": self.bulk_adopted,
+            "burst_batches": self.burst_batches,
+            "burst_adopted": self.burst_adopted,
             "cert_cluster": self.cert_cluster,
             "cold_promoted": self.cold_promoted,
             "harvested": self.harvested,
@@ -210,6 +244,11 @@ class DiscoveryEngine:
         self._pivoter: PivotEngine | None = None
         self._bulk_day = ""
         self._bulk_today = 0
+        self._bulk_scan_day = ""
+        self._bulk_scan_today = 0
+        self._burst = BurstDetector()
+        self._burst_day = ""
+        self._burst_today = 0
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -296,8 +335,10 @@ class DiscoveryEngine:
         if not self._followers:
             log.warning("没有可用 CT 日志，发现层只剩 DNS 探测")
 
-        # 每半小时检查一次：日志冻结了就换一条。这是它最容易「静默失效」的地方。
-        while not self._stop.wait(1800):
+        # 冻结是「进程在跑、指标在涨、一条新证书都没进来」的静默失效。
+        # 原间隔 1800s：实测 12:50 报 nimbus2026 冻结、13:02 仍在跟它，
+        # 半天发现层就空转了。缩到 3 分钟，且换日志时避开已知冻死的 URL。
+        while not self._stop.wait(CT_MANAGER_INTERVAL):
             frozen = [f for f in list(self._followers) if f.frozen and not getattr(f, "retired", False)]
             if not frozen:
                 continue
@@ -372,6 +413,14 @@ class DiscoveryEngine:
     def _on_ct_batch(self, observations: list[CertObservation]) -> None:
         for obs in observations:
             self.stats.seen += 1
+            # 先看证书本身：批量签发的判据不需要域名命中任何词。
+            # 放在最前面，是为了让「名字完全随机」的站群也能被看见。
+            if len(obs.all_domains) >= BULK_MIN_DOMAINS:
+                self._adopt_bulk_cert(obs)
+            else:
+                # v1.16：单域名证书才是现在的主流站群形态。SAN 里看不到一批，
+                # 但同一生成器长期吐出的「固定前缀 + 变数字」域名仍是一族。
+                self._adopt_burst(obs)
             host = obs.domain.lower().strip(".")
             if not host or "." not in host:
                 continue
@@ -411,6 +460,143 @@ class DiscoveryEngine:
                 getattr(hit, "cluster", "") in CERT_SIBLING_CLUSTERS for hit in result.hits
             ):
                 self._spread_cert_siblings(obs, domain)
+
+    def _bulk_scan_budget_left(self) -> bool:
+        today = time.strftime("%Y-%m-%d")
+        if self._bulk_scan_day != today:
+            self._bulk_scan_day = today
+            self._bulk_scan_today = 0
+        if self._bulk_scan_today >= BULK_SCAN_DAILY:
+            return False
+        self._bulk_scan_today += 1
+        return True
+
+    def _adopt_bulk_cert(self, obs: CertObservation) -> int:
+        """CT 里「一次签发几十个随机域名」的证书，直接当线索源。
+
+        和 `_spread_cert_siblings` 的区别是**触发条件**：
+        那边要求当前域名先命中词库，等于只沿着已知线索爬；
+        这边只看证书形状，能发现「一个词都不命中」的全新站群。
+
+        为什么值得单独开一条：线上 94 条涉老里 88 条来自同一张证书，
+        说明这条链路一旦不依赖种子，产出就能从「一个团伙」变成「一批团伙」。
+        """
+        from ..normalize import is_pivot_noise
+
+        fp = obs.fingerprint or ""
+        if not fp:
+            return 0
+        # 一张 90 个域名证书会产生 90 条观测，指纹去重必须在打分之前
+        if not self.deduper.add("bulkcert:" + fp):
+            return 0
+        if not self._looks_like_bulk_batch(obs.all_domains):
+            return 0
+        if not self._bulk_scan_budget_left():
+            return 0
+
+        roots: dict[str, float] = {}
+        for raw in obs.all_domains:
+            host = str(raw).lower().strip(".")
+            if not host or "." not in host:
+                continue
+            root = collapse_host(host) if settings.discover_collapse_subdomains else host
+            if not root or root in roots:
+                continue
+            if self.lib.is_whitelisted(root) or is_pivot_noise(root):
+                continue
+            try:
+                roots[root] = morph_assess(root).score
+            except Exception:  # noqa: BLE001 形态模块故障不该影响采纳
+                roots[root] = 0.0
+        if len(roots) < BULK_MIN_DOMAINS:
+            return 0
+
+        # 只带「最像批量生成」的那几个：剩下的等取证时读证书再展开，
+        # 避免一次把 90 个死域名塞进取证队列。
+        picked = sorted(roots.items(), key=lambda kv: -kv[1])[:BULK_SCAN_LIMIT]
+        reason = f"批量签发：同证书 {len(roots)} 个域名，{obs.issuer[:48] or '未知签发者'}"
+        base_obs = replace(obs, source="ct_bulk", note=reason)
+        added = 0
+        with self._pending_lock:
+            for root, _score in picked:
+                if not self.deduper.add("bulk:" + root):
+                    continue
+                # 这些域名确实在同一张证书上：fingerprint 保留（同证书是团伙
+                # 证据），但流水要记自己的域名，别都指向证书主域。
+                row_obs = replace(base_obs, domain=root, all_domains=[root])
+                self.pending.append(
+                    (row_obs, "domain", root, BULK_SCAN_HINT, ["bulk_cert_scan"], root)
+                )
+                added += 1
+        if added:
+            self.stats.bulk_scanned += 1
+            self.stats.bulk_adopted += added
+            log.info("批量证书：%s（%d 域名）采纳 %d 个候选", obs.domain, len(roots), added)
+        return added
+
+    def _burst_budget_available(self) -> bool:
+        """当日是否还有采纳额度，作为 `observe(adoptable=...)` 传入。
+
+        预算耗尽时不跳过 `observe`：观测仍要入桶排队，否则这批线索连同
+        重放机会一起丢了。聚合器在 `adoptable=False` 时只累积不产出。
+        """
+        today = time.strftime("%Y-%m-%d")
+        if self._burst_day != today:
+            self._burst_day = today
+            self._burst_today = 0
+        return self._burst_today < BURST_DAILY
+
+    def _adopt_burst(self, obs: CertObservation, *, unlimited: bool = False) -> int:
+        """一个站群批次凑齐了：把其中最像站群的几个送进候选池。
+
+        与 `_adopt_bulk_cert` 的区别是证据来源：那边读一张证书上的 SAN 列表，
+        这里读一串证书共有的前缀族或签发者/命名模式/签发时刻。两者都不依赖
+        关键词，这样才能发现「一个词都不命中」的全新站群。
+        `unlimited` 供历史回放使用：补漏不占当天的 BURST_DAILY 配额。
+        """
+        picked = self._burst.observe(
+            obs,
+            allowed=lambda root: not self.lib.is_whitelisted(root),
+            limit=BULK_SCAN_LIMIT,
+            adoptable=unlimited or self._burst_budget_available(),
+        )
+        if not picked:
+            return 0
+
+        # 证据链要写清是「哪条判据」判的：一族全同前缀即前缀族，否则是
+        # 同时段同签名。窗口批次的随机串域名 family_key 全为 None。
+        fams = {family_key(root) for root, _ in picked}
+        family = next(iter(fams)) if len(fams) == 1 else None
+        issuer = obs.issuer[:48] or "未知签发者"
+        if family:
+            reason = (
+                f"站群前缀族 {family}：累计 {len(picked)} 个同族域名"
+                f"（固定字母前缀+变数字），{issuer}"
+            )
+        else:
+            reason = (
+                f"批量单域名证书：同签发者同时段 {len(picked)} 个同形态域名，{issuer}"
+            )
+        base_obs = replace(obs, source="ct_burst", note=reason)
+        added = 0
+        with self._pending_lock:
+            for root, _score in picked:
+                if not self.deduper.add("burst:" + root):
+                    continue
+                # 一批证书各挂一个域名：整批共用触发那张证书的 domain /
+                # fingerprint 会让流水与 value 对不上，还会被 _cert_clusters
+                # 误判成「同证书团伙」。每条流水改记自己的域名，指纹留空。
+                row_obs = replace(base_obs, domain=root, all_domains=[root], fingerprint="")
+                self.pending.append(
+                    (row_obs, "domain", root, BURST_SCORE_HINT, ["burst_cert"], root)
+                )
+                added += 1
+        if added:
+            self._burst_today += 1
+            self.stats.burst_batches += 1
+            self.stats.burst_adopted += added
+            log.info("单域名证书站群：%s 触发一批，采纳 %d 个候选", obs.domain, added)
+        return added
 
     def _spread_cert_siblings(self, obs: CertObservation, origin: str) -> None:
         """把同一张证书上的其他注册域送进队列。
@@ -843,6 +1029,29 @@ class DiscoveryEngine:
             self._stop.wait(2.0)
             self._flush()
 
+    def replay_ct_observations(self, observations: list[CertObservation]) -> dict[str, Any]:
+        """把历史 CT 观测回放进站群聚合器（运维补漏，不占实时日预算）。
+
+        实时流只能看见「正在签发」的证书；长期运营的前缀族签完后就再也不会
+        出现，可 `discovery_events` 里存着当时的原始观测。回放让它们按族
+        重新聚合，走与实时发现完全相同的采纳 / 去重 / 入库路径，还能把库里
+        已存在却沉在 cold 的站群域名重新标成 `await_capture` 提回候选池。
+
+        幂等：`BurstDetector` 按桶键记忆已采纳域名，`_persist` 按 normalized
+        跳过建重复资产；可重复执行，也不会挤占当天的 BURST_DAILY 配额。
+        """
+        before = self.stats.queued
+        for obs in observations:
+            self._adopt_burst(obs, unlimited=True)
+        self._flush(force=True)
+        return {
+            "batches": self.stats.burst_batches,
+            "adopted": self.stats.burst_adopted,
+            "created": self.stats.queued - before,
+            "families": self._burst.stats["families"],
+            "windows": self._burst.stats["windows"],
+        }
+
     def _flush(self, force: bool = False) -> None:
         with self._pending_lock:
             if not self.pending:
@@ -854,15 +1063,23 @@ class DiscoveryEngine:
         self._last_flush = time.time()
 
         rows = batch
-        try:
-            with session_scope() as session:
-                created = self._persist(session, rows)
-            self.stats.queued += created
-        except Exception as exc:  # noqa: BLE001
-            self.stats.db_errors += 1
-            log.warning("发现批写入失败（%d 条）：%s", len(rows), exc)
-            # 失败不重排队：事件日志里已有流水，人工可回放
-            emit("discover.flush_failed", count=len(rows), error=str(exc)[:200])
+        # WAL 下「先 SELECT 再 autoflush 写入」撞上别的连接提交会立刻返回
+        # SQLITE_BUSY_SNAPSHOT，busy_timeout 对它无效，只能整体重跑事务。
+        # 发现线索不重排队（事件流水里已有），必须在丢之前重试。
+        for attempt in range(3):
+            try:
+                with session_scope() as session:
+                    created = self._persist(session, rows)
+                self.stats.queued += created
+                return
+            except Exception as exc:  # noqa: BLE001
+                if "locked" not in str(exc).lower() or attempt == 2:
+                    self.stats.db_errors += 1
+                    log.warning("发现批写入失败（%d 条）：%s", len(rows), exc)
+                    # 失败不重排队：事件日志里已有流水，可 discover replay-ct 补
+                    emit("discover.flush_failed", count=len(rows), error=str(exc)[:200])
+                    return
+                time.sleep(0.3 * (attempt + 1))
 
     def _cert_clusters(self, session, rows: list[tuple]) -> dict[str, str]:
         """同一张证书签过的可疑域名，按指纹索引。
@@ -906,6 +1123,13 @@ class DiscoveryEngine:
                 if asset is not None:
                     asset.last_seen = utcnow()
                     asset.enrich_count = (asset.enrich_count or 0) + 1
+                    # 复现时把新证据的理由追加进发现原因。原实现只更新
+                    # last_seen / meta，注释却写着「和发现原因」——族批次、
+                    # 同证书批次这类关联证据因此一直没进人工审阅视野。
+                    note = (getattr(obs, "note", "") or "") if obs is not None else ""
+                    if note and note not in (asset.discovery_reason or ""):
+                        prev = asset.discovery_reason or ""
+                        asset.discovery_reason = (prev + "；" + note if prev else note)[:512]
                     meta = dict(asset.meta or {})
                     changed = False
                     if score > meta.get("discover_hint", 0):
@@ -1138,6 +1362,7 @@ class DiscoveryEngine:
             "stream": self._stream.status() if self._stream else None,
             "dns": self._dns.stats if self._dns else None,
             "seeds": self._seeds.stats() if self._seeds else None,
+            "burst": self._burst.as_dict(),
             "pending": len(self.pending),
             "crt_sh_error": self._ct_sh.last_error,
         }

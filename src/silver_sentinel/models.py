@@ -187,6 +187,10 @@ class Evidence(Base):
     chain_hash: Mapped[str] = mapped_column(String(64), default="")
     size: Mapped[int] = mapped_column(Integer, default=0)
     path: Mapped[str] = mapped_column(Text, default="")
+    # 文件本体现在在哪：plain（data/evidence 明文）/ vault（密文仓）/ missing。
+    # 以前只有 path，而开了「上传后删明文」之后 path 指向的文件必然不存在，
+    # 所有按「文件在不在」判断的逻辑都会把它认成丢失（自检、导出、人工排查都踩过）。
+    storage: Mapped[str] = mapped_column(String(8), default="plain")
     mime: Mapped[str] = mapped_column(String(80), default="")
     note: Mapped[str] = mapped_column(Text, default="")
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

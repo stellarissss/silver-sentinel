@@ -18,12 +18,16 @@ from typing import Any
 from sqlalchemy import select
 
 from ..db import session_scope
+from ..entities import NODE_TYPES, from_text, read_evidence_text
 from ..models import Asset, Evidence
 from ..normalize import extract_indicators, is_shared_infra
 from .schema import node_key
 from .store import GraphStore, get_graph
 
 log = logging.getLogger(__name__)
+
+# 每轮建图最多给多少个历史资产补抽主体（vault 解密有成本，别让周期被拖垮）
+GRAPH_BACKFILL_PER_RUN = 60
 
 
 def _as_list(value: Any) -> list[str]:
@@ -39,7 +43,7 @@ def _as_list(value: Any) -> list[str]:
 class GraphBuilder:
     def __init__(self, store: GraphStore | None = None) -> None:
         self.store = store or get_graph()
-        self.stats = {"assets": 0, "nodes": 0, "edges": 0, "errors": 0}
+        self.stats = {"assets": 0, "nodes": 0, "edges": 0, "entities": 0, "errors": 0}
 
     def _link(self, src: tuple[str, str], dst: tuple[str, str], rel: str, **kw: Any) -> None:
         try:
@@ -57,6 +61,7 @@ class GraphBuilder:
         value = asset.value
         kind = asset.kind
         label = value[:120]
+        anchor = node_key(kind, value)
 
         if kind == "domain":
             self._build_domain(asset, value, facts, meta, label)
@@ -69,9 +74,24 @@ class GraphBuilder:
             fallback = self.store.upsert_node("keyword" if kind == "text" else kind, value, label)
             self._attach_indicators(fallback, value)
 
+        # 取证流水线已经把主体落进 facts.entities：零 IO，直接用。
+        self._attach_entities(anchor, facts.get("entities") or {})
         if evidence_texts:
-            anchor = node_key(kind, value)
             self._attach_indicators(anchor, "\n".join(t for t in evidence_texts if t))
+
+    def _attach_entities(self, anchor: str, entities: dict) -> None:
+        """把结构化主体挂到图上。同一微信号/收款卡跨站复用同一个节点。"""
+        if not entities or not isinstance(entities, dict):
+            return
+        node_type, node_value = anchor.split(":", 1)
+        src = (node_type, node_value)
+        for field, (target_type, rel) in NODE_TYPES.items():
+            for raw in _as_list(entities.get(field))[:20]:
+                value = str(raw).strip()
+                if not value or value == "count":
+                    continue
+                self._link(src, (target_type, value), rel)
+                self.stats["entities"] = self.stats.get("entities", 0) + 1
 
     def _build_domain(self, asset: Asset, value: str, facts: dict, meta: dict, label: str) -> None:
         dkey = self.store.upsert_node("domain", value, label, {"tier": asset.tier, "score": asset.score})
@@ -208,20 +228,50 @@ class GraphBuilder:
                     .limit(limit)
                 )
             )
-            # 预取证据文本，避免 N+1
-            evidence_map: dict[int, list[str]] = {}
-            for ev in s.scalars(
-                select(Evidence).where(Evidence.asset_id.in_([r.id for r in rows] or [-1]))
-            ):
-                if ev.kind in ("page_text", "apk_strings", "chat_text"):
-                    evidence_map.setdefault(ev.asset_id, []).append(ev.note or "")
+            # 预取证据行，避免 N+1。
+            # 以前这里收的是 `ev.note`——那只是「页面正文 https://...」一句说明，
+            # 真正的正文在文件里（plain 或 vault 密文），从没被读进来，
+            # 于是联系方式/收款主体节点几乎为空（线上 wechat 仅 3 个）。
+            # 现在读真正文并抽指标；SQLite 绑定变量上限按 500 一批查。
+            evidence_map: dict[int, list[Evidence]] = {}
+            ids = [r.id for r in rows]
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                for ev in s.scalars(
+                    select(Evidence).where(Evidence.asset_id.in_(chunk))
+                ):
+                    if ev.kind in ("page_text", "apk_strings", "chat_text"):
+                        evidence_map.setdefault(ev.asset_id, []).append(ev)
 
+            # 每轮只给有限个「还没抽过主体」的历史资产解密，避免周期被
+            # 1.7 万条 vault 密文拖垮。抽完写回 facts，之后每轮零 IO。
+            backfilled = 0
             for asset in rows:
+                evs = evidence_map.get(asset.id, [])
+                texts: list[str] = []
+                if evs:
+                    text = read_evidence_text(evs, per_row_limit=60_000, max_chars=120_000)
+                    if text:
+                        texts.append(text)
+                    facts = (asset.meta or {}).get("facts") or {}
+                    if not facts.get("entities") and text and backfilled < GRAPH_BACKFILL_PER_RUN:
+                        ent = from_text(text)
+                        if ent:
+                            meta = dict(asset.meta or {})
+                            f = dict(meta.get("facts") or {})
+                            f["entities"] = {k: v for k, v in ent.items()}
+                            f["entities"]["count"] = sum(len(v) for v in ent.values())
+                            meta["facts"] = f
+                            asset.meta = meta
+                            backfilled += 1
+                            self.stats["backfilled"] = backfilled
                 try:
-                    self.build_asset(asset, evidence_texts=evidence_map.get(asset.id, []))
+                    self.build_asset(asset, evidence_texts=texts)
                 except Exception as exc:  # noqa: BLE001
                     self.stats["errors"] += 1
                     log.debug("构建资产 %s 失败：%s", asset.id, exc)
+            if backfilled:
+                s.flush()
 
         # 把 Campaign 关系也写进图
         self._link_campaigns()

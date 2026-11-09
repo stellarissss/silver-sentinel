@@ -90,6 +90,92 @@ def test_casino_is_not_elder():
     assert sig.reason == "无受众指向"
 
 
+# ---------------------------------------------------------------- 三大高发类型（v1.16）
+#
+# 依据：公安部 2026-06-12 发布会通报涉老诈骗三大高发类型为养老投资类、
+# 推销保健品类、冒充身份类。上线一天的实际表现是 94 条涉老里 89 条都是
+# 「伪造政府网站标识码」，另外两类一个都没抓到——词表只认养老/社保/补贴。
+
+INVEST_TEXT = """
+国惠康养 · 养老公寓床位预订 内部认购
+保本高息 稳赚不赔 零风险理财 年化利率 11% 坐等养老收益
+原始股 股权认购 三年退还本金
+请填写身份证号 绑定银行卡 完成预约登记
+"""
+
+HEALTH_TEXT = """
+中华养生大讲堂 · 免费领鸡蛋 听课送米油
+专家义诊 名医坐诊 夸大药效 高价保健品 理疗器械 包治百病
+请提交身份证号与医保卡信息领取健康礼包 添加微信客服
+"""
+
+IMPERSONATE_TEXT = """
+医保账户异常通知：您的医保卡即将冻结
+涉嫌洗钱 已被立案 请配合调查 转入安全账户完成转账验资
+不要告诉子女 要求保密 当场操作
+请填写银行卡号与手机验证码
+"""
+
+# 反例：正规机构也会用「年化利率 / 保健品 / 理疗仪」这些词，
+# 但正常机构不索要身份证银行卡，也不冒充部委——hard 闸门必须挡住。
+FUND_TEXT = """
+某某基金管理有限公司 产品说明书
+本产品业绩比较基准 年化利率 3.2%，历史收益不代表未来表现
+投资者应仔细阅读风险揭示书，理财非存款，投资需谨慎
+客服电话 400-xxx-xxxx
+"""
+
+PHARMACY_TEXT = """
+某某大药房 保健食品与理疗仪专区
+蛋白粉 羊奶粉 慢病管理 免费测血压
+支持到店自提与医保卡支付，营业时间 9:00-21:00
+"""
+
+
+def test_pension_investment_scheme_is_elder():
+    sig = assess({}, INVEST_TEXT)
+    assert sig.is_elder, sig.reason
+    assert "养老投资" in sig.schemes
+    assert sig.hits["identity"]
+
+
+def test_health_seminar_scheme_is_elder():
+    sig = assess({}, HEALTH_TEXT)
+    assert sig.is_elder, sig.reason
+    assert "保健品会销" in sig.schemes
+
+
+def test_identity_spoof_scheme_is_elder():
+    sig = assess({}, IMPERSONATE_TEXT)
+    assert sig.is_elder, sig.reason
+    assert "冒充身份" in sig.schemes
+
+
+def test_legit_fund_page_is_not_elder():
+    """有投资话术但没有身份索取/权威冒用：不能被新增受众词误判成涉老。"""
+    sig = assess({"claim": {"verdict": "neutral"}}, FUND_TEXT)
+    assert not sig.is_elder
+    assert sig.reason == "只有受众指向和营销动作，缺冒充或身份索取" or sig.reason == "只有受众指向，缺证据"
+
+
+def test_legit_pharmacy_page_is_not_elder():
+    sig = assess({"claim": {"verdict": "neutral"}}, PHARMACY_TEXT)
+    assert not sig.is_elder
+
+
+def test_schemes_are_readonly_labels():
+    """分类标注不参与定罪：博彩页即便蹭到词也不该变成涉老。"""
+    sig = assess({}, CASINO_TEXT)
+    assert not sig.is_elder
+    assert sig.reason == "无受众指向"
+
+
+def test_detect_schemes_returns_multiple_labels():
+    from silver_sentinel.elder import detect_schemes
+
+    assert set(detect_schemes(INVEST_TEXT + HEALTH_TEXT)) >= {"养老投资", "保健品会销"}
+
+
 # ---------------------------------------------------------------- 分级联动
 
 
