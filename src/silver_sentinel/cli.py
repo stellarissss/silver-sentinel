@@ -233,6 +233,25 @@ def cmd_trash(args) -> int:
     return 0
 
 
+def cmd_prune_assets(args) -> int:
+    """清理取证失败的死站：默认 dry-run，--apply 才真正删。"""
+    from .prune import prune as run_prune
+    from .prune import restore as run_restore
+
+    if args.restore:
+        result = run_restore(Path(args.restore), apply=args.apply)
+    else:
+        result = run_prune(
+            apply=args.apply,
+            include_observed=args.include_observed,
+            include_high_risk=args.include_high_risk,
+            limit=args.limit,
+            reason=args.reason,
+        )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_dismiss(args) -> int:
     """人工排除：把一条资产从自动盯防里摘出来，并留下判断依据。
 
@@ -1722,6 +1741,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=30)
     p.add_argument("--purge-days", type=int, default=None, help="清理多少天前的文件（必须显式指定）")
     p.set_defaults(func=cmd_trash)
+
+    p = sub.add_parser(
+        "prune-assets", help="清理取证失败的死站：最小留痕后删除（默认 dry-run）"
+    )
+    p.add_argument("--apply", action="store_true", help="真正写入；不加则只统计不删")
+    p.add_argument("--include-observed", action="store_true", help="连观察/已确认档一起删（默认保留）")
+    p.add_argument("--include-high-risk", action="store_true", help="连 high_risk 判定一起删（默认保留）")
+    p.add_argument("--limit", type=int, default=0, help="最多处理多少条（0=全部）")
+    p.add_argument("--reason", default="取证永久失败，已无需举报；保留最小留痕，释放取证预算用于发现新团伙")
+    p.add_argument("--restore", help="从归档 JSONL 恢复资产（需同时加 --apply）")
+    p.set_defaults(func=cmd_prune_assets)
 
     p = sub.add_parser("dismiss", help="人工排除：把一条资产移出自动盯防并记录理由")
     p.add_argument("asset_id", type=int)

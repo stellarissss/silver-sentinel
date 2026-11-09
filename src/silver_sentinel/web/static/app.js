@@ -810,7 +810,7 @@ function assetRowHtml(a) {
     return assetCells(a, extra);
   }
   const open = state.expandedGroups.has(g.key);
-  const kindLabel = { campaign: "同团伙", cert: "同证书", backend: "同收单", template: "同模板" }[g.kind] || g.label || "同源";
+  const kindLabel = { campaign: "同团伙", cert: "同证书", backend: "同收单", template: "同模板", family: "同前缀族" }[g.kind] || g.label || "同源";
   return `
     <tr class="group-row${open ? " open" : ""}" data-asset="${a.id}" data-group="${escapeHtml(g.key)}">
       <td>${badge(a.verdict)}</td>

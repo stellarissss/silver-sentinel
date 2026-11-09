@@ -774,7 +774,13 @@ def _collapse_rows(rows: list[Asset]) -> tuple[list[dict[str, Any]], int]:
 
     组在「组内第一条出现的位置」占位，这样按分数排序时，
     一个高分组不会被低分成员拖到后面去。
+
+    group_key 为空时再兜一层「站群前缀族」：取证失败的资产没有正文/证书，
+    但 `mz479.top` / `mz749.top` 这类固定前缀 + 变数字的域名，在发现阶段就
+    是同一个生成器长期运营的证据（见 discover/burst.py）。只用于展示、
+    不写库，误判了也能用「展开全部」一键绕开。
     """
+    from .discover.burst import family_key
     from .grouping import GROUP_LABELS, group_row
 
     order: list[Any] = []
@@ -783,16 +789,20 @@ def _collapse_rows(rows: list[Asset]) -> tuple[list[dict[str, Any]], int]:
 
     for a in rows:
         key = a.group_key or ""
-        if not key:
-            order.append(_asset_row(a))
-            continue
+        if key:
+            kind = a.group_kind or ""
+            label = (a.meta or {}).get("group_label") or GROUP_LABELS.get(kind, "同源")
+        else:
+            fam = family_key(a.normalized or a.value or "")
+            if not fam:
+                order.append(_asset_row(a))
+                continue
+            key = f"family:{fam}"
+            kind, label = "family", f"同站群前缀族 {fam}"
         if key not in buckets:
             buckets[key] = []
             order.append(key)
-            meta_of[key] = (
-                a.group_kind or "",
-                (a.meta or {}).get("group_label") or GROUP_LABELS.get(a.group_kind or "", "同源"),
-            )
+            meta_of[key] = (kind, label)
         buckets[key].append(a)
 
     out: list[dict[str, Any]] = []
