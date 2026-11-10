@@ -21,7 +21,7 @@ from .analyzers.cluster import cluster
 from .collectors import apk as apk_collector
 from .collectors import crtsh, reputation, typosquat
 from .config import settings
-from .db import session_scope
+from .db import chain_write_scope
 from .discover.keywords import get_library
 from .domain import Assessment, AssetKind, Signal, utcnow
 from .enrich.icp import get_icp
@@ -214,7 +214,7 @@ def scan(
     session: Session | None = None,
 ) -> ScanResult:
     if session is None:
-        with session_scope() as own:
+        with chain_write_scope() as own:
             return scan(
                 kind,
                 value,

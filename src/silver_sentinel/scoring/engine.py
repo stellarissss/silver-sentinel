@@ -26,6 +26,15 @@ from ..normalize import normalize_text
 
 RULES_DIR = Path(__file__).resolve().parent.parent / "rules"
 
+# 阈值唯一来源。必须与 rules/builtin.yaml 的 thresholds 一致——以前代码
+# 兜底写 40、YAML 写 35，同一套规则两个默认值：加载成功时按 35 判，
+# 一旦 YAML 缺字段回退到 40，同一批资产结论会突变。测试会钉死两者相等。
+DEFAULT_THRESHOLDS: dict[str, float] = {
+    "suspicious": 15.0,
+    "high_risk": 35.0,
+    "confirmed": 70.0,
+}
+
 
 @dataclass(slots=True)
 class Rule:
@@ -48,7 +57,7 @@ class RuleSet:
     official_terms: list[str] = field(default_factory=list)
     therapeutic_terms: list[str] = field(default_factory=list)
     thresholds: dict[str, float] = field(
-        default_factory=lambda: {"suspicious": 15, "high_risk": 40, "confirmed": 70}
+        default_factory=lambda: dict(DEFAULT_THRESHOLDS)
     )
     sources: list[str] = field(default_factory=list)
 
@@ -69,14 +78,19 @@ def load_ruleset(extra_path: str | Path | None = None) -> RuleSet:
     builtin = RULES_DIR / "builtin.yaml"
     raw = yaml.safe_load(builtin.read_text(encoding="utf-8")) or {}
 
+    # YAML 缺字段时按单一常量补齐，而不是整体回退到另一套默认值：
+    # 以前「只缺一档」也会用 40 顶替 35，同一批资产结论会突变。
+    parsed_thresholds = {
+        k: float(v) for k, v in (raw.get("thresholds") or {}).items()
+        if k in DEFAULT_THRESHOLDS
+    }
     rs = RuleSet(
         version=int(raw.get("version", 1)),
         brands=_parse_brands(raw),
         asset_unfreeze_terms=list(raw.get("asset_unfreeze_terms", [])),
         official_terms=list(raw.get("official_terms", [])),
         therapeutic_terms=list(raw.get("therapeutic_terms", [])),
-        thresholds={k: float(v) for k, v in (raw.get("thresholds") or {}).items()}
-        or {"suspicious": 15, "high_risk": 40, "confirmed": 70},
+        thresholds={**DEFAULT_THRESHOLDS, **parsed_thresholds},
         sources=[str(builtin)],
     )
 
@@ -294,16 +308,80 @@ def aggregate(
         notes.append(f"仅命中 {len(signals)} 条信号，低于最小判定门槛，按弃权处理")
         return round(score, 1), confidence, "insufficient", coverage, sources, notes
 
-    if score < thresholds.get("suspicious", 15):
+    if score < thresholds.get("suspicious", DEFAULT_THRESHOLDS["suspicious"]):
         return round(score, 1), confidence, "low", coverage, sources, notes
 
-    if score < thresholds.get("high_risk", 40):
+    if score < thresholds.get("high_risk", DEFAULT_THRESHOLDS["high_risk"]):
         return round(score, 1), confidence, "suspicious", coverage, sources, notes
 
-    if score >= thresholds.get("confirmed", 70):
+    if score >= thresholds.get("confirmed", DEFAULT_THRESHOLDS["confirmed"]):
         notes.append("分数已达到确认档，但缺少官方通报或人工复核，按保守原则降级为高度可疑")
 
     return round(score, 1), confidence, "high_risk", coverage, sources, notes
+
+
+VERDICT_RANK = {
+    "insufficient": 0,
+    "low": 1,
+    "suspicious": 2,
+    "high_risk": 3,
+    "confirmed": 4,
+    "benign": -1,
+}
+
+
+def verdict_for_score(
+    score: float,
+    thresholds: dict[str, float],
+    *,
+    signals: int = 2,
+    min_signals: int = 2,
+) -> str:
+    """只按分数与信号数反推机器判定，与 aggregate() 的分支保持一致。"""
+    if signals < min_signals:
+        return "insufficient"
+    if score < thresholds.get("suspicious", DEFAULT_THRESHOLDS["suspicious"]):
+        return "low"
+    if score < thresholds.get("high_risk", DEFAULT_THRESHOLDS["high_risk"]):
+        return "suspicious"
+    return "high_risk"
+
+
+def normalize_verdict(
+    assessment: Any,
+    thresholds: dict[str, float],
+    *,
+    reviewed: bool = False,
+    min_signals: int = 2,
+) -> None:
+    """分数被压低后，判定必须同步回退。
+
+    线上出现过 `score=20 / verdict=high_risk` 的资产：白名单把分数压到 20，
+    `_apply_claim()` 早先却无条件给了 high_risk，而资产随后沉进 cold 档、
+    再也不进周期重评，于是这条误报永久留在高危池里。这里做最后一道归一：
+    人工终审（reviewed/confirmed）不受影响，机器判定不能比分数应得的更重。
+    """
+    if reviewed or assessment.verdict == "confirmed":
+        return
+    # 硬证据提级（伪造政府标识码、官方通报）不依赖「至少 N 条信号」：
+    # 分数已经到高危门槛，就不要拿 min_signals 把它降回 insufficient。
+    # 少了这一句，上一轮确认的仿冒财政部站群（95 分）会被批量打回。
+    if float(assessment.score or 0) >= thresholds.get(
+        "high_risk", DEFAULT_THRESHOLDS["high_risk"]
+    ):
+        return
+    expected = verdict_for_score(
+        float(assessment.score or 0),
+        thresholds,
+        signals=len(getattr(assessment, "signals", []) or []),
+        min_signals=min_signals,
+    )
+    if VERDICT_RANK.get(assessment.verdict, 0) > VERDICT_RANK.get(expected, 0):
+        previous = assessment.verdict
+        assessment.verdict = expected
+        assessment.notes.append(
+            f"分数 {float(assessment.score or 0):.1f} 未达 {previous} 门槛，判定回退为 {expected}"
+        )
 
 
 # ---------------------------------------------------------------- 领域识别
@@ -464,13 +542,18 @@ def assess(
 
 
 def priority_of(assessment: Assessment) -> str:
+    """优先级分档必须与判定阈值同源。
+
+    以前这里硬编码 70/40/15，而 high_risk 门槛是 YAML 里的 35——
+    35~39 分的 high_risk 会被标成 P3，人工审阅顺序被悄悄颠倒。
+    """
     if assessment.verdict == "confirmed":
         return "P0"
-    if assessment.score >= 70:
+    if assessment.score >= DEFAULT_THRESHOLDS["confirmed"]:
         return "P1"
-    if assessment.score >= 40:
+    if assessment.score >= DEFAULT_THRESHOLDS["high_risk"]:
         return "P2"
-    if assessment.score >= 15:
+    if assessment.score >= DEFAULT_THRESHOLDS["suspicious"]:
         return "P3"
     return "P4"
 

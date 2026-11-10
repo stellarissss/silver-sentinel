@@ -30,7 +30,7 @@ from datetime import timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 
 from . import triage
 from .config import settings
@@ -251,12 +251,23 @@ def pending_assets(limit: int = 200) -> list[int]:
     from sqlalchemy import func
 
     from .models import Evidence
+    from .scoring.engine import DEFAULT_THRESHOLDS, get_ruleset
 
+    thresholds = get_ruleset().thresholds
     with session_scope() as s:
         rows = s.execute(
-            select(Asset.id, Asset.score, Asset.scan_count, Asset.meta)
+            select(Asset.id, Asset.score, Asset.scan_count, Asset.meta, Asset.verdict)
             .where(
-                Asset.tier.in_(ACTIVE_TIERS),
+                or_(
+                    Asset.tier.in_(ACTIVE_TIERS),
+                    # 历史误报：白名单压分后 verdict 没跟着回退，资产沉进
+                    # cold/dismissed 就再也不进重评，永久占着高危池。
+                    # 把它们拉回来，周期研判会按新规则自动纠正。
+                    and_(Asset.verdict == "high_risk",
+                         Asset.score < thresholds.get("high_risk", DEFAULT_THRESHOLDS["high_risk"])),
+                    and_(Asset.verdict == "suspicious",
+                         Asset.score < thresholds.get("suspicious", DEFAULT_THRESHOLDS["suspicious"])),
+                ),
                 # 人工终审过的资产不再进入机器研判：结论不该被周期任务反复重算，
                 # 也省掉每轮 40 个高分资产的白工与 SQLite 锁竞争。
                 or_(Asset.reviewed_by == "", Asset.reviewed_by.is_(None)),
@@ -275,15 +286,24 @@ def pending_assets(limit: int = 200) -> list[int]:
 
     with_text: list[int] = []
     fresh: list[int] = []
-    for asset_id, score, scan_count, meta in rows:
+    inconsistent: list[int] = []
+    for asset_id, score, scan_count, meta, verdict in rows:
         scoring = (meta or {}).get("scoring") or {}
         scored_ev = int(scoring.get("evidence_id") or 0)
         current_ev = latest_text.get(asset_id, 0)
-        if current_ev and current_ev > scored_ev:
+        # 判定比分数应得的更重：优先纠正，别让它继续占着高危队列。
+        if (
+            (verdict == "high_risk"
+             and float(score or 0) < thresholds.get("high_risk", DEFAULT_THRESHOLDS["high_risk"]))
+            or (verdict == "suspicious"
+                and float(score or 0) < thresholds.get("suspicious", DEFAULT_THRESHOLDS["suspicious"]))
+        ):
+            inconsistent.append(asset_id)
+        elif current_ev and current_ev > scored_ev:
             with_text.append(asset_id)
         elif not scan_count or float(score or 0.0) == 0.0:
             fresh.append(asset_id)
-    return (with_text + fresh)[:limit]
+    return (inconsistent + with_text + fresh)[:limit]
 
 
 def stale_assets(limit: int = 100, hours: int = 24) -> list[int]:

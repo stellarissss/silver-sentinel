@@ -254,12 +254,8 @@ def decide(asset: Asset, *, facts: dict[str, Any] | None = None, verdict: str | 
             else "；".join((claim.get("reasons") or ["页面备案号与域名不一致"])[:1])
         )
         return TriageDecision(TIER_WATCH, [reason], urgent=True)
-    if claim_verdict == "fake_site_id":
-        return TriageDecision(
-            TIER_WATCH,
-            [f"伪造政府网站标识码 {claim.get('site_id') or ''}（该码只发给 .gov.cn），需人工确认"],
-            urgent=True,
-        )
+    # 上面 `in ("fake_site_id", "fake_icp")` 已覆盖 fake_site_id 并 return，
+    # 原来这里还有一段同文案的重复分支，永远走不到（改一处必漏另一处）。
     if claim_verdict == "impersonation":
         who = (claim.get("agencies") or [""])[0]
         domains = (claim.get("official_domains") or {}).get(who) or [""]

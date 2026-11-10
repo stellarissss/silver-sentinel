@@ -91,10 +91,12 @@ def discover_status() -> dict[str, Any]:
 def discover_events(limit: int = Query(default=80, le=500), source: str = "") -> dict[str, Any]:
     with session_scope() as s:
         stmt = select(DiscoveryEvent).order_by(DiscoveryEvent.id.desc()).limit(limit)
+        count_stmt = select(func.count(DiscoveryEvent.id))
         if source:
             stmt = stmt.where(DiscoveryEvent.source == source)
+            count_stmt = count_stmt.where(DiscoveryEvent.source == source)
         rows = list(s.scalars(stmt))
-        total = s.scalar(select(func.count(DiscoveryEvent.id))) or 0
+        total = s.scalar(count_stmt) or 0
     return {
         "total": total,
         "items": [
@@ -860,7 +862,25 @@ def evidence_download(evidence_id: int):
         path = evidence_service.materialize(row)
     if path is None:
         raise HTTPException(status_code=410, detail="文件已丢失（明文与密文均不可读）")
-    return FileResponse(path, filename=name, media_type=mime)
+
+    def _cleanup_materialized(p: Path) -> None:
+        from .config import settings
+
+        # materialize() 在明文存在时返回的是 evidence/ 里的原文件，绝不能删。
+        # 只有解密落到 data/tmp 的临时文件才在响应结束后回收，别让已脱敏
+        # 的证据重新裸奔在磁盘上（最多滞留 1 小时等 housekeeping 太久了）。
+        try:
+            if p.resolve().parent == (settings.data_dir / "tmp").resolve():
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return FileResponse(
+        path,
+        filename=name,
+        media_type=mime,
+        background=BackgroundTask(_cleanup_materialized, path),
+    )
 
 
 @router.get("/api/evidence/{evidence_id}/preview")

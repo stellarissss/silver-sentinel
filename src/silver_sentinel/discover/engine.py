@@ -67,6 +67,12 @@ log = logging.getLogger(__name__)
 # 设得低是刻意的——「宁可错杀」，冷存比漏掉便宜。
 COLD_THRESHOLD = 0.30
 
+# 纯形态噪声上限：CT 流里绝大多数域名没有任何词表命中、也没有证书/前缀族
+# 关联，只是「刚注册过」。近 24h 2400 次取证里大半花在这类页面上，
+# 把真线索挤到后面。低于这个 hint 分且无关联证据的候选直接冷存 +
+# capture_state=skipped，不占取证预算；资产和发现流水都保留，可随时复查。
+NOISE_HINT = 0.42
+
 # 证书兄弟扩散：一张证书上的 SAN 几乎必然属于同一团伙。
 # 诈骗站群习惯用一次签发带几十个域名，这是零成本的关联证据——
 # 内容词库看不到的兄弟站，靠「同一张证书」就能捞出来。
@@ -156,6 +162,7 @@ class DiscoverStats:
     burst_batches: int = 0
     burst_adopted: int = 0
     cold_promoted: int = 0
+    noise_filtered: int = 0
     harvested: int = 0
     shape_seen: int = 0
     shape_resolved: int = 0
@@ -182,6 +189,7 @@ class DiscoverStats:
             "burst_adopted": self.burst_adopted,
             "cert_cluster": self.cert_cluster,
             "cold_promoted": self.cold_promoted,
+            "noise_filtered": self.noise_filtered,
             "harvested": self.harvested,
             "shape_seen": self.shape_seen,
             "shape_resolved": self.shape_resolved,
@@ -1217,13 +1225,28 @@ class DiscoveryEngine:
                 reason = (reason + "；" if reason else "") + f"同批签发 {batch_mates + 1} 个域名"
                 self.stats.cert_cluster += 1
 
+            # 纯形态噪声：没有词表命中、没有证书/前缀族关联、不是外部情报，
+            # 分数又低。资产和发现流水都留着，但不进候选池也不进取证队列。
+            pure_noise = (
+                score < NOISE_HINT
+                and not terms
+                and not cluster_of
+                and not batch_mates
+                and (obs is None or obs.source not in EXTERNAL_SOURCES)
+            )
+            if pure_noise:
+                meta["discover_noise"] = True
+                reason = (reason + "；" if reason else "") + "纯形态候选，暂不占用取证预算"
+                self.stats.noise_filtered += 1
+
             asset = Asset(
                 kind=kind,
                 value=value,
                 normalized=normalized,
-                tier=TIER_CANDIDATE
-                if (score >= COLD_THRESHOLD or cluster_of or batch_mates)
-                else TIER_COLD,
+                tier=TIER_COLD
+                if pure_noise
+                else (TIER_CANDIDATE if (score >= COLD_THRESHOLD or cluster_of or batch_mates) else TIER_COLD),
+                capture_state="skipped" if pure_noise else "pending",
                 discovery_source=obs.source if obs else "manual",
                 discovery_reason=reason,
                 score=0.0,

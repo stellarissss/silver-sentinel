@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,19 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _same_device() -> bool:
+    """副本目标与数据目录是不是同一块盘。
+
+    同盘「副本」不是备份：机器一坏两份一起没。线上 dir 后端误配到
+    /var/lib/silver-sentinel/replica，白复制了 2.7G 密文和 1G DB 快照，
+    磁盘直接吃到 95%。宁可跳过并报警，也不要假装备份成功。
+    """
+    try:
+        return os.stat(settings.data_dir).st_dev == os.stat(settings.replica_target).st_dev
+    except OSError:
+        return False
 
 
 @dataclass
@@ -169,6 +183,9 @@ class Replica:
     # ------------------------------------------------------------ 主流程
     def sync_events(self) -> int:
         """把事件日志的新增字节切成新分片上传。返回上传字节数。"""
+        if self.backend == "dir" and _same_device():
+            log.warning("副本目标与数据目录同盘，跳过事件分片（同盘双份不是备份）")
+            return 0
         path = settings.eventlog_path
         if not path.is_file():
             return 0
@@ -201,6 +218,9 @@ class Replica:
 
     def sync_evidence(self, batch: int = 200) -> int:
         """上传尚未同步的证据文件。文件按 sha256 命名，重复上传无副作用。"""
+        if self.backend == "dir" and _same_device():
+            log.warning("副本目标与数据目录同盘，跳过明文证据复制（同盘双份不是备份）")
+            return 0
         ev_dir = settings.evidence_dir
         if not ev_dir.is_dir():
             return 0
@@ -242,12 +262,15 @@ class Replica:
         return count
 
     def sync_vault_blobs(self, batch: int = 400) -> int:
-        """把证据仓的密文也复制一份。
+        """把证据仓的密文也复制一份（目标必须在不同盘）。
 
         开了 SILVER_VAULT_REMOVE_PLAINTEXT 后，evidence/ 目录是空的；
         如果副本只备份明文，机器一坏就只剩远端 vault 一份。密文体积小、
-        内容寻址、天然幂等，跟着副本走一遍成本很低。
+        内容寻址、天然幂等——但同盘复制两份毫无意义，只会吃满磁盘。
         """
+        if self.backend == "dir" and _same_device():
+            log.warning("副本目标与数据目录同盘，跳过 vault 密文复制（同盘双份不是备份）")
+            return 0
         src = settings.data_dir / "vault" / "blobs"
         if not src.is_dir():
             return 0
@@ -285,6 +308,9 @@ class Replica:
     def sync_db(self) -> bool:
         """数据库快照。SQLite 用 backup API 拿到一致性副本，不能直接 copy 正在写的库。"""
         if not settings.db_url.startswith("sqlite"):
+            return False
+        if self.backend == "dir" and _same_device():
+            log.warning("副本目标与数据目录同盘，跳过数据库快照（同盘双份不是备份）")
             return False
         db_path = Path(settings.db_url.replace("sqlite:///", ""))
         if not db_path.is_file():
@@ -356,6 +382,27 @@ class Replica:
             return {"ok": False, "reason": "副本未启用"}
         if not self.target:
             return {"ok": False, "reason": "未配置副本目标"}
+
+        # 同盘 dir 后端整轮跳过。只跳过 vault/DB 不够：事件分片和明文证据
+        # 仍会以每小时几百个文件的速度往同盘副本里堆，磁盘照样吃满
+        # （线上实测 377 个/小时）。同盘「副本」本来就不是备份，宁可不跑并报警。
+        if self.backend == "dir" and _same_device():
+            warning = (
+                "副本目标与数据目录同盘：已跳过全部同步（事件/证据/vault/DB），"
+                "请把 SILVER_REPLICA_TARGET 指向另一块盘，或改用 s3/webdav 后端"
+            )
+            with self._lock:
+                self.state.last_run = utcnow().isoformat()
+                self.state.last_ok = True
+                self.state.last_error = ""
+                self.state.history.append(
+                    {"at": self.state.last_run, "ok": True, "skipped": True}
+                )
+                self._save_state()
+            return {
+                "ok": True, "backend": self.backend, "skipped": True,
+                "same_device_warning": warning, "elapsed": 0.0,
+            }
 
         started = time.monotonic()
         result: dict[str, Any] = {"ok": True, "backend": self.backend}

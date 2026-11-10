@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -16,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from . import __version__, webauth
 from .analyzers import llm as llm_analyzer
@@ -179,7 +180,7 @@ def _asset_row(asset: Asset) -> dict[str, Any]:
         "capture_state": asset.capture_state or "pending",
         "capture_error": (asset.capture_error or "")[:200],
         "last_capture_at": asset.last_capture_at.isoformat() if asset.last_capture_at else None,
-        "evidence_count": len([e for e in (asset.evidence or []) if e.deleted_at is None]),
+        "evidence_count": len(asset.evidence or []),  # relationship 已在 SQL 层排掉软删
         # 同源折叠：group_key 是这批资产的共同标识，group_kind 说明凭什么归到一起
         "group_key": asset.group_key or "",
         "group_kind": asset.group_kind or "",
@@ -651,7 +652,9 @@ async def api_scan_apk(file: UploadFile, run_llm: bool = Query(default=True)) ->
     if not data.startswith(b"PK"):
         raise HTTPException(status_code=400, detail="不是有效的 APK（ZIP）文件")
 
-    tmp = Path(tempfile.mkstemp(suffix=".apk", dir=str(settings.data_dir / "evidence"))[1])
+    fd, tmp_name = tempfile.mkstemp(suffix=".apk", dir=str(settings.data_dir / "evidence"))
+    os.close(fd)  # 以前只取路径丢掉 fd，每次上传泄漏一个文件描述符
+    tmp = Path(tmp_name)
     try:
         tmp.write_bytes(data)
         result = scan("apk", file.filename, file_path=str(tmp), run_llm=run_llm)
@@ -672,8 +675,8 @@ def api_assets(
     source: str | None = None,
     sort: str = "score",
     order: str = "desc",
-    limit: int = Query(default=50, le=300),
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=300),
+    offset: int = Query(default=0, ge=0),
     collapse: bool = True,
 ) -> dict[str, Any]:
     """线索列表。默认只返回有效资产（不含已排除）。
@@ -723,6 +726,9 @@ def api_assets(
             "value": Asset.value,
         }.get(sort, Asset.score)
         stmt = stmt.order_by(sort_col.asc() if order == "asc" else sort_col.desc(), Asset.id.desc())
+        # 列表每行都要 evidence_count，selectinload 一次把关系批量取回来，
+        # 避免默认 50 行触发 50 次额外查询（2.3 万证据行时列表明显变慢）。
+        stmt = stmt.options(selectinload(Asset.evidence))
 
         # 每一档各有多少条。「有效 0 条」必须能立刻解释成「另有 N 条冷存」，
         # 否则用户只会看到一张空表，以为东西丢了。
@@ -745,14 +751,14 @@ def api_assets(
                 "collapsed": False,
             }
 
-        # 折叠视图：先取够一屏的行，在内存里分组再分页。
+        # 折叠视图：分组代表行要取「组内分数最高的那条」还要带成员列表，
+        # SQL 里得套两层子查询，所以先在内存里分组再分页。
         #
-        # 为什么不写 SQL GROUP BY：每组的代表行要取「组内分数最高的那条」，
-        # 还要带成员列表，SQL 里得套两层子查询；而 active 档实测不到 2000 行，
-        # 一次全取比这堆子查询快得多。上限 8000 是防止 all 档扫全库。
-        scan_cap = max(limit + offset, 200) * 8
-        scan_cap = min(scan_cap, 8000)
-        rows = list(session.scalars(stmt.limit(scan_cap)))
+        # 但 total 必须是**全局折叠后**的项数：以前用 scan_cap 截断扫描、
+        # 再用 Python 切片套 offset，翻到后半段就返回空页，total 也只是
+        # 被截断那批能折出的项数。active 档实测不到 2000 行、all 档 7000+，
+        # 一次全取的代价远小于错误的分页。
+        rows = list(session.scalars(stmt))
         items, group_count = _collapse_rows(rows)
         view_total = len(items)
         return {
@@ -765,7 +771,7 @@ def api_assets(
             "tier_counts": tier_counts,
             "collapsed": True,
             "group_count": group_count,
-            "truncated": len(rows) >= scan_cap and view_total > offset + limit,
+            "truncated": False,
         }
 
 
@@ -1080,7 +1086,7 @@ def api_watch_run() -> dict[str, Any]:
 
 
 @app.get("/api/runs")
-def api_runs(limit: int = 30) -> dict[str, Any]:
+def api_runs(limit: int = Query(default=30, ge=1, le=200)) -> dict[str, Any]:
     with session_scope() as session:
         rows = list(session.scalars(select(ScanRun).order_by(ScanRun.id.desc()).limit(limit)))
         return {
@@ -1138,6 +1144,14 @@ async def unhandled_error(request: Request, exc: Exception) -> JSONResponse:  # 
 
 
 def serve() -> None:
+    """直接调 serve() 也要和 CLI 一样读配置、生成口令。
+
+    以前硬编码 0.0.0.0:8000 且跳过 ensure_password：不走 cli:main 的部署
+    会丢掉端口配置；若 SILVER_WEB_PASSWORD 未设，鉴权中间件整站放行，
+    涉诈线索和举报材料就在公网裸奔。
+    """
     import uvicorn
 
-    uvicorn.run("silver_sentinel.api:app", host="0.0.0.0", port=8000, reload=False)
+    host = settings.web_host
+    webauth.ensure_password(host)
+    uvicorn.run("silver_sentinel.api:app", host=host, port=settings.web_port, reload=False)

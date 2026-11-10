@@ -24,34 +24,39 @@ def _code() -> str:
     return "rb" + secrets.token_hex(6)
 
 
-def _evidence_paths(session: Session, asset_id: int) -> tuple[list[Evidence], dict[str, Path]]:
+def _evidence_paths(session: Session, asset_id: int) -> tuple[list[Evidence], dict[str, bytes]]:
+    """读回该资产的全部证据内容，键是 sha256。
+
+    必须走 evidence.read_bytes() 这个统一入口：开了「上传后删明文」之后
+    row.path 指向的明文文件本来就不存在，密文在 vault/blobs。以前这里直接
+    Path.exists()，vault 模式下会返回一个空 mapping——交给监管的 ZIP 里
+    一张截图都没有，manifest 却仍逐条列出全部证据。
+    """
+    from ..evidence import read_bytes
+
     rows = list(
         session.scalars(
             select(Evidence).where(Evidence.asset_id == asset_id).order_by(Evidence.id)
         )
     )
-    mapping: dict[str, Path] = {}
+    blobs: dict[str, bytes] = {}
     for e in rows:
-        p = Path(e.path or "")
-        if not p.is_absolute():
-            p = settings.data_dir / p
-        if p.exists():
-            mapping[e.sha256] = p
-    return rows, mapping
+        if e.deleted_at is not None:
+            continue
+        data = read_bytes(e)
+        if data:
+            blobs[e.sha256] = data
+    return rows, blobs
 
 
-def _page_text(evidence: list[Evidence], paths: dict[str, Path]) -> str:
+def _page_text(evidence: list[Evidence], blobs: dict[str, bytes]) -> str:
     """取最近一次页面正文快照，用于摘引原话。读不到就返回空。"""
     for ev in reversed(evidence):
         if getattr(ev, "kind", "") != "page_text":
             continue
-        p = paths.get(str(ev.sha256))
-        if not p:
-            continue
-        try:
-            return p.read_text(encoding="utf-8", errors="ignore")[:300_000]
-        except OSError:
-            continue
+        data = blobs.get(str(ev.sha256))
+        if data:
+            return data[:300_000].decode("utf-8", "replace")
     return ""
 
 

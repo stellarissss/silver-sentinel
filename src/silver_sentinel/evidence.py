@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -21,6 +22,11 @@ from .domain import utcnow
 from .models import Evidence
 
 log = logging.getLogger(__name__)
+
+# 同一进程内的兜底：chain_write_scope() 已在事务级串行化写链，
+# 但 intake / CLI 之类仍可能直接拿 session 调 append()，这里再锁一层，
+# 保证「查重 → 读链尾 → 算哈希 → flush」中间插不进别的写入。
+_APPEND_LOCK = threading.RLock()
 
 MIME_BY_EXT = {
     ".png": "image/png",
@@ -74,33 +80,34 @@ def append(
     dedupe: bool = True,
 ) -> Evidence:
     digest = hashlib.sha256(data).hexdigest()
-    if dedupe:
-        existing = _same_content(session, asset_id, kind, digest)
-        if existing is not None:
-            return existing
+    with _APPEND_LOCK:
+        if dedupe:
+            existing = _same_content(session, asset_id, kind, digest)
+            if existing is not None:
+                return existing
 
-    target = settings.evidence_dir / f"{digest}{extension}"
-    if not target.exists():
-        target.write_bytes(data)
+        target = settings.evidence_dir / f"{digest}{extension}"
+        if not target.exists():
+            target.write_bytes(data)
 
-    prev = chain_tip(session)
-    captured = utcnow()  # 必须显式赋值：列默认值在 flush 时才生效，那时已经要算哈希了
-    row = Evidence(
-        asset_id=asset_id,
-        kind=kind,
-        sha256=digest,
-        prev_hash=prev,
-        size=len(data),
-        captured_at=captured,
-        path=str(target.relative_to(settings.data_dir)) if target.is_relative_to(settings.data_dir) else str(target),
-        storage="plain",
-        note=note,
-        mime=mime or MIME_BY_EXT.get(extension.lower(), ""),
-    )
-    row.chain_hash = compute_chain_hash(prev, digest, captured.isoformat())
-    session.add(row)
-    session.flush()
-    return row
+        prev = chain_tip(session)
+        captured = utcnow()  # 必须显式赋值：列默认值在 flush 时才生效，那时已经要算哈希了
+        row = Evidence(
+            asset_id=asset_id,
+            kind=kind,
+            sha256=digest,
+            prev_hash=prev,
+            size=len(data),
+            captured_at=captured,
+            path=str(target.relative_to(settings.data_dir)) if target.is_relative_to(settings.data_dir) else str(target),
+            storage="plain",
+            note=note,
+            mime=mime or MIME_BY_EXT.get(extension.lower(), ""),
+        )
+        row.chain_hash = compute_chain_hash(prev, digest, captured.isoformat())
+        session.add(row)
+        session.flush()
+        return row
 
 
 def append_file(
@@ -125,34 +132,35 @@ def append_file(
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     hexdigest = digest.hexdigest()
-    if dedupe:
-        existing = _same_content(session, asset_id, kind, hexdigest)
-        if existing is not None:
-            return existing
+    with _APPEND_LOCK:
+        if dedupe:
+            existing = _same_content(session, asset_id, kind, hexdigest)
+            if existing is not None:
+                return existing
 
-    target = settings.evidence_dir / f"{hexdigest}{extension}"
-    if not target.exists():
-        shutil.copyfile(path, target)
+        target = settings.evidence_dir / f"{hexdigest}{extension}"
+        if not target.exists():
+            shutil.copyfile(path, target)
 
-    prev = chain_tip(session)
-    captured = utcnow()
-    row = Evidence(
-        asset_id=asset_id,
-        kind=kind,
-        sha256=hexdigest,
-        prev_hash=prev,
-        size=path.stat().st_size,
-        captured_at=captured,
-        path=str(target.relative_to(settings.data_dir))
-        if target.is_relative_to(settings.data_dir)
-        else str(target),
-        storage="plain",
-        note=note,
-        mime=mime or MIME_BY_EXT.get(extension.lower(), ""),
-    )
-    row.chain_hash = compute_chain_hash(prev, hexdigest, captured.isoformat())
-    session.add(row)
-    session.flush()
+        prev = chain_tip(session)
+        captured = utcnow()
+        row = Evidence(
+            asset_id=asset_id,
+            kind=kind,
+            sha256=hexdigest,
+            prev_hash=prev,
+            size=path.stat().st_size,
+            captured_at=captured,
+            path=str(target.relative_to(settings.data_dir))
+            if target.is_relative_to(settings.data_dir)
+            else str(target),
+            storage="plain",
+            note=note,
+            mime=mime or MIME_BY_EXT.get(extension.lower(), ""),
+        )
+        row.chain_hash = compute_chain_hash(prev, hexdigest, captured.isoformat())
+        session.add(row)
+        session.flush()
     return row
 
 

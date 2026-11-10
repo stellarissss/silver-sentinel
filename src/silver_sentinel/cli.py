@@ -21,7 +21,7 @@ from .domain import VERDICT_LABELS
 from .intake import scan
 from .models import Asset
 from .respond import advise, build, export_bundle
-from .scoring.engine import load_ruleset
+from .scoring.engine import DEFAULT_THRESHOLDS, load_ruleset
 
 if TYPE_CHECKING:
     from .discover.engine import CertObservation
@@ -249,6 +249,112 @@ def cmd_prune_assets(args) -> int:
             reason=args.reason,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_chain(args) -> int:
+    """证据链自检：verify / list / add（登记受控断点，不改写历史哈希）。"""
+    from .db import add_chain_anchor, list_chain_anchors
+
+    init_db()
+    if args.action == "verify":
+        with session_scope() as s:
+            out = {"chain": verify_chain(s), "anchors": list_chain_anchors(s)}
+    elif args.action == "list":
+        with session_scope() as s:
+            out = {"anchors": list_chain_anchors(s)}
+    else:
+        if not args.evidence_id:
+            print("chain add 需要证据 ID", file=sys.stderr)
+            return 2
+        with session_scope() as s:
+            out = add_chain_anchor(
+                s,
+                args.evidence_id,
+                args.reason or "并发写入导致的已知分叉",
+                args.by or "cli",
+            )
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_reconcile_verdicts(args) -> int:
+    """修正「判定比分数应得更重」的历史残留。默认 dry-run，--apply 才写库。
+
+    白名单压分后 old 代码没让 verdict 跟着回退，资产沉进 cold/dismissed
+    就再也不进周期重评，于是 20 分的站永久挂 high_risk。
+    """
+    from sqlalchemy import func, or_, select
+
+    from .core.eventlog import emit
+    from .domain import utcnow
+    from .models import SignalRow
+    from .scoring.engine import VERDICT_RANK, get_ruleset, verdict_for_score
+
+    thresholds = get_ruleset().thresholds
+    changes: list[dict] = []
+    with session_scope() as s:
+        counts = dict(
+            s.execute(
+                select(SignalRow.asset_id, func.count(SignalRow.id)).group_by(SignalRow.asset_id)
+            ).all()
+        )
+        rows = list(
+            s.scalars(
+                select(Asset).where(
+                    or_(Asset.reviewed_by == "", Asset.reviewed_by.is_(None)),
+                    Asset.verdict != "confirmed",
+                )
+            )
+        )
+        candidates: list[tuple[Asset, dict]] = []
+        for a in rows:
+            # 分数已达高危门槛的一律不碰：伪造政府标识码是硬证据提级，
+            # 信号可能只有一条，按 min_signals 反推会把它误降成 insufficient。
+            if float(a.score or 0) >= thresholds.get(
+                "high_risk", DEFAULT_THRESHOLDS["high_risk"]
+            ):
+                continue
+            expected = verdict_for_score(
+                float(a.score or 0),
+                thresholds,
+                signals=counts.get(a.id, 0),
+                min_signals=settings.min_signals_for_verdict,
+            )
+            if VERDICT_RANK.get(a.verdict or "", 0) <= VERDICT_RANK.get(expected, 0):
+                continue
+            candidates.append(
+                (
+                    a,
+                    {
+                        "asset_id": a.id,
+                        "value": a.value,
+                        "score": float(a.score or 0),
+                        "from": a.verdict,
+                        "to": expected,
+                        "signals": counts.get(a.id, 0),
+                    },
+                )
+            )
+        if args.limit:
+            candidates = candidates[: args.limit]
+        for a, entry in candidates:
+            changes.append(entry)
+            if args.apply:
+                a.verdict = entry["to"]
+                meta = dict(a.meta or {})
+                meta["verdict_reconciled"] = {**entry, "at": utcnow().isoformat()}
+                a.meta = meta
+                emit("verdict.reconciled", **entry)
+        if args.apply:
+            s.flush()
+    print(
+        json.dumps(
+            {"apply": bool(args.apply), "changed": len(changes), "items": changes[:50]},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -1752,6 +1858,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", default="取证永久失败，已无需举报；保留最小留痕，释放取证预算用于发现新团伙")
     p.add_argument("--restore", help="从归档 JSONL 恢复资产（需同时加 --apply）")
     p.set_defaults(func=cmd_prune_assets)
+
+    p = sub.add_parser("chain", help="证据链：verify / list / add（受控断点，不改写历史哈希）")
+    p.add_argument("action", choices=["verify", "list", "add"])
+    p.add_argument("evidence_id", nargs="?", type=int, help="add 时的证据 ID")
+    p.add_argument("--reason", default="", help="断点原因，写进留痕")
+    p.add_argument("--by", default="", help="登记人")
+    p.set_defaults(func=cmd_chain)
+
+    p = sub.add_parser(
+        "reconcile-verdicts", help="修正判定与分数不符的历史残留（默认 dry-run）"
+    )
+    p.add_argument("--apply", action="store_true", help="真正写库；不加则只统计")
+    p.add_argument("--limit", type=int, default=0, help="最多处理多少条（0=全部）")
+    p.set_defaults(func=cmd_reconcile_verdicts)
 
     p = sub.add_parser("dismiss", help="人工排除：把一条资产移出自动盯防并记录理由")
     p.add_argument("asset_id", type=int)

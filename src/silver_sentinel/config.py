@@ -240,7 +240,7 @@ class Settings:
     replica_interval: int = 300        # 秒
     # 数据库快照保留份数。每 20 轮（约 100 分钟）一份，50G 盘上不清理
     # 一年就是 5000 份、几十 GB——磁盘满后取证会先降级再停摆。
-    replica_db_keep: int = 12
+    replica_db_keep: int = 3
     replica_access_key: str = ""
     replica_secret_key: str = ""
     replica_bucket: str = "silver-sentinel"
@@ -434,6 +434,15 @@ class Settings:
 
         self.confirm_requires_official = _bool("SILVER_CONFIRM_REQUIRES_OFFICIAL", True)
         self.min_signals_for_verdict = _int("SILVER_MIN_SIGNALS", self.min_signals_for_verdict)
+
+        # 半自动举报配置：.env.example 与 docs/13 都要求能配，但以前字段只有
+        # dataclass 默认值，__post_init__ 从没读过环境变量，扩展令牌静默失效。
+        self.report_reporter = _str("SILVER_REPORT_REPORTER", self.report_reporter)
+        self.report_email = _str("SILVER_REPORT_EMAIL", self.report_email)
+        self.report_phone = _str("SILVER_REPORT_PHONE", self.report_phone)
+        self.report_extension_token = _str("SILVER_REPORT_EXTENSION_TOKEN", self.report_extension_token)
+        self.report_api_base = _str("SILVER_REPORT_API_BASE", self.report_api_base).rstrip("/")
+        self.report_max_shots = _int("SILVER_REPORT_MAX_SHOTS", self.report_max_shots)
 
         self.monitor_tick_seconds = _int("SILVER_MONITOR_TICK", self.monitor_tick_seconds)
         self.default_watch_interval_minutes = _int("SILVER_WATCH_INTERVAL", self.default_watch_interval_minutes)

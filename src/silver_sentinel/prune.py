@@ -292,10 +292,16 @@ def restore(archive: Path | str, *, apply: bool = False) -> dict[str, Any]:
         col.name for col in Asset.__table__.columns if isinstance(col.type, DateTime)
     }
     with session_scope() as session:
-        existing = set(session.scalars(select(Asset.normalized)))
+        # 唯一约束是 (kind, normalized)，不是 normalized 单列：domain 与 url
+        # 可能产生同一个值，只按 normalized 去重会误跳过一条、丢数据。
+        existing = {
+            (kind, normalized)
+            for kind, normalized in session.execute(select(Asset.kind, Asset.normalized))
+        }
         for record in records:
             normalized = record.get("normalized") or ""
-            if normalized in existing:
+            dedup_key = (record.get("kind") or "domain", normalized)
+            if dedup_key in existing:
                 result["skipped"] += 1
                 continue
             data = {k: v for k, v in record.items() if k in columns}
@@ -306,6 +312,6 @@ def restore(archive: Path | str, *, apply: bool = False) -> dict[str, Any]:
                     except ValueError:
                         data[key] = None
             session.add(Asset(**data))
-            existing.add(normalized)
+            existing.add(dedup_key)
             result["restored"] += 1
     return result

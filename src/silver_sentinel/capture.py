@@ -40,7 +40,7 @@ from . import runtime_settings
 from .collectors import apk_fetch
 from .config import settings
 from .core.eventlog import emit
-from .db import session_scope
+from .db import chain_write_scope, session_scope
 from .domain import AssetKind, utcnow
 from .evidence import append as append_evidence
 from .evidence import append_file as append_evidence_file
@@ -344,6 +344,10 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
             task.error = "上次执行被中断（进程重启），已重新排队"
         if stale:
             log.info("回收 %s 个中断的取证任务", len(stale))
+            # 下面那条 SELECT 按 state='queued' 找活，必须先把回收结果落库。
+            # 以前靠 autoflush 隐式代劳；关掉隐式 flush 后不显式写一次，
+            # SQL 层看到的仍是 running，这条任务就永远捞不回来。
+            s.flush()
 
         tasks = list(
             s.scalars(
@@ -790,7 +794,9 @@ def _capture_asset_locked(asset_id: int) -> dict[str, Any]:
 
     # ---- 落证据（失败也留痕）
     evidence_written: list[str] = []
-    with session_scope() as s:
+    # 整段事务串行：chain_tip() 读到链尾到 commit 之间不能插进别的写事务，
+    # 否则两条链会各自按旧链尾算 prev_hash，链就分叉（线上 id=15535 那处）。
+    with chain_write_scope() as s:
         asset = s.get(Asset, asset_id)
         if asset is None:
             return {"ok": False, "reason": "资产消失"}
@@ -1621,7 +1627,7 @@ def _download_apk_locked(asset_id: int, links: list[str], page_url: str, tier: s
     for link in candidates:
         result = apk_fetch.fetch(link, max_bytes=max_bytes, referer=page_url)
         if not result.ok:
-            with session_scope() as s:
+            with chain_write_scope() as s:
                 append_evidence(
                     s, asset_id, "capture_error",
                     json.dumps({"stage": "apk", "url": link, "reason": result.reason}, ensure_ascii=False).encode(),

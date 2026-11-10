@@ -33,7 +33,7 @@ from ..config import settings
 from ..domain import Assessment, utcnow
 from ..models import Asset, SignalRow
 from ..normalize import extract_indicators, normalize_domain
-from .engine import assess, get_ruleset
+from .engine import assess, get_ruleset, normalize_verdict
 
 log = logging.getLogger(__name__)
 
@@ -298,6 +298,14 @@ def assess_now(
     merged["coverage"] = dict(assessment.coverage)
     # 自称/冒充是结构化事实，不走 YAML 规则，直接叠加到评分上。
     _apply_claim(assessment, merged, ruleset.thresholds)
+    # 兜底归一：白名单压分、伪造标识码提级之后，判定不能比分数应得的更重。
+    # 缺了这一步就会留下「20 分却挂 high_risk」的永久误报（冷存档不再重评）。
+    normalize_verdict(
+        assessment,
+        ruleset.thresholds,
+        reviewed=bool(asset.reviewed_by),
+        min_signals=settings.min_signals_for_verdict,
+    )
     merged["coverage"] = dict(assessment.coverage)
     return assessment, merged
 

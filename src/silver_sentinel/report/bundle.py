@@ -53,9 +53,12 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _shrink(path: Path) -> tuple[bytes, str]:
-    """截图压缩；失败就原样返回，不因为压缩问题丢证据。"""
-    raw = path.read_bytes()
+def _shrink(raw: bytes) -> tuple[bytes, str]:
+    """截图压缩；失败就原样返回，不因为压缩问题丢证据。
+
+    入参是证据内容而不是路径：vault 模式下明文文件不存在，
+    内容由统一读取入口解密后直接传进来。
+    """
     try:
         from PIL import Image
 
@@ -207,7 +210,7 @@ def build(
     body: str,
     bundle_id: str,
     out_dir: Path,
-    evidence_paths: dict[str, Path],
+    evidence_blobs: dict[str, bytes],
 ) -> Built:
     out_dir.mkdir(parents=True, exist_ok=True)
     host = (ctx.asset.normalized or ctx.asset.value).replace("/", "_").replace(":", "_")[:60] or "target"
@@ -220,10 +223,10 @@ def build(
     for ev in ctx.evidence:
         if getattr(ev, "kind", "") != "screenshot":
             continue
-        p = evidence_paths.get(str(getattr(ev, "sha256", "")))
-        if not p or not p.exists():
+        raw = evidence_blobs.get(str(getattr(ev, "sha256", "")))
+        if not raw:
             continue
-        data, mime = _shrink(p)
+        data, mime = _shrink(raw)
         label = f"{getattr(ev, 'captured_at', '')}_{str(ev.sha256)[:8]}.jpg"
         shots.append((label, data, mime))
         shot_files.append((label, data))
@@ -254,6 +257,9 @@ def build(
                 "captured_at": getattr(ev, "captured_at", None).isoformat() if getattr(ev, "captured_at", None) else "",
                 "size": getattr(ev, "size", 0),
                 "note": getattr(ev, "note", ""),
+                # 明文与密文都读不到的证据如实标出来，避免 manifest
+                # 列了证据、ZIP 里却没有对应文件。
+                "included": ev.sha256 in evidence_blobs,
             }
             for ev in ctx.evidence
         ],
@@ -287,14 +293,14 @@ def build(
             kind = getattr(ev, "kind", "")
             if kind not in {"page_html", "page_text", "network"}:
                 continue
-            p = evidence_paths.get(str(getattr(ev, "sha256", "")))
-            if not p or not p.exists():
+            data = evidence_blobs.get(str(getattr(ev, "sha256", "")))
+            if not data:
                 continue
-            data = p.read_bytes()
             if len(data) > MAX_HTML_BYTES:
                 data = data[:MAX_HTML_BYTES]
                 manifest["truncated"].append(f"{kind}:{ev.sha256[:12]}")
-            arc = f"evidence/{kind}-{str(ev.sha256)[:12]}{p.suffix or '.bin'}"
+            ext = {"page_html": ".html", "page_text": ".txt", "network": ".json"}.get(kind, ".bin")
+            arc = f"evidence/{kind}-{str(ev.sha256)[:12]}{ext}"
             zf.writestr(arc, data)
             manifest["files"].append(
                 {"name": arc, "sha256": _sha(data), "size": len(data),

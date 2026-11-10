@@ -137,7 +137,12 @@ class Asset(Base):
         back_populates="asset", cascade="all, delete-orphan", order_by="SignalRow.weight.desc()"
     )
     evidence: Mapped[list[Evidence]] = relationship(
-        back_populates="asset", cascade="all, delete-orphan", order_by="Evidence.id"
+        back_populates="asset",
+        cascade="all, delete-orphan",
+        order_by="Evidence.id",
+        # 软删是 tombstone（行还在，deleted_at 非空）。把过滤下推到 SQL，
+        # 列表页就不必把每个资产的全部历史证据拉进内存再 Python 过滤。
+        primaryjoin="and_(Asset.id == Evidence.asset_id, Evidence.deleted_at.is_(None))",
     )
     reports: Mapped[list[ReportDraft]] = relationship(
         back_populates="asset", cascade="all, delete-orphan", order_by="ReportDraft.id.desc()"
@@ -452,6 +457,25 @@ class TaskRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     stats: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     error: Mapped[str] = mapped_column(Text, default="")
+
+
+class ChainAnchor(Base):
+    """证据链的受控断点。
+
+    历史上有过并发写入：两个事务各自按当时读到的链尾构造 prev_hash，
+    提交顺序与构造顺序对不上，链就在中间分叉。这**不是**证据被篡改，
+    重算整条链反而会改写两万多条历史哈希，破坏「不可篡改」的语义。
+
+    正确做法是把那条证据登记成锚点：校验时从这里另起一段，
+    哈希原样保留，断点可查、可审计。
+    """
+
+    __tablename__ = "chain_anchors"
+
+    evidence_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(80), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class KeywordHit(Base):
