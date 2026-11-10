@@ -303,10 +303,17 @@ def assess_now(
 
 
 def apply_assessment(session: Session, asset: Asset, assessment: Assessment) -> int:
-    """把评估结果写回资产与信号表，返回写入的信号条数。"""
+    """把评估结果写回资产与信号表，返回写入的信号条数。
+
+    人工复核是终审：`reviewed_by` 非空时机器只更新分数、置信度与信号，
+    不覆盖 verdict。否则周期研判会把人工 confirmed 打回 high_risk——
+    `_apply_claim()` 对「伪造政府标识码」无条件提级到 high_risk，
+    即使 `assess()` 因 reviewed=True 已返回 confirmed 也照样覆盖。
+    """
     asset.score = assessment.score
     asset.confidence = assessment.confidence
-    asset.verdict = assessment.verdict
+    if not asset.reviewed_by:
+        asset.verdict = assessment.verdict
 
     session.execute(delete(SignalRow).where(SignalRow.asset_id == asset.id))
     written = 0

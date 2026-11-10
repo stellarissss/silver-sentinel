@@ -398,7 +398,9 @@ def scan(
     asset.scan_count = (asset.scan_count or 0) + 1
     asset.score = assessment.score
     asset.confidence = assessment.confidence
-    asset.verdict = assessment.verdict
+    # 人工复核过的资产，重扫只刷新证据与分数，不改终审判定。
+    if not asset.reviewed_by:
+        asset.verdict = assessment.verdict
     asset.meta = {**(asset.meta or {}), **extra_meta, "last_trigger": trigger, "facts": facts}
 
     if icp_result is not None:

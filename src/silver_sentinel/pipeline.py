@@ -30,7 +30,7 @@ from datetime import timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from . import triage
 from .config import settings
@@ -255,7 +255,12 @@ def pending_assets(limit: int = 200) -> list[int]:
     with session_scope() as s:
         rows = s.execute(
             select(Asset.id, Asset.score, Asset.scan_count, Asset.meta)
-            .where(Asset.tier.in_(ACTIVE_TIERS))
+            .where(
+                Asset.tier.in_(ACTIVE_TIERS),
+                # 人工终审过的资产不再进入机器研判：结论不该被周期任务反复重算，
+                # 也省掉每轮 40 个高分资产的白工与 SQLite 锁竞争。
+                or_(Asset.reviewed_by == "", Asset.reviewed_by.is_(None)),
+            )
             .order_by(Asset.score.desc(), Asset.first_seen.desc())
             .limit(max(limit * 6, 600))
         ).all()
