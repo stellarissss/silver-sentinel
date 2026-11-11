@@ -518,6 +518,21 @@ def backfill(limit: int = 30) -> int:
             Asset.capture_retry_at.is_(None),
             Asset.capture_retry_at <= now,
         )
+        # 近 24h 首次发现、从未取证的线索：独立优先通道。
+        # 24 小时复访池有 3000+ 条 0 分老站且每天再生，水位 room 常年只有 1，
+        # 新线索排在它们后面就几个小时拿不到正文 → 永远 0 分 insufficient，
+        # 首屏自然「看不到任何新发现」。
+        fresh_before = now - timedelta(hours=24)
+        fresh_rank = case(
+            (
+                and_(
+                    Asset.capture_state == "pending",
+                    Asset.first_seen >= fresh_before,
+                ),
+                0,
+            ),
+            else_=1,
+        )
         rows = list(
             s.scalars(
                 select(Asset)
@@ -539,14 +554,21 @@ def backfill(limit: int = 30) -> int:
                     or_(Asset.capture_retry_at.is_not(None), ~recently_dead),
                 )
                 # 「从未取证」排在「已取证待复访」前面。
-                # 线上出现过 3 条 pending 资产连续 8 分钟没进队：24 小时复访
-                # 产生的大量 captured 资产按分数占了 limit，新线索永远轮不到，
-                # 而 doctor 报 starved、看着像队列坏了。分级仍然优先于取证状态：
-                # watch 的复访比 candidate 的首访更急。
+                #
+                # 线上又复现了一次更隐蔽的饥饿：source_rank 原本排在 pending
+                # 之前，ip_pool / ct_bulk 来源的 0 分老站「24 小时复访」持续
+                # 压住 pivot / ct_poll 来源的新线索。复访池每天再生、room 常年
+                # 只有 1，新资产几小时排不上取证 → 没有正文 → 永远 0 分
+                # insufficient → 首屏看不到任何新发现。
+                #
+                # 分级仍然优先于取证状态（watch 的复访比 candidate 的首访更急），
+                # 但同一档内给「近 24h 首次发现、从未取证」一条独立通道，
+                # 且 pending 整体必须先于 source_rank。
                 .order_by(
                     tier_rank,
-                    source_rank,
+                    fresh_rank,
                     (Asset.capture_state == "pending").desc(),
+                    source_rank,
                     Asset.score.desc(),
                     Asset.last_capture_at.is_(None).desc(),
                     Asset.first_seen.desc(),

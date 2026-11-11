@@ -51,9 +51,20 @@ GROUP_LABELS = {
     "cert": "同证书",
     "backend": "同收单端点",
     "template": "同模板",
+    "family": "同站群前缀族",
+    "offline": "失联站点",
 }
 
-GROUP_ORDER = {"campaign": 4, "cert": 3, "backend": 2, "template": 1}
+GROUP_ORDER = {"campaign": 4, "cert": 3, "backend": 2, "template": 1, "family": 0, "offline": 0}
+
+# 站点失联 / 取证失败：当前拿不到任何页面内容，再怎么排序也挤不出新证据。
+# 这类资产按分数排会长期霸占首屏（线上 95 分站群全部 dead，首页前 60 行
+# 全是它们）。折叠只影响展示，不改判定、不删数据，展开可见、可一键关掉。
+OFFLINE_CAPTURE_STATES = frozenset({"dead", "failed"})
+
+# 单个折叠组最多带多少成员进响应。失联组线上有 1400+ 条，全塞进 JSON
+# 既拖慢列表也把前端展开卡死；真实总数用 size 给，成员分页另走详情。
+OFFLINE_MEMBER_CAP = 40
 
 
 def normalize_title(title: str) -> str:
@@ -143,11 +154,16 @@ def group_row(
     kind: str,
     label: str,
     members: list[dict[str, Any]],
+    member_cap: int | None = None,
 ) -> dict[str, Any]:
     """把一组成员压成列表页的一行。
 
     代表行取「分数最高、档位最高」的那一条：它是这批里最该被看的样本。
     代表行本身的字段照常返回，前端不用为分组行写第二套渲染。
+
+    member_cap 只截「展开时可见的成员」，不动 size / max_score / 诱饵统计——
+    失联组线上有 1400+ 条，全量塞进 JSON 会把列表请求拖到几 MB，但真实
+    规模和组内的诱饵标记一条都不能丢。
     """
     rank = {"confirmed": 4, "watch": 3, "candidate": 2, "cold": 1, "dismissed": 0}
     ordered = sorted(
@@ -160,6 +176,7 @@ def group_row(
     # 否则「26537.net 是诱饵」这件事会被折叠吞掉——代表行是收单端点，
     # 而真正需要人工看一眼的那条藏在展开后的第三行。
     decoys = [m for m in ordered if m.get("decoy")]
+    shown = ordered if member_cap is None else ordered[:member_cap]
     head["group"] = {
         "key": key,
         "kind": kind,
@@ -181,8 +198,9 @@ def group_row(
                 "evidence_count": m.get("evidence_count") or 0,
                 "decoy_kind": (m.get("decoy") or {}).get("kind") or "",
             }
-            for m in ordered
+            for m in shown
         ],
+        "members_truncated": len(shown) < len(members),
         "max_score": max((float(m.get("score") or 0) for m in members), default=0.0),
         "tiers": sorted({m.get("tier") or "" for m in members}),
     }

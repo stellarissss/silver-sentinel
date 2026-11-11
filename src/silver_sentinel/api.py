@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from . import __version__, webauth
@@ -24,6 +24,7 @@ from .analyzers import llm as llm_analyzer
 from .config import settings
 from .db import init_db, session_scope, verify_chain
 from .domain import CATEGORY_LABELS, VERDICT_LABELS, utcnow
+from .grouping import OFFLINE_CAPTURE_STATES, OFFLINE_MEMBER_CAP
 from .intake import scan
 from .models import TIER_LABELS, Asset, Campaign, Evidence, ReportDraft, ScanRun, SignalRow, WatchTarget
 from .respond import CHANNELS, advise, build, export_bundle
@@ -156,7 +157,15 @@ class ReviewIn(BaseModel):
     note: str = ""
 
 
-def _asset_row(asset: Asset) -> dict[str, Any]:
+def _asset_row(
+    asset: Asset, evidence_counts: dict[int, int] | None = None
+) -> dict[str, Any]:
+    """列表行。
+
+    evidence_counts 由折叠视图一次性聚合好传进来：折叠要扫描全量资产，
+    若让每行去加载 evidence 关系，几万条证据会被整体 ORM 化，列表接口
+    直接挂死。非折叠视图不传，走 relationship 常规路径。
+    """
     return {
         "id": asset.id,
         "kind": asset.kind,
@@ -180,7 +189,11 @@ def _asset_row(asset: Asset) -> dict[str, Any]:
         "capture_state": asset.capture_state or "pending",
         "capture_error": (asset.capture_error or "")[:200],
         "last_capture_at": asset.last_capture_at.isoformat() if asset.last_capture_at else None,
-        "evidence_count": len(asset.evidence or []),  # relationship 已在 SQL 层排掉软删
+        "evidence_count": (
+            evidence_counts.get(asset.id, 0)
+            if evidence_counts is not None
+            else len(asset.evidence or [])  # relationship 已在 SQL 层排掉软删
+        ),
         # 同源折叠：group_key 是这批资产的共同标识，group_kind 说明凭什么归到一起
         "group_key": asset.group_key or "",
         "group_kind": asset.group_kind or "",
@@ -578,14 +591,30 @@ def stats() -> dict[str, Any]:
             )
         ) or 0
 
+        # 「风险最高线索」要给人看还能处置的目标。已失联 / 取证失败的
+        # 高分老站（用户举报过的 95 分站群）会把 8 张卡片全占满，
+        # 折叠到线索库末尾，这里只留可访问的高分线索。
         top = list(
             session.scalars(
                 select(Asset)
-                .where(Asset.tier.in_(active_tiers), Asset.score > 0)
+                .where(
+                    Asset.tier.in_(active_tiers),
+                    Asset.score > 0,
+                    or_(
+                        Asset.capture_state.is_(None),
+                        Asset.capture_state.notin_(tuple(OFFLINE_CAPTURE_STATES)),
+                    ),
+                )
                 .order_by(Asset.score.desc())
                 .limit(8)
             )
         )
+        offline_active = session.scalar(
+            select(func.count(Asset.id)).where(
+                Asset.tier.in_(active_tiers),
+                Asset.capture_state.in_(tuple(OFFLINE_CAPTURE_STATES)),
+            )
+        ) or 0
 
         return {
             "total_assets": total,
@@ -617,6 +646,7 @@ def stats() -> dict[str, Any]:
                 }
             ] if dismissed_recent else [],
             "top_assets": [_asset_row(a) for a in top],
+            "offline_assets": offline_active,
         }
 
 
@@ -678,6 +708,7 @@ def api_assets(
     limit: int = Query(default=50, ge=1, le=300),
     offset: int = Query(default=0, ge=0),
     collapse: bool = True,
+    fold_offline: bool = True,
 ) -> dict[str, Any]:
     """线索列表。默认只返回有效资产（不含已排除）。
 
@@ -726,9 +757,10 @@ def api_assets(
             "value": Asset.value,
         }.get(sort, Asset.score)
         stmt = stmt.order_by(sort_col.asc() if order == "asc" else sort_col.desc(), Asset.id.desc())
-        # 列表每行都要 evidence_count，selectinload 一次把关系批量取回来，
-        # 避免默认 50 行触发 50 次额外查询（2.3 万证据行时列表明显变慢）。
-        stmt = stmt.options(selectinload(Asset.evidence))
+        # evidence_count 的加载方式在下面两个分支里分开处理：
+        # 非折叠视图只取 limit 行，selectinload 一次批量取回关系是划算的；
+        # 折叠视图要扫描全量行来分组，此时 selectinload 会把几万条证据
+        # 整体 ORM 化（线上实测 5.7 万条 → 53s，接口直接挂死），改用聚合计数。
 
         # 每一档各有多少条。「有效 0 条」必须能立刻解释成「另有 N 条冷存」，
         # 否则用户只会看到一张空表，以为东西丢了。
@@ -739,7 +771,13 @@ def api_assets(
         raw_total = session.scalar(count_stmt) or 0
 
         if not collapse:
-            rows = list(session.scalars(stmt.offset(offset).limit(limit)))
+            rows = list(
+                session.scalars(
+                    stmt.options(selectinload(Asset.evidence))
+                    .offset(offset)
+                    .limit(limit)
+                )
+            )
             return {
                 "items": [_asset_row(a) for a in rows],
                 "total": raw_total,
@@ -749,6 +787,7 @@ def api_assets(
                 "tier": tier,
                 "tier_counts": tier_counts,
                 "collapsed": False,
+                "offline_count": 0,
             }
 
         # 折叠视图：分组代表行要取「组内分数最高的那条」还要带成员列表，
@@ -758,13 +797,34 @@ def api_assets(
         # 再用 Python 切片套 offset，翻到后半段就返回空页，total 也只是
         # 被截断那批能折出的项数。active 档实测不到 2000 行、all 档 7000+，
         # 一次全取的代价远小于错误的分页。
-        rows = list(session.scalars(stmt))
-        items, group_count = _collapse_rows(rows)
+        # 折叠要按 group_key / 前缀族把全量行分组，但每行只需要一个
+        # evidence_count 数字：一次 group by 拿到全部计数，不加载关系。
+        # 条件与 Asset.evidence 的 primaryjoin 一致，软删 tombstone 不计入。
+        evidence_counts = {
+            int(asset_id): int(n)
+            for asset_id, n in session.execute(
+                select(Evidence.asset_id, func.count(Evidence.id))
+                .where(Evidence.deleted_at.is_(None))
+                .group_by(Evidence.asset_id)
+            ).all()
+        }
+        # campaign 是行里唯一还会懒加载的关系；预加载一次消掉 N+1。
+        rows = list(session.scalars(stmt.options(selectinload(Asset.campaign))))
+        items, group_count = _collapse_rows(
+            rows,
+            fold_offline=fold_offline and collapse,
+            evidence_counts=evidence_counts,
+        )
+        offline_count = sum(
+            1 for a in rows
+            if (a.capture_state or "") in OFFLINE_CAPTURE_STATES
+        ) if (fold_offline and collapse) else 0
         view_total = len(items)
         return {
             "items": items[offset: offset + limit],
             "total": view_total,
             "raw_total": raw_total,
+            "offline_count": offline_count,
             "limit": limit,
             "offset": offset,
             "tier": tier,
@@ -775,7 +835,12 @@ def api_assets(
         }
 
 
-def _collapse_rows(rows: list[Asset]) -> tuple[list[dict[str, Any]], int]:
+def _collapse_rows(
+    rows: list[Asset],
+    *,
+    fold_offline: bool = True,
+    evidence_counts: dict[int, int] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     """把已排序的行按 group_key 折叠，保持原来的顺序。
 
     组在「组内第一条出现的位置」占位，这样按分数排序时，
@@ -785,13 +850,24 @@ def _collapse_rows(rows: list[Asset]) -> tuple[list[dict[str, Any]], int]:
     但 `mz479.top` / `mz749.top` 这类固定前缀 + 变数字的域名，在发现阶段就
     是同一个生成器长期运营的证据（见 discover/burst.py）。只用于展示、
     不写库，误判了也能用「展开全部」一键绕开。
+
+    失联站点（dead / failed）当前拿不到任何页面内容，按分数排会长期霸占
+    首屏——线上 95 分死站群一度占满前 60 行，把新线索全压到后面。这里把
+    **整组都失联**的组沉到末尾，但保留它们原来的同源依据（同证书 80 个站
+    仍是一组、同前缀族仍是一组），团伙证据不能因为折叠而消失；只有连同源
+    依据都没有的失联散站，才合成一个「失联站点」大组。混合组里只要还有
+    能取到内容的站，就留在前面——那批人还在运营，不该被藏起来。
     """
     from .discover.burst import family_key
     from .grouping import GROUP_LABELS, group_row
 
+    def is_offline(a: Asset) -> bool:
+        return (a.capture_state or "") in OFFLINE_CAPTURE_STATES
+
     order: list[Any] = []
     buckets: dict[str, list[Asset]] = {}
     meta_of: dict[str, tuple[str, str]] = {}
+    loose_offline: list[Asset] = []
 
     for a in rows:
         key = a.group_key or ""
@@ -801,7 +877,11 @@ def _collapse_rows(rows: list[Asset]) -> tuple[list[dict[str, Any]], int]:
         else:
             fam = family_key(a.normalized or a.value or "")
             if not fam:
-                order.append(_asset_row(a))
+                # 无同源依据的失联散站：攒起来合成一个大组，别几百行铺在末尾
+                if fold_offline and is_offline(a):
+                    loose_offline.append(a)
+                    continue
+                order.append(_asset_row(a, evidence_counts))
                 continue
             key = f"family:{fam}"
             kind, label = "family", f"同站群前缀族 {fam}"
@@ -811,13 +891,23 @@ def _collapse_rows(rows: list[Asset]) -> tuple[list[dict[str, Any]], int]:
             meta_of[key] = (kind, label)
         buckets[key].append(a)
 
-    out: list[dict[str, Any]] = []
+    front: list[dict[str, Any]] = []
+    back: list[dict[str, Any]] = []
     group_count = 0
     for entry in order:
         if not isinstance(entry, str):
-            out.append(entry)
+            front.append(entry)
             continue
-        members = [_asset_row(a) for a in buckets[entry]]
+        group_assets = buckets[entry]
+        # 整组失联才沉底。混合组里还有活站，留在前面。
+        # fold_offline=0 时完全不区分失联，退回原来的纯同源折叠。
+        all_offline = (
+            fold_offline
+            and bool(group_assets)
+            and all(is_offline(a) for a in group_assets)
+        )
+        target = back if all_offline else front
+        members = [_asset_row(a, evidence_counts) for a in group_assets]
         # 只有 2 条的组不折叠：省下一行，却多一个徽标和一次点击，净收益是负的。
         # 线上实测：46 组里 30 组是「×2 同证书」（同一张证书覆盖两个子域），
         # 全折起来反而让列表更吵。成员仍然逐条显示，只把关联标出来。
@@ -837,12 +927,35 @@ def _collapse_rows(rows: list[Asset]) -> tuple[list[dict[str, Any]], int]:
                     "max_score": max((float(o.get("score") or 0) for o in members), default=0.0),
                     "tiers": sorted({o.get("tier") or "" for o in members}),
                 }
-                out.append(m)
+                if all_offline:
+                    m["group"]["offline"] = True
+                target.append(m)
             continue
         kind, label = meta_of[entry]
-        out.append(group_row(key=entry, kind=kind, label=label, members=members))
+        head = group_row(key=entry, kind=kind, label=label, members=members)
+        if all_offline:
+            head["group"]["offline"] = True
+        target.append(head)
         group_count += 1
-    return out, group_count
+
+    # 无同源依据的失联散站合成一个大组，成员只带前 OFFLINE_MEMBER_CAP 条；
+    # 真实规模用 size 给，诱饵/蜜罐由 group_row 从全量统计后浮到组行上。
+    if loose_offline:
+        members = [_asset_row(a, evidence_counts) for a in loose_offline]
+        if len(members) < 3:
+            back.extend(members)
+        else:
+            head = group_row(
+                key="offline:lost",
+                kind="offline",
+                label=f"失联 / 取证失败站点（{len(members)} 条）",
+                members=members,
+                member_cap=OFFLINE_MEMBER_CAP,
+            )
+            head["group"]["offline"] = True
+            back.append(head)
+            group_count += 1
+    return front + back, group_count
 
 
 @app.get("/api/assets/{asset_id}")

@@ -380,6 +380,27 @@ async function loadOverview() {
     </div>`).join("") : `<div class="empty">还没有线索。去「研判台」输入第一条可疑链接或安装包。</div>`;
 
   $$("#top-assets .row-item").forEach(el => el.addEventListener("click", () => openAsset(el.dataset.asset)));
+
+  // 概览只列还能处置的高分线索。已失联 / 取证失败的站点折在线索库末尾，
+  // 这里给一条可点的提示，避免「8 张卡片全是站点失联」又没人解释为什么。
+  const box = $("#top-assets");
+  const offlineBox = document.createElement("div");
+  offlineBox.className = "offline-note";
+  offlineBox.innerHTML = s.offline_assets
+    ? `<span>另有 <b>${s.offline_assets}</b> 条失联站点（已下线 / 取证失败）已从本榜折叠，`
+      + `证据与判定仍保留。</span><button class="ev-link" data-goto-offline>去线索库查看</button>`
+    : "";
+  if (s.offline_assets) {
+    box.appendChild(offlineBox);
+    offlineBox.querySelector("[data-goto-offline]").addEventListener("click", () => {
+      const sel = $("#filter-tier");
+      state.assetTier = "all";
+      state.assetOffset = 0;
+      if (sel) sel.value = "all";
+      switchView("assets");
+      loadAssets();
+    });
+  }
 }
 
 /* 风险指数条：一个总分 + 四项可解释构成 + 七日趋势 */
@@ -810,7 +831,12 @@ function assetRowHtml(a) {
     return assetCells(a, extra);
   }
   const open = state.expandedGroups.has(g.key);
-  const kindLabel = { campaign: "同团伙", cert: "同证书", backend: "同收单", template: "同模板", family: "同前缀族" }[g.kind] || g.label || "同源";
+  const kindLabel = { campaign: "同团伙", cert: "同证书", backend: "同收单", template: "同模板", family: "同前缀族", offline: "失联站点" }[g.kind] || g.label || "同源";
+  // 失联组上千条只带前 40 条成员，展开时必须说明「没显示完」，
+  // 否则人工会以为折叠把线索弄丢了。
+  const truncatedHint = g.members_truncated
+    ? `<tr class="group-member"><td class="mono dim"></td><td colspan="7" class="mono dim">仅列出前 ${g.members.length} 条，共 ${g.size} 条失联站点；点「展开全部（不折叠）」或按判定/分级筛选查看全部。</td></tr>`
+    : "";
   return `
     <tr class="group-row${open ? " open" : ""}" data-asset="${a.id}" data-group="${escapeHtml(g.key)}">
       <td>${badge(a.verdict)}</td>
@@ -833,7 +859,8 @@ function assetRowHtml(a) {
       <td class="mono">${fmtTime(a.last_seen)}</td>
       <td class="mono">${a.scan_count}</td>
     </tr>
-    ${open ? g.members.map(m => memberRowHtml(m)).join("") : ""}`;
+    ${open ? g.members.map(m => memberRowHtml(m)).join("") : ""}
+    ${open ? truncatedHint : ""}`;
 }
 
 function memberRowHtml(m) {
@@ -948,12 +975,26 @@ function renderAssetMeta(data) {
   // 折叠后「共 12 项」和「95 条」不是一回事，两个数都得给——
   // 否则用户会以为折叠把线索弄丢了。
   const folded = data.collapsed && data.raw_total > data.total
-    ? `<span>${data.raw_total} 条折成 <b>${data.total}</b> 项（${data.group_count || 0} 组同源）</span>`
+    ? `<span>${data.raw_total} 条折成 <b>${data.total}</b> 项（${data.group_count || 0} 组）</span>`
+    : "";
+  // 失联站点被折成一组沉到列表末尾，必须显式报数：否则用户翻到最后一页
+  // 会以为那些已举报的高分站点凭空消失了。
+  const offlineNote = data.offline_count
+    ? `<button class="ev-link" data-offline-jump title="已折到列表末尾，点此跳过去">`
+      + `${data.offline_count} 条失联站点已折叠（已下线 / 取证失败）</button>`
     : "";
   const toggle = `<button class="ev-link" data-collapse-toggle>${data.collapsed ? "展开全部（不折叠）" : "按同源折叠"}</button>`;
   el.innerHTML = `<span>${escapeHtml(tierLabel)}</span><span>共 <b>${data.total}</b> 项</span>`
     + (data.total ? `<span>当前 ${from}–${to}</span>` : "")
-    + folded + other + toggle;
+    + folded + offlineNote + other + toggle;
+
+  // 失联组沉在列表末尾，点击直接翻到最后一页，别让人自己翻 40 页。
+  el.querySelectorAll("[data-offline-jump]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.assetOffset = Math.max(0, Math.floor((data.total - 1) / data.limit) * data.limit);
+      loadAssets();
+    });
+  });
 }
 
 function renderAssetPager(data) {

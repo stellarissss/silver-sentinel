@@ -2162,3 +2162,20 @@ table.data tbody tr.group-member:hover td { background: var(--surface-2); }
 .peer-row:hover { background: var(--surface-2); }
 .peer-val { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
 .peer-more { padding: 6px 10px; font-size: 10.5px; }
+
+
+/* 概览页「失联站点已折叠」提示条：不抢风险榜的视觉重心，但必须看得见 */
+.offline-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-top: 1px dashed var(--rule);
+  font-size: 11.5px;
+  color: var(--ink-dim, var(--ink));
+  line-height: 1.5;
+}
+.offline-note b { color: var(--ink); }
+.offline-note .ev-link { margin-left: auto; white-space: nowrap; }
