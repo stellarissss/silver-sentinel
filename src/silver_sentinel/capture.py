@@ -2000,26 +2000,50 @@ def reconcile_watch(limit: int = MAX_AUTO_WATCH) -> dict[str, int]:
     只在配额内补，不淘汰已有目标：对账的职责是补齐，不是重新排座次。
     """
     added = 0
+    revived = 0
     with session_scope() as s:
-        existing = set(s.scalars(select(WatchTarget.value).where(WatchTarget.kind == "asset")))
+        # 只统计启用中的目标：死站/降级目标被 prune_watch 停用后仍留在表里
+        # （保住 scan_runs 外键），但它们不该再占 200 个盯防名额。
         current = s.scalar(
-            select(func.count(WatchTarget.id)).where(WatchTarget.auto.is_(True))
+            select(func.count(WatchTarget.id)).where(
+                WatchTarget.kind == "asset",
+                WatchTarget.auto.is_(True),
+                WatchTarget.enabled.is_(True),
+            )
         ) or 0
-        room = max(0, limit - current)
-        if room <= 0:
-            return {"added": 0, "existing": len(existing), "room": 0}
+        # 保留全部（含停用）的映射：遇到已停用、但如今重新合规的目标就复活它，
+        # 而不是新增——uq_watch_kind_value 唯一约束不允许同 value 两条。
+        by_value = {
+            t.value: t
+            for t in s.scalars(select(WatchTarget).where(WatchTarget.kind == "asset"))
+        }
         rows = s.scalars(
             select(Asset)
             .where(
                 Asset.tier.in_((TIER_WATCH, TIER_CONFIRMED)),
                 Asset.kind.in_(("domain", "url")),
+                # 域名已注销/永久解析失败的死站不得再进盯防池：它们会占满
+                # 200 个自动配额，把真正在线的可疑站挤出去（线上实测 103/200
+                # 是 NXDOMAIN 死站，长时间「无新发现」的根因之一）。
+                Asset.capture_state != "dead",
             )
             .order_by(Asset.score.desc())
         )
         for asset in rows:
             key = asset.value[:200]
-            if key in existing:
+            existing = by_value.get(key)
+            if existing is not None:
+                if not existing.enabled and existing.auto:
+                    # 曾经被停用（如死站恢复 / 降级后又升回来）：复活并立刻复访
+                    existing.enabled = True
+                    existing.asset_id = asset.id
+                    existing.next_run_at = utcnow() + timedelta(minutes=5)
+                    existing.note = f"{asset.tier} 自动纳管（对账复活）"
+                    revived += 1
+                    current += 1
                 continue
+            if current >= limit:
+                break
             s.add(
                 WatchTarget(
                     kind="asset",
@@ -2032,27 +2056,46 @@ def reconcile_watch(limit: int = MAX_AUTO_WATCH) -> dict[str, int]:
                     next_run_at=utcnow() + timedelta(minutes=5),
                 )
             )
-            existing.add(key)
+            by_value[key] = None
             added += 1
-            if added >= room:
-                break
-    if added:
-        log.info("盯防对账：补入 %d 个目标", added)
-    return {"added": added, "existing": len(existing), "room": room}
+            current += 1
+    if added or revived:
+        log.info("盯防对账：补入 %d 个、复活 %d 个目标", added, revived)
+    return {"added": added, "revived": revived, "existing": len(by_value), "room": max(0, limit - current)}
 
 
 def prune_watch() -> int:
-    """把已经排除/冷存/降回候选的目标移出自动监控。人工加的保持不动。"""
+    """把已排除/冷存/降回候选/已判死的自动目标停用。人工加的保持不动。
+
+    死站（capture_state=dead，域名注销或永久 NXDOMAIN）曾长期霸占 200 个
+    自动盯防配额中的一多半，每轮复访只是再排队烧一次浏览器、写一个空 run，
+    既挤掉真正在线的可疑站，又让监控页「有变更 0 / 有失败 0」看起来像空转。
+    这里把它们一并停用，配额让给活站。资产本身不删，历史证据仍可查。
+
+    用「停用」而非「删除」：scan_runs.target_id 外键指向 watch_targets，生产
+    开了 PRAGMA foreign_keys=ON，直接 delete 会 IntegrityError（历史版本这里
+    一直外键失败、被 housekeeping 的 try/except 吞掉，等于功能从未生效）。
+    停用既保住外键完整、又保留巡检历史，且由于 enabled=False 不再被调度捞起。
+    """
     moved = 0
+    dead = 0
     with session_scope() as s:
-        rows = list(s.scalars(select(WatchTarget).where(WatchTarget.auto.is_(True))))
+        rows = list(s.scalars(select(WatchTarget).where(WatchTarget.auto.is_(True), WatchTarget.enabled.is_(True))))
         for row in rows:
             asset = s.get(Asset, row.asset_id) if row.asset_id else None
+            is_dead = asset is not None and asset.capture_state == "dead"
             # 分级落回候选后，自动盯防也应当撤回：否则 watchlist 会一直膨胀，
             # 而候选项本来就走低频轮转，不需要占盯防配额。
-            if asset is None or asset.tier not in (TIER_WATCH, TIER_CONFIRMED):
-                s.delete(row)
+            if asset is None or asset.tier not in (TIER_WATCH, TIER_CONFIRMED) or is_dead:
+                if is_dead and asset.tier in (TIER_WATCH, TIER_CONFIRMED):
+                    dead += 1
+                reason = "已判死（域名注销/永久失联）" if is_dead else "资产已排除/降级，自动盯防撤回"
+                row.enabled = False
+                row.next_run_at = None
+                row.note = f"{row.note or ''}\n[自动停用] {reason}".strip()[:1000]
                 moved += 1
+    if dead:
+        log.info("盯防清理：停用 %d 个已注销/永久失联的死站", dead)
     return moved
 
 

@@ -170,6 +170,25 @@ def _run_asset_target(target_id: int, run_id: int | None, row: dict) -> dict:
         _retire_target(target_id, "找不到对应资产")
         return {"target": label, "status": "skipped", "stats": stats, "error": "资产已不存在"}
 
+    # 复访前先看资产是不是已经判死（域名注销 / 永久 NXDOMAIN）。
+    # 死站再排队只会重复烧浏览器、写一条空 run，还占着盯防名额——自愈：
+    # 这里直接停用目标并说明原因，不必等 housekeeping 的 prune_watch。
+    from .models import Asset as _Asset
+
+    with session_scope() as s:
+        cap = s.scalar(
+            select(_Asset.capture_state).where(_Asset.id == asset_id)
+        )
+    if cap == "dead":
+        reason = "资产已判死（域名注销/永久失联），停止复访"
+        _close_run(
+            run_id, target_id,
+            status="skipped", error=reason, stats=stats,
+            interval_minutes=row["interval"], changed=False,
+        )
+        _retire_target(target_id, reason)
+        return {"target": label, "status": "skipped", "stats": stats, "error": reason}
+
     # 取证线程活着就只排队（最高优先级），让队列统一调度；
     # 线程没起来（老部署/手工跑）才退回同步执行。
     if capture_worker_alive():

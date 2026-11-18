@@ -109,14 +109,23 @@ def _claim_signals(merged: dict[str, Any]) -> list[Any]:
             )
         ]
     if verdict == "impersonation":
+        # level=3 是冒充国务院/国务院办公厅这类最高国家机关：官方已明确定性
+        # 「高仿部委央企」为诈骗，且这类站几乎必然配套惠民资金/补贴话术。
+        # 它的证据强度应与「伪造政府网站标识码」同级，而不是和普通冒充混为一谈。
+        try:
+            level = int(claim.get("level") or 0)
+        except (TypeError, ValueError):
+            level = 0
+        top_authority = level >= 3 or who in ("国务院", "国务院办公厅")
         return [
             Signal(
-                rule_id="IMP-002",
+                rule_id="IMP-002H" if top_authority else "IMP-002",
                 category="impersonation",
-                title="冒充政府机构",
-                weight=78.0,
-                confidence=0.9,
-                detail=f"自称「{who}」，该机构官方域名为 {official}",
+                title="冒充最高国家机关" if top_authority else "冒充政府机构",
+                weight=92.0 if top_authority else 78.0,
+                confidence=0.95 if top_authority else 0.9,
+                detail=f"自称「{who}」，该机构官方域名为 {official}"
+                       + ("；冒充国务院/部委属官方定性诈骗" if top_authority else ""),
                 source="claim",
             )
         ]
@@ -155,11 +164,28 @@ def _apply_claim(assessment: Any, merged: dict[str, Any], thresholds: dict[str, 
         assessment.confidence = max(float(assessment.confidence or 0), 0.95)
         assessment.notes.append("伪造政府网站标识码，按最高优先级处置")
     elif verdict == "impersonation":
-        assessment.score = max(float(assessment.score or 0), 70.0)
-        if assessment.verdict in ("insufficient", "low"):
+        try:
+            level = int(claim.get("level") or 0)
+        except (TypeError, ValueError):
+            level = 0
+        agencies = claim.get("agencies") or []
+        who = agencies[0] if agencies else ""
+        top_authority = level >= 3 or who in ("国务院", "国务院办公厅")
+        if top_authority:
+            # 冒充国务院/部委：提到高危档，确保按分数排序能上主页、优先取证。
+            # 仍不给 confirmed——那条档留给人工终审（机器不进举报链）的约束不变。
+            assessment.score = max(float(assessment.score or 0), 90.0)
             assessment.verdict = "high_risk"
-        assessment.confidence = max(float(assessment.confidence or 0), 0.85)
-        assessment.notes.append("冒充政府机构，优先人工核验")
+            assessment.confidence = max(float(assessment.confidence or 0), 0.95)
+            assessment.notes.append("冒充国务院/部委等最高国家机关，按高危优先处置")
+        else:
+            assessment.score = max(float(assessment.score or 0), 70.0)
+            # 原来只在 insufficient/low 时才改判，suspicious 会被原样留下，
+            # 造成「70 分却挂 suspicious」的分数-判定不一致。到高危门槛就应改判。
+            if assessment.verdict in ("insufficient", "low", "suspicious"):
+                assessment.verdict = "high_risk"
+            assessment.confidence = max(float(assessment.confidence or 0), 0.85)
+            assessment.notes.append("冒充政府机构，优先人工核验")
     elif verdict == "fabricated_agency":
         assessment.score = max(float(assessment.score or 0), 55.0)
         assessment.confidence = max(float(assessment.confidence or 0), 0.7)
