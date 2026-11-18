@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
+import signal
 import socket
 import threading
 import time
@@ -38,6 +40,71 @@ from ..config import settings
 from ..opsec import EgressBlocked, get_guard
 
 log = logging.getLogger(__name__)
+
+
+def _playwright_driver_pid(playwright_obj: Any) -> int | None:
+    """从 Playwright 同步对象里安全取出 driver(node) 进程 PID。
+
+    Playwright 没有公开 API 暴露它，但 1.x 内部链是固定的：
+        Playwright._impl_obj._connection._transport._proc.pid
+    这是 node 驱动进程，chromium 是它的后代；杀掉它等于连根拔起整棵
+    浏览器进程树。内部实现若哪天变了，getattr 链条返回 None，自动降级
+    到「只靠 playwright.stop()」的旧行为，不会让主流程崩。
+    """
+    try:
+        impl = getattr(playwright_obj, "_impl_obj", None)
+        conn = getattr(impl, "_connection", None)
+        transport = getattr(conn, "_transport", None)
+        proc = getattr(transport, "_proc", None)
+        pid = getattr(proc, "pid", None)
+        return int(pid) if pid else None
+    except Exception:  # noqa: BLE001 纯诊断用途，任何异常都当作取不到
+        return None
+
+
+def _process_alive(pid: int) -> bool:
+    """PID 是否仍存活（含僵尸判定：僵尸不占资源，视作已死）。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as fh:
+            # 第 3 个字段是进程状态；Z/X 表示已退出
+            state = fh.read().split(") ", 1)[-1].split(" ", 1)[0]
+        return state not in ("Z", "X", "x")
+    except OSError:
+        return True
+
+
+def _kill_process_tree(root_pid: int) -> int:
+    """杀掉 root_pid 及其所有后代（先子进程后父进程），返回实际发信号的进程数。
+
+    chromium 是 driver(node) 的后代：driver → chrome-headless → zygote/gpu/...
+    从叶到根 kill，避免父进程先死导致子进程变孤儿继续占内存。只针对明确
+    由本沙箱启动、且已确认 PID 的进程，不按名字扫全系统，绝不误伤服务自身。
+    """
+    if root_pid <= 0 or not _process_alive(root_pid):
+        return 0
+    try:
+        out = os.popen(f"ps -o pid= --ppid {root_pid} 2>/dev/null").read()
+        children = [int(x) for x in out.split()]
+    except Exception:  # noqa: BLE001
+        children = []
+    killed = 0
+    for child in children:
+        killed += _kill_process_tree(child)
+    try:
+        os.kill(root_pid, signal.SIGKILL)
+        killed += 1
+    except (ProcessLookupError, PermissionError):
+        pass
+    return killed
+
 
 _PRIVATE_NETS = [
     ipaddress.ip_network("10.0.0.0/8"),
@@ -349,6 +416,13 @@ class WebSandbox:
         self._launched_at = 0.0
         self._runs_at_launch = 0
         self._owner_thread: int | None = None
+        # driver(node) 进程 PID。跨线程 close() 时 Playwright 的 stop() 因
+        # 线程绑定会失败被吞，driver 变孤儿；留着 PID 才能从 OS 层兜底强杀。
+        self._driver_pid: int | None = None
+        # 已启动过的全部 driver PID，供进程级收割做白名单（避免误杀活跃实例）。
+        self._spawned_driver_pids: set[int] = set()
+        # 孤儿收割节流：避免每次取证都 ps 全进程表。
+        self._last_reap: float = 0.0
 
     def _maybe_recycle(self) -> None:
         """到点就把浏览器换掉。只在单线程取证循环里调用，无并发风险。"""
@@ -417,6 +491,10 @@ class WebSandbox:
             self._launched_at = time.monotonic()
             self._runs_at_launch = self.stats["runs"]
             self._owner_thread = ident
+            # 记录 driver PID，供跨线程 close() 从 OS 层兜底清理。
+            self._driver_pid = _playwright_driver_pid(self._playwright)
+            if self._driver_pid:
+                self._spawned_driver_pids.add(self._driver_pid)
             return self._browser
 
     def observe(
@@ -427,6 +505,15 @@ class WebSandbox:
         obs = WebObservation(url=url)
 
         self._maybe_recycle()
+        # 每次取证前节流收割一次孤儿 driver（30s 间隔）：即便 close() 的
+        # PID 兜底失效，也能在下一轮把泄漏的浏览器连根拔掉，不让它累积。
+        now = time.monotonic()
+        if now - self._last_reap >= 30:
+            self._last_reap = now
+            try:
+                self.reap_orphan_drivers()
+            except Exception:  # noqa: BLE001 收割失败不该阻断取证
+                log.exception("收割孤儿 Playwright driver 失败")
 
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
@@ -703,6 +790,51 @@ class WebSandbox:
 
         return obs
 
+    def reap_orphan_drivers(self) -> int:
+        """收割本服务遗留的孤儿 Playwright driver，返回清理组数。
+
+        兜底防线：即便 close() 的 PID 兜底因某些异常没生效，或进程在旧版本
+        下已经泄漏了一批 driver，这里在每次取证前按「父进程=本服务、cmdline
+        含 playwright/driver/node、且不是当前活跃 driver」扫描清除。
+
+        只认本服务的直接子进程，按 PID 精确清理，不按名字扫全系统，绝不
+        误伤服务自身或其它项目。频率低（每次取证一次，ps 开销可忽略）。
+        """
+        keep = self._driver_pid or 0
+        try:
+            out = os.popen("ps -eo pid=,ppid=,args= 2>/dev/null").read()
+        except Exception:  # noqa: BLE001
+            return 0
+        me = os.getpid()
+        orphans: list[int] = []
+        for line in out.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid, ppid = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            cmd = parts[2]
+            if (
+                ppid == me
+                and pid != keep
+                and "playwright" in cmd
+                and "driver" in cmd
+                and "node" in cmd
+            ):
+                orphans.append(pid)
+        reaped = 0
+        for pid in orphans:
+            if _process_alive(pid):
+                n = _kill_process_tree(pid)
+                if n:
+                    reaped += 1
+                    log.warning("已收割孤儿 Playwright driver pid=%s（%d 进程）", pid, n)
+        if reaped:
+            self.stats["orphans_reaped"] = self.stats.get("orphans_reaped", 0) + reaped
+        return reaped
+
     def status(self) -> dict[str, Any]:
         return {
             "enabled": settings.sandbox_enabled and settings.sandbox_browser_enabled,
@@ -716,6 +848,11 @@ class WebSandbox:
         }
 
     def close(self) -> None:
+        # 先留住 PID：下面两个 close/stop 在「跨线程」或「event loop 已毒化」
+        # 时会抛异常被吞，driver(node) 就变成没人管的孤儿，chromium 子进程
+        # 跟着一起留在内存里。取证超时换线程 → 这里 stop 失败 → 每次泄漏一组，
+        # 堆积几十个浏览器把 2G 机器换页风暴打死。留着 PID 才能兜底强杀。
+        stale_pid = self._driver_pid
         try:
             if self._browser is not None:
                 self._browser.close()
@@ -726,6 +863,13 @@ class WebSandbox:
                 self._playwright.stop()
         except Exception:  # noqa: BLE001
             pass
+        # OS 层兜底：stop() 若因线程绑定失败，driver 仍活着，从进程树连根清除。
+        # 只处理本实例亲自启动并记录过 PID 的进程，绝不误伤服务或其它实例。
+        if stale_pid and _process_alive(stale_pid):
+            n = _kill_process_tree(stale_pid)
+            if n:
+                log.warning("已强制清理残留的 Playwright 进程树 driver_pid=%s 进程数=%d", stale_pid, n)
+        self._driver_pid = None
         self._browser = None
         self._playwright = None
         self._owner_thread = None
