@@ -99,9 +99,21 @@ class CaptureWorker:
 
     def tick(self) -> int:
         """跑一条。返回实际执行条数。"""
-        from .capture import backfill, queue_summary, run_batch
+        from .capture import available_memory_mb, backfill, memory_ok, queue_summary, run_batch
 
         t0 = time.monotonic()
+        # 内存看门狗：可用内存见底时这一轮不拉 Chromium。小内存机器上，
+        # 内存不足还硬取证 → swap 颠簸 → 取证线程卡在 do_swap_page → 超时
+        # 重建 → 内存更少，是反复卡死的根源。跳过一轮，给系统喘息的窗口；
+        # 任务留在队列里，内存恢复后下一轮接着跑，不会丢线索。
+        if not memory_ok():
+            self.idle_rounds += 1
+            log.warning(
+                "可用内存 %.0fMB 低于阈值 %dMB，暂停本轮取证等待内存恢复",
+                available_memory_mb(), settings.capture_min_free_mem_mb,
+            )
+            beat("capture", skipped_low_mem=True, avail_mb=round(available_memory_mb()))
+            return 0
         added = backfill(limit=settings.capture_backfill_limit)
         result = run_batch(limit=1)
         spent = time.monotonic() - t0

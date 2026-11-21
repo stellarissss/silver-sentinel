@@ -401,10 +401,14 @@ class WebSandbox:
     所以按次数与时长双阈值定期回收：到点关掉，下一次 observe 再冷启动。
     """
 
-    # 每 N 次取证回收一次浏览器进程
-    RECYCLE_EVERY_RUNS = 300
-    # 或者每 N 小时回收一次（取二者先到者）
-    RECYCLE_EVERY_SECONDS = 6 * 3600
+    # 每 N 次取证回收一次浏览器进程。
+    # 从 300 收紧到 60：Chromium 的堆会随每次导航缓慢增长，300 次才回收
+    # 意味着一个浏览器进程能涨到几百 MB，在 ≤2G 的机器上足以把可用内存
+    # 吃到见底、触发 swap 颠簸。60 次回收一次，单次堆增长有限，代价只是
+    # 每 60 次多一次 2~4 秒冷启动——用小代价换内存稳定，很划算。
+    RECYCLE_EVERY_RUNS = 60
+    # 或者每 N 小时回收一次（取二者先到者）。6h→2h，进一步压缩堆增长窗口。
+    RECYCLE_EVERY_SECONDS = 2 * 3600
 
     def __init__(self) -> None:
         self._playwright = None
@@ -669,15 +673,24 @@ class WebSandbox:
                 obs.html_len = len(html)
             except Exception:  # noqa: BLE001
                 html = ""
-            # 截图放在最后：等 JS 渲染与跳转都结束，截到的才是受害者看到的那一屏
+            # 截图放在最后：等 JS 渲染与跳转都结束，截到的才是受害者看到的那一屏。
+            # 显式 timeout：page.screenshot 是少数不受 set_default_timeout 约束、
+            # 能把取证线程钉死的操作之一（超长/动画页面渲染尤其明显）。用剩余
+            # 预算给一道硬闸，卡住就放弃截图而不是拖垮整个浏览器和取证队列。
+            shot_timeout = max(3000, int(min(timeout, 12.0) * 1000))
             try:
-                obs.screenshot = page.screenshot(full_page=False, type="png", animations="disabled")
+                obs.screenshot = page.screenshot(
+                    full_page=False, type="png", animations="disabled", timeout=shot_timeout
+                )
             except Exception as exc:  # noqa: BLE001
                 log.debug("截图失败：%s", exc)
             # 全页截图：首屏常被伪装成「活动已结束」，整页才看得到表单和二维码。
-            # 限高 + JPEG，避免超长落地页把 2G 内存打满。
+            # 限高 + JPEG，避免超长落地页把 2G 内存打满。同样加显式超时。
             try:
-                raw = page.screenshot(full_page=True, type="jpeg", quality=68, animations="disabled")
+                raw = page.screenshot(
+                    full_page=True, type="jpeg", quality=68,
+                    animations="disabled", timeout=shot_timeout
+                )
                 obs.screenshot_full = _shrink_image(raw, max_height=6000)
             except Exception as exc:  # noqa: BLE001
                 log.debug("全页截图失败：%s", exc)

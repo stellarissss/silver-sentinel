@@ -578,18 +578,29 @@ class Vault:
         return fh
 
     # ------------------------------------------------------ 账本读写
-    def read_manifest(self, path: Path) -> list[dict[str, Any]]:
+    def iter_manifest(self, path: Path):
+        """逐行流式解析账本。绝不 read_bytes() 全量载入。
+
+        线上 custody 账本涨到 95MB / 21.7 万行，旧的 read_bytes().splitlines()
+        一次分配 95MB bytes + 21.7 万行列表 + 同量级 dict，解析一次峰值几百 MB、
+        100% CPU 持有 GIL 几十秒——把 1.9G 机器的可用内存吃光、拖慢所有线程。
+        流式迭代把内存峰值压到单行，是这类 append-only JSONL 的正确读法。
+        """
         if not path.is_file():
-            return []
-        out: list[dict[str, Any]] = []
-        for raw in path.read_bytes().splitlines():
-            if not raw.strip():
-                continue
-            try:
-                out.append(json.loads(raw))
-            except json.JSONDecodeError:
-                break
-        return out
+            return
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                if not raw.strip():
+                    continue
+                try:
+                    yield json.loads(raw)
+                except json.JSONDecodeError:
+                    return
+
+    def read_manifest(self, path: Path) -> list[dict[str, Any]]:
+        """保留原语义（返回全部条目的列表）。调用方若只要计数/Exists/末条，
+        应改用 iter_manifest / _last_entry，避免构造整表。"""
+        return list(self.iter_manifest(path))
 
     def _append_jsonl(self, path: Path, entry: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -599,8 +610,42 @@ class Vault:
             os.fsync(fh.fileno())
 
     def _last_entry(self, path: Path) -> dict[str, Any] | None:
-        entries = self.read_manifest(path)
-        return entries[-1] if entries else None
+        """只取账本最后一条——反向读文件末尾，不解析整表。
+
+        这是 push 的每轮热路径（_append_custody/_append_manifest 都要拿 last 续链）。
+        旧实现 read_manifest 解析 95MB 全表只为拿一行，是 CPU/GIL/内存尖峰的元凶。
+        这里从文件末尾倒着找换行，最多读一个尾部块，O(1) 而非 O(n)。
+        """
+        if not path.is_file():
+            return None
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                if size == 0:
+                    return None
+                block = 8192
+                pos = size
+                tail = b""
+                while pos > 0:
+                    step = min(block, pos)
+                    pos -= step
+                    fh.seek(pos)
+                    chunk = fh.read(step)
+                    tail = chunk + tail
+                    # 找到至少一个完整行（开头有换行，或已到文件头）
+                    if b"\n" in tail or pos == 0:
+                        break
+                # 最后一行 = 末尾去空后最后一个换行之后的内容
+                lines = [ln for ln in tail.splitlines() if ln.strip()]
+                if not lines:
+                    return None
+                last = lines[-1]
+                return json.loads(last)
+        except (OSError, json.JSONDecodeError):
+            # 尾部损坏时退回全表扫描兜底（罕见），保证正确性优先
+            entries = self.read_manifest(path)
+            return entries[-1] if entries else None
 
     def _append_manifest(self, entry: dict[str, Any]) -> dict[str, Any]:
         last = self._last_entry(self.manifest_path)
@@ -699,7 +744,12 @@ class Vault:
         bytes_sent = 0
         try:
             backend = self._backend()
-            done = {e["evidence"]["sha256"] for e in self.read_manifest(self.manifest_path)}
+            # 流式提取已固化证据的 sha256，避免把 95MB 账本解析成整表列表。
+            done = {
+                e["evidence"]["sha256"]
+                for e in self.iter_manifest(self.manifest_path)
+                if e.get("evidence", {}).get("sha256")
+            }
             with session_scope() as session:
                 rows = self._evidence_rows(session)
                 for row in rows:

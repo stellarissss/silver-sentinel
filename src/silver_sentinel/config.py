@@ -195,6 +195,11 @@ class Settings:
     # 冷档待取证资产跑一遍。设 0 关闭。作用是让浏览器在发现层供给不足时
     # 仍在产出证据，也顺带用页面正文复核一遍当初被判冷的线索。
     capture_cold_fill_seconds: int = 90
+    # 内存看门狗：可用内存低于这个值时暂停取证，不再拉起 Chromium。
+    # 小内存机器（≤2G）上，取证 Chromium 峰值几百 MB；内存见底时继续取证会
+    # 触发 swap 颠簸 → 取证线程卡在 do_swap_page → 超时重建 → 内存更少的
+    # 死亡螺旋。留一道闸，宁可晚几秒取证也不能把整机拖垮。设 0 关闭。
+    capture_min_free_mem_mb: int = 350
 
     # ---------------------------------------------------------------- 出站防护（OPSEC）
     # 默认开启：拦内网/元数据、去标识 UA、导出脱敏。是否需要代理才允许访问可疑目标，
@@ -395,6 +400,9 @@ class Settings:
         )
         self.capture_cold_fill_seconds = max(
             0, _int("SILVER_CAPTURE_COLD_FILL_SECONDS", self.capture_cold_fill_seconds)
+        )
+        self.capture_min_free_mem_mb = max(
+            0, _int("SILVER_CAPTURE_MIN_FREE_MEM_MB", self.capture_min_free_mem_mb)
         )
         self.llm_batch = max(0, _int("SILVER_LLM_BATCH", self.llm_batch))
 

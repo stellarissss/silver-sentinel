@@ -53,6 +53,7 @@ def test_classify_failure_by_nature():
     from silver_sentinel.capture import (
         FAILURE_BLOCKED,
         FAILURE_DEAD,
+        FAILURE_STALL,
         FAILURE_TRANSIENT,
         classify_failure,
     )
@@ -65,6 +66,10 @@ def test_classify_failure_by_nature():
         "net::ERR_SSL_PROTOCOL_ERROR": FAILURE_BLOCKED,
         "net::ERR_CERT_AUTHORITY_INVALID": FAILURE_BLOCKED,
         "net::ERR_EMPTY_RESPONSE": FAILURE_BLOCKED,
+        # 线程级卡死：必须和页面级超时区分，长冷却避免反复拉起 Chromium
+        "取证超时，已重建执行线程": FAILURE_STALL,
+        "浏览器句柄属于已废弃的取证线程": FAILURE_STALL,
+        # 普通页面 goto 超时仍是瞬时，保持分钟级重试
         "Timeout 30000ms exceeded": FAILURE_TRANSIENT,
         "net::ERR_CONNECTION_RESET": FAILURE_TRANSIENT,
         "": FAILURE_TRANSIENT,
@@ -353,3 +358,25 @@ def test_never_captured_beats_refresh(db):
             for t in s.query(CaptureTask).filter(CaptureTask.state == "queued").all()
         }
     assert ids == {fresh_id}, f"只应排入首访资产，实际 {ids}"
+
+
+def test_stall_gets_long_cooldown_not_minute_retry():
+    """浏览器卡死（STALL）的冷却必须远大于瞬时失败，避免反复拉起 Chromium 撑爆内存。
+
+    线上 8cc145.cc 这类站每次把浏览器钉死到硬超时，若按 transient 只等 10 分钟，
+    就会不停重建线程、拉起新 Chromium，把 2G 内存推入 swap 颠簸 → 整机卡死。
+    """
+    from silver_sentinel.capture import (
+        _CAPTURE_TIMEOUT,
+        FAILURE_STALL,
+        FAILURE_TRANSIENT,
+        classify_failure,
+        retry_delay,
+    )
+
+    stall = classify_failure("取证超时，已重建执行线程")
+    assert stall == FAILURE_STALL
+    # 卡死冷却（48h）至少是瞬时重试（10min）的 100 倍
+    assert retry_delay(stall) >= retry_delay(FAILURE_TRANSIENT) * 100
+    # 单次硬超时收紧到 90s：卡死危害窗口不能太长
+    assert _CAPTURE_TIMEOUT <= 90

@@ -93,6 +93,7 @@ def _cold_fill_ready() -> bool:
 FAILURE_DEAD = "dead"          # 域名没了 / 端口拒连：永久性，隔天再看
 FAILURE_BLOCKED = "blocked"    # WAF、证书、空响应：可能是临时封锁，隔天再看
 FAILURE_TRANSIENT = "transient"  # 超时、连接重置：分钟级重试有意义
+FAILURE_STALL = "stall"        # 浏览器卡死到被迫重建线程：重量级，长冷却，禁止分钟级重试
 
 _DEAD_MARKERS = (
     "ERR_NAME_NOT_RESOLVED",
@@ -115,6 +116,16 @@ _BLOCKED_MARKERS = (
     "出站被拒",
     "内网地址",
 )
+# 线程级「浏览器卡死」产生的文本。这类失败不是页面打不开，而是整个
+# Chromium 把取证线程钉死到硬超时、被迫换线程——每次都要重新拉起浏览器，
+# 峰值几百 MB。若按 transient 只冷却 10 分钟，卡死的站会不停把内存撑到
+# swap 颠簸（线上 8cc145.cc 就是典型）。必须单独归类、长冷却。
+_STALL_MARKERS = (
+    "取证超时",
+    "重建执行线程",
+    "重建取证线程",
+    "已废弃的取证线程",
+)
 
 
 def classify_failure(error: str) -> str:
@@ -126,6 +137,9 @@ def classify_failure(error: str) -> str:
     text = (error or "").upper()
     if not text.strip():
         return FAILURE_TRANSIENT
+    # 浏览器卡死最优先判定：它常伴随部分网络错误文本，但性质完全不同。
+    if any(marker.upper() in text for marker in _STALL_MARKERS):
+        return FAILURE_STALL
     if any(marker.upper() in text for marker in _SOFT_DEAD_MARKERS):
         return FAILURE_BLOCKED
     if any(marker.upper() in text for marker in _DEAD_MARKERS):
@@ -139,6 +153,11 @@ def retry_delay(kind: str) -> timedelta:
     """按失败性质给冷却时间。"""
     if kind == FAILURE_DEAD:
         return timedelta(hours=settings.capture_dead_retry_hours)
+    if kind == FAILURE_STALL:
+        # 卡死浏览器的站比普通 WAF 封锁更该远离：每碰一次就要重建线程、
+        # 拉起新 Chromium，反复把 2G 内存推入 swap 颠簸。给它和判死同级的
+        # 长冷却（默认 48h），宁可少看几次也不能让它拖垮整机。
+        return timedelta(hours=settings.capture_dead_retry_hours)
     if kind == FAILURE_BLOCKED:
         return timedelta(hours=settings.capture_blocked_retry_hours)
     return timedelta(minutes=10)
@@ -151,9 +170,11 @@ _MAX_NETWORK = 4_000_000
 # 而且 Playwright 的同步 API 绑死创建它的线程——同一实例换线程用会直接报
 # "Cannot switch to a different thread"。所以不是加锁，是固定放在一个专用线程里执行。
 _CAPTURE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ss-capture")
-# 单次取证的硬上限。沙箱自身 45 秒超时，加上 APK 下载与截图，
-# 240 秒还没回来就一定有东西卡住了，直接换线程比干等 10 分钟强。
-_CAPTURE_TIMEOUT = 150
+# 单次取证的硬上限。沙箱自身 45 秒超时，加上 APK 下载与截图，留足余量。
+# 从 150s 收紧到 90s：一个卡死的站每多钉 1 秒，Chromium 就多占 1 秒几百 MB，
+# 在 2G 小机上足以把系统推入 swap 颠簸。90s 仍覆盖 45s 沙箱 + 大包下载 + 两张截图，
+# 但把单次卡死危害窗口砍掉 40%。配合 STALL 长冷却，卡死站一天只碰一次。
+_CAPTURE_TIMEOUT = 90
 
 
 # ---------------------------------------------------------------- 队列
@@ -393,10 +414,12 @@ def run_batch(limit: int = 2) -> dict[str, Any]:
                         for k in ("evidence", "apk", "changes", "egress", "status")
                         if result.get(k) is not None
                     }
-                elif kind in (FAILURE_DEAD, FAILURE_BLOCKED):
+                elif kind in (FAILURE_DEAD, FAILURE_BLOCKED, FAILURE_STALL):
                     # 永久性失败不做分钟级重试：十分钟后再拉起一次 Chromium
                     # 只会得到同一句 ERR_NAME_NOT_RESOLVED，纯烧配额。
-                    # 直接落 failed，冷却期由 asset.capture_retry_at 控制。
+                    # STALL（浏览器卡死）尤其如此——每次重试都要重建线程、拉起
+                    # 新浏览器，是内存颠簸的直接触发源。直接落 failed，冷却期
+                    # 由 asset.capture_retry_at 控制。
                     task.state = "failed"
                     task.finished_at = utcnow()
                     task.error = f"[{kind}] {error}"[:500]
@@ -700,6 +723,15 @@ def _note_browser_failure() -> None:
 
 def _reset_capture_pool() -> None:
     global _CAPTURE_POOL
+    # 超时往往意味着旧线程里的 Chromium 已经卡死（DNS 黑洞 / swap IO）。
+    # 只换线程池不关浏览器的话，旧线程仍攥着几百 MB 内存不放，新线程又
+    # 拉起一个 Chromium——每次超时累积一组，RSS 一路涨到把整机推入颠簸。
+    # 这里主动关一次：close() 内部有 driver PID 进程树强杀兜底，能回收
+    # 卡死线程持有的浏览器。放在换池之前，确保释放发生在下一次取证之前。
+    try:
+        get_web_sandbox().close()
+    except Exception:  # noqa: BLE001 清理失败不该挡住重建
+        log.debug("重建取证线程时关闭浏览器失败", exc_info=True)
     old = _CAPTURE_POOL
     _CAPTURE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ss-capture")
     try:
@@ -1583,6 +1615,32 @@ def _disk_free_gb() -> float:
         return st.f_bavail * st.f_frsize / (1024 ** 3)
     except OSError:
         return 999.0
+
+
+def available_memory_mb() -> float:
+    """系统可用内存（MB，取 MemAvailable）。取不到返回一个宽松的大值，不挡取证。
+
+    MemAvailable 比 MemFree 准——它算上了可回收的 buff/cache。小内存机器上，
+    可用内存见底时还去拉 Chromium，会让整个进程卡在 do_swap_page，进而 timeout、
+    重建、再拉起新浏览器——内存越来越少的死亡螺旋（线上实测）。看门狗据此
+    决定「这一轮先不取证，等内存缓过来」。
+    """
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:  # noqa: PTH123
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return 4096.0
+
+
+def memory_ok() -> bool:
+    """可用内存是否够拉一次 Chromium。阈值为 0 表示关闭看门狗。"""
+    threshold = int(getattr(settings, "capture_min_free_mem_mb", 0) or 0)
+    if threshold <= 0:
+        return True
+    return available_memory_mb() >= threshold
 
 
 def _apk_size_cap(tier: str) -> int:
