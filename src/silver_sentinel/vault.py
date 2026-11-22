@@ -602,6 +602,64 @@ class Vault:
         应改用 iter_manifest / _last_entry，避免构造整表。"""
         return list(self.iter_manifest(path))
 
+    @staticmethod
+    def _count_lines(path: Path) -> int:
+        """数 JSONL 行数（二进制块，不解码不建对象）。
+
+        账本只追加，行数即条目数。status() 只需 entries 计数，用这个方法
+        避免把 105MB 账本 parse 成 21.7 万个 dict——后者是内存/CPU 尖峰、
+        GIL 霸占的根因。IO 是顺序读，内存恒定 1MB。
+        """
+        if not path.is_file():
+            return 0
+        count = 0
+        with path.open("rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)  # 1MB
+                if not chunk:
+                    break
+                count += chunk.count(b"\n")
+        return count
+
+    def _first_entry(self, path: Path) -> dict[str, Any] | None:
+        """只取账本第一条（node 标识在首条），读文件头一块即可。"""
+        if not path.is_file():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for raw in fh:
+                    if raw.strip():
+                        return json.loads(raw)
+                    # 跳过开头可能的空行，但只读前几行
+            return None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _verify_chain(self, path: Path) -> tuple[int, str | None, str]:
+        """流式校验一条哈希链：返回 (条目数, 断裂原因或None, 末条hash)。
+
+        逐条解析、逐条丢弃，内存恒定；不再构造整表列表。语义与旧版一致：
+        检查 seq 连续、prev 衔接、内容哈希匹配，遇到第一处断裂即停。
+        """
+        prev = GENESIS
+        count = 0
+        broken: str | None = None
+        head = GENESIS
+        for i, entry in enumerate(self.iter_manifest(path), 1):
+            if int(entry.get("seq", 0)) != i:
+                broken = f"第 {i} 条序号断裂"
+                break
+            if entry.get("prev") != prev:
+                broken = f"第 {i} 条前序哈希不符"
+                break
+            if _hash_entry(entry) != entry.get("hash"):
+                broken = f"第 {i} 条内容哈希不符"
+                break
+            prev = entry["hash"]
+            head = prev
+            count = i
+        return count, broken, head
+
     def _append_jsonl(self, path: Path, entry: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
@@ -908,7 +966,10 @@ class Vault:
         if not names:
             for path in self.remote_ledger_dir.glob("*.jsonl") if self.remote_ledger_dir.is_dir() else []:
                 names.append(f"ledger/{path.name}")
-        out: list[tuple[str, list[dict[str, Any]]]] = []
+        # 返回 (name, 落盘路径)。旧实现把整份账本 data.splitlines() 解析成
+        # dict 列表（线上 node 账本 77MB、21 万条），是 pull 路径的内存峰值
+        # 元凶。现在只落盘 + 记路径，由 pull() 用 iter_manifest 逐条流式处理。
+        out: list[tuple[str, Path]] = []
         for name in names:
             data = backend.get(name)
             if data is None:
@@ -917,16 +978,9 @@ class Vault:
                     continue
                 data = path.read_bytes()
             self.remote_ledger_dir.mkdir(parents=True, exist_ok=True)
-            _atomic_write(self.remote_ledger_dir / Path(name).name, data)
-            entries: list[dict[str, Any]] = []
-            for raw in data.splitlines():
-                if not raw.strip():
-                    continue
-                try:
-                    entries.append(json.loads(raw))
-                except json.JSONDecodeError:
-                    break
-            out.append((name, entries))
+            landed = self.remote_ledger_dir / Path(name).name
+            _atomic_write(landed, data)
+            out.append((name, landed))
         return out
 
     def pull(self, *, limit: int = 500) -> dict[str, Any]:
@@ -939,14 +993,15 @@ class Vault:
         try:
             backend = self._backend()
             manifests = self._pull_manifests()
-            self.state.remote_entries = sum(len(entries) for _, entries in manifests)
+            self.state.remote_entries = sum(self._count_lines(path) for _, path in manifests)
             known: set[str] = set()
             with session_scope() as session:
                 known = {sha for (sha,) in session.execute(select(Evidence.sha256)).all()}
 
-            for name, entries in manifests:
-                origin = (entries[0].get("node") if entries else Path(name).stem) or Path(name).stem
-                for entry in entries:
+            for name, landed in manifests:
+                first = self._first_entry(landed)
+                origin = (first or {}).get("node") or Path(name).stem
+                for entry in self.iter_manifest(landed):
                     if imported >= limit:
                         break
                     sha = (entry.get("evidence") or {}).get("sha256")
@@ -1091,26 +1146,13 @@ class Vault:
             if not p.name.startswith("custody-") and p.name != self.manifest_path.name
         ]
         for path in paths:
-            entries = self.read_manifest(path)
-            prev = GENESIS
-            broken = None
-            for i, entry in enumerate(entries, 1):
-                if int(entry.get("seq", 0)) != i:
-                    broken = f"第 {i} 条序号断裂"
-                    break
-                if entry.get("prev") != prev:
-                    broken = f"第 {i} 条前序哈希不符"
-                    break
-                if _hash_entry(entry) != entry.get("hash"):
-                    broken = f"第 {i} 条内容哈希不符"
-                    break
-                prev = entry["hash"]
+            count, broken, head = self._verify_chain(path)
             result["nodes"].append(
-                {"file": path.name, "entries": len(entries), "head": prev, "ok": broken is None, "reason": broken or ""}
+                {"file": path.name, "entries": count, "head": head, "ok": broken is None, "reason": broken or ""}
             )
             if broken:
                 result["ok"] = False
-            result["checked"] += len(entries)
+            result["checked"] += count
 
         # 各节点保管链（本地 + 远端副本）
         for custody in [self.custody_path] + [
@@ -1119,22 +1161,18 @@ class Vault:
         ]:
             if not custody.is_file():
                 continue
-            entries = self.read_manifest(custody)
-            prev = GENESIS
-            broken = None
-            for i, entry in enumerate(entries, 1):
-                if int(entry.get("seq", 0)) != i or entry.get("prev") != prev or _hash_entry(entry) != entry.get("hash"):
-                    broken = f"第 {i} 条保管链断裂"
-                    break
-                prev = entry["hash"]
+            count, broken, _ = self._verify_chain(custody)
             key = "custody" if custody == self.custody_path else f"custody:{custody.name}"
-            result[key] = {"entries": len(entries), "ok": broken is None, "reason": broken or ""}
+            result[key] = {"entries": count, "ok": broken is None, "reason": broken or ""}
             if broken:
                 result["ok"] = False
 
         if deep:
             checked = 0
-            for entry in self.read_manifest(self.manifest_path)[-sample:]:
+            # 流式取末 sample 条，不构造整表（deque 只留末尾窗口）
+            from collections import deque
+            tail = deque(self.iter_manifest(self.manifest_path), maxlen=sample)
+            for entry in tail:
                 sha = entry["evidence"]["sha256"]
                 path = self._local_blob_path(sha)
                 if not path.is_file():
@@ -1199,7 +1237,7 @@ class Vault:
                 continue
             shutil.copy2(path, self.remote_ledger_dir / path.name)
             count += 1
-        entries = sum(len(self.read_manifest(p)) for p in self.remote_ledger_dir.glob("*.jsonl"))
+        entries = sum(self._count_lines(p) for p in self.remote_ledger_dir.glob("*.jsonl"))
         return {"ok": True, "files": count, "entries": entries}
 
     # ------------------------------------------------------ 同步循环
@@ -1239,22 +1277,27 @@ class Vault:
 
     # ------------------------------------------------------ 状态
     def status(self) -> dict[str, Any]:
+        # 流式化：运维页 SSE 每 15s 调一次本方法。旧实现把每个账本（线上
+        # custody 105MB / 21.7 万行）parse 成整表 dict，只为拿 first/last/count，
+        # 一次几百 MB + 长时间持 GIL，把 1.9G 机器推入 swap 颠簸。
+        # 现在计数走二进制换行统计、首末条各只读一块，内存恒定、不再霸占 GIL。
         manifests = []
         remote_all = sorted(self.remote_ledger_dir.glob("*.jsonl")) if self.remote_ledger_dir.is_dir() else []
         for path in [self.manifest_path] + [
             p for p in remote_all
             if not p.name.startswith("custody-") and p.name != self.manifest_path.name
         ]:
-            entries = self.read_manifest(path)
+            first = self._first_entry(path)
+            last = self._last_entry(path)
             manifests.append(
                 {
                     "file": path.name,
-                    "node": entries[0].get("node") if entries else "",
-                    "entries": len(entries),
-                    "head": entries[-1]["hash"][:16] if entries else "",
+                    "node": (first or {}).get("node", ""),
+                    "entries": self._count_lines(path),
+                    "head": (last or {}).get("hash", "")[:16],
                 }
             )
-        local_entries = len(self.read_manifest(self.manifest_path))
+        local_entries = self._count_lines(self.manifest_path)
         from sqlalchemy import func
 
         with session_scope() as session:

@@ -74,3 +74,55 @@ def test_last_entry_corrupt_tail_falls_back(tmp_path):
     p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
     v = _bare_vault()
     assert v._last_entry(p)["seq"] == 4
+
+
+def test_count_lines_large_file(tmp_path):
+    """大账本计数走二进制换行统计，结果与逐行解析一致，但不建对象。"""
+    p = tmp_path / "node.jsonl"
+    rows = [{"seq": i, "v": "x" * 50} for i in range(3000)]
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    v = _bare_vault()
+    assert v._count_lines(p) == 3000
+    assert v._count_lines(tmp_path / "nope.jsonl") == 0
+
+
+def test_first_entry(tmp_path):
+    """首条只读文件头，返回 node 标识。"""
+    p = tmp_path / "node.jsonl"
+    rows = [{"seq": i, "node": "node-a"} for i in range(100)]
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    v = _bare_vault()
+    assert v._first_entry(p)["node"] == "node-a"
+    assert v._first_entry(p)["seq"] == 0
+
+
+def test_verify_chain_streaming_matches_semantics(tmp_path):
+    """流式哈希链校验：完好链 ok、断裂链报错，语义与原整表实现一致。"""
+    from silver_sentinel.vault import GENESIS, _hash_entry
+
+    p = tmp_path / "chain.jsonl"
+    entries = []
+    prev = GENESIS
+    for i in range(1, 6):
+        e = {"v": 1, "seq": i, "prev": prev, "node": "n", "action": "x", "subject": "s",
+             "actor": "system", "detail": {}, "ts": "t"}
+        e["hash"] = _hash_entry(e)
+        entries.append(e)
+        prev = e["hash"]
+    p.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+    v = _bare_vault()
+    count, broken, head = v._verify_chain(p)
+    assert count == 5 and broken is None and head == prev
+
+    # 篡改第 3 条内容 → 链断裂
+    entries[2]["detail"] = {"tampered": True}
+    p.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+    count, broken, _ = v._verify_chain(p)
+    assert broken is not None and "哈希" in broken
+
+    # 序号断裂
+    entries[2]["hash"] = _hash_entry({k: val for k, val in entries[2].items() if k != "hash"})
+    entries[2]["seq"] = 99
+    p.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+    _, broken, _ = v._verify_chain(p)
+    assert broken is not None and "序号" in broken
