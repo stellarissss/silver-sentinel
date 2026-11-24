@@ -229,11 +229,23 @@ if [ -n "$(ls -A "$PW_PATH" 2>/dev/null || true)" ] && \
   ok "chromium 已就位（$PW_PATH）"
 else
   log "安装 chromium（约 150MB，只需一次）"
-  PLAYWRIGHT_BROWSERS_PATH="$PW_PATH" "$VENV_DIR/bin/python" -m playwright install chromium \
-    >/dev/null 2>&1 || die "chromium 安装失败：取证不可用，拒绝部署半残服务（可检查网络/磁盘后重跑）"
+  # 官方 CDN 在国内常卡住（2026-11-24 新机实测卡 9 分钟没进度）。
+  # 优先走 npmmirror 镜像，失败再回退官方；两种都加超时上限，
+  # 绝不让它无限挂着把部署拖死。
+  _pw_install() {
+    PLAYWRIGHT_BROWSERS_PATH="$PW_PATH" PLAYWRIGHT_DOWNLOAD_HOST="$1" \
+      timeout 600 "$VENV_DIR/bin/python" -m playwright install chromium >/dev/null 2>&1
+  }
+  if _pw_install "https://npmmirror.com/mirrors/playwright"; then
+    ok "chromium 已安装（镜像源）"
+  elif _pw_install ""; then
+    ok "chromium 已安装（官方源）"
+  else
+    die "chromium 安装失败：取证不可用，拒绝部署半残服务（检查网络/磁盘后重跑）"
+  fi
   find "$PW_PATH" -maxdepth 3 -type f \( -name 'chrome' -o -name 'headless_shell' -o -name 'chrome-headless-shell' \) -print -quit 2>/dev/null | grep -q . \
     || die "chromium 安装后未找到可执行文件，拒绝部署半残服务"
-  ok "chromium 已安装"
+  ok "chromium 可执行文件校验通过"
 fi
 chown -R "$APP_USER:$APP_USER" "$PW_PATH" 2>/dev/null || true
 
