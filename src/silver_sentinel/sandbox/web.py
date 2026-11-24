@@ -456,9 +456,13 @@ class WebSandbox:
         with self._lock:
             if self._browser is not None and getattr(self, "_owner_thread", None) == ident:
                 return self._browser
-            from playwright.sync_api import sync_playwright
-
             try:
+                # playwright 是可选依赖（sandbox extra）。没装时 import 就会抛
+                # ModuleNotFoundError，必须进下面的 except 统一包装成可判别的
+                # 错误文本——否则它绕过包装直接冒泡，取证端无法区分「没装包」
+                # （重启无用，需长冷却）和「进程毒化」（重启可自愈）两种故障。
+                from playwright.sync_api import sync_playwright
+
                 self._playwright = sync_playwright().start()
                 self._browser = self._playwright.chromium.launch(
                     headless=True,

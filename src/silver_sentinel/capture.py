@@ -661,6 +661,11 @@ def capture_asset(asset_id: int) -> dict[str, Any]:
 
     等不到就如实返回「忙」，不要静默失败，也不要让调用方无限期挂着。
     """
+    # 浏览器运行时根本没装（playwright / chromium 缺失）时，重启进程一万次
+    # 也不会好。此时直接短路返回，服务保持在线、页面照常打开，取证进入冷却，
+    # 彻底切断「失败 → os._exit → Restart=always → 再失败」的死循环烧 CPU。
+    if _browser_hard_down():
+        return {"ok": False, "reason": _BROWSER_DOWN_REASON}
     try:
         future = _CAPTURE_POOL.submit(_capture_asset_locked, asset_id)
     except RuntimeError:  # 线程池已关闭（进程在退）
@@ -683,7 +688,7 @@ def capture_asset(asset_id: int) -> dict[str, Any]:
         text = f"{result.get('reason') or ''}{result.get('error') or ''}"
         if "浏览器不可用" in text or "asyncio loop" in text or "different thread" in text:
             _reset_capture_pool()
-            _note_browser_failure()
+            _note_browser_failure(text)
         else:
             _BROWSER_FAILS[0] = 0
         return result
@@ -701,9 +706,65 @@ def capture_asset(asset_id: int) -> dict[str, Any]:
 _BROWSER_FAILS = [0]
 _BROWSER_FAIL_LIMIT = 3
 
+# 2026-11-24 事故：新机部署时装了 wheel 却没装 playwright（可选依赖），
+# ms-playwright 目录是空的。取证每次都「浏览器不可用」→ 3 次后 os._exit(3)
+# → systemd Restart=always 拉起 → 再失败 → 一分钟内重启 358 次，白烧 CPU。
+# 根因是「浏览器运行时压根没装」属于**永久性**故障：重启进程永远不会自愈。
+# 因此先按错误文本分型：装没装这类永久性错误走长冷却降级（服务在线、页面
+# 能开、只是不取证），只有真正的进程级毒化才保留 os._exit 重启自愈。
+_PERMANENT_BROWSER_MARKERS = (
+    "no module named 'playwright'",
+    "no module named \"playwright\"",
+    "modulenotfounderror",
+    "executable doesn't exist",
+    "please run the following command to install",
+    "playwright install chromium",
+    "browser executable",
+    "looks like you called `playwright",
+)
 
-def _note_browser_failure() -> None:
+# 降级时长：浏览器是运维手动补装的，短时间内不会自己变好。
+# 用长冷却而不是无限期，是为了补装后无需重启进程也能自动恢复取证。
+_BROWSER_DOWN_COOLDOWN = 3600.0  # 1 小时
+_BROWSER_DOWN_UNTIL = [0.0]  # time.monotonic() 时间戳；0 表示未降级
+_BROWSER_DOWN_REASON = (
+    "浏览器运行时未安装（playwright/chromium 缺失），取证已进入降级冷却；"
+    "服务正常在线。请在服务器执行 `playwright install chromium` 补装后等待自动恢复"
+)
+
+
+def _is_permanent_browser_error(text: str) -> bool:
+    """错误文本是否属于「浏览器运行时根本没装」这类重启无法自愈的故障。"""
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _PERMANENT_BROWSER_MARKERS)
+
+
+def _browser_hard_down() -> bool:
+    """是否处于浏览器缺失的长冷却降级期。"""
+    return time.monotonic() < _BROWSER_DOWN_UNTIL[0]
+
+
+def _note_browser_failure(text: str = "") -> None:
     _BROWSER_FAILS[0] += 1
+
+    # 永久性故障：不能靠重启进程修复。进入长冷却降级并告警一次，
+    # 绝不 os._exit——否则 Restart=always 会把整机拖入重启风暴。
+    if _is_permanent_browser_error(text):
+        was_down = _browser_hard_down()
+        _BROWSER_DOWN_UNTIL[0] = time.monotonic() + _BROWSER_DOWN_COOLDOWN
+        _BROWSER_FAILS[0] = 0
+        if not was_down:  # 只在进入降级的那一刻告警，避免刷屏
+            log.error(
+                "浏览器运行时缺失（playwright/chromium 未安装），取证降级 %d 秒；"
+                "服务保持在线，不重启进程。请执行 `playwright install chromium` 补装",
+                int(_BROWSER_DOWN_COOLDOWN),
+            )
+            try:
+                emit("capture.browser_missing", cooldown=int(_BROWSER_DOWN_COOLDOWN))
+            except Exception:  # noqa: BLE001
+                pass
+        return
+
     if _BROWSER_FAILS[0] < _BROWSER_FAIL_LIMIT:
         return
     log.error(

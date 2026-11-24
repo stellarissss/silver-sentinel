@@ -210,17 +210,30 @@ PYEOF
 PW_PATH="$APP_DIR/ms-playwright"
 ensure_env PLAYWRIGHT_BROWSERS_PATH "$PW_PATH"
 install -d -m 0755 "$PW_PATH"
-if [ -n "$(ls -A "$PW_PATH" 2>/dev/null || true)" ]; then
+
+# 2026-11-24 新机事故复盘：原先 playwright 缺失 / chromium 装不上都只 warn
+# 放过，结果留下一个「能启动、能开网页、但每次取证都失败」的半残服务；进程端
+# 连续 3 次失败就 os._exit，systemd Restart=always 一分钟内拉起 358 次，白烧
+# CPU。取证是本项目的核心，浏览器运行时是硬依赖，装不上必须 fail-fast，
+# 绝不能让半残服务上线。
+if ! "$VENV_DIR/bin/python" -c 'import playwright' >/dev/null 2>&1; then
+  log "wheel 未携带 playwright（sandbox extra），补装中 ..."
+  "$VENV_DIR/bin/python" -m pip install --quiet --no-cache-dir 'playwright>=1.44' \
+    || die "playwright 安装失败：取证是核心功能，拒绝部署半残服务"
+  "$VENV_DIR/bin/python" -c 'import playwright' >/dev/null 2>&1 \
+    || die "playwright 补装后仍不可导入，拒绝部署半残服务"
+fi
+
+if [ -n "$(ls -A "$PW_PATH" 2>/dev/null || true)" ] && \
+   [ -n "$(find "$PW_PATH" -maxdepth 3 -type f \( -name 'chrome' -o -name 'headless_shell' -o -name 'chrome-headless-shell' \) -print -quit 2>/dev/null)" ]; then
   ok "chromium 已就位（$PW_PATH）"
-elif "$VENV_DIR/bin/python" -c 'import playwright' >/dev/null 2>&1; then
-  log "安装 chromium（约 150MB，只需一次）"
-  if PLAYWRIGHT_BROWSERS_PATH="$PW_PATH" "$VENV_DIR/bin/python" -m playwright install chromium >/dev/null 2>&1; then
-    ok "chromium 已安装"
-  else
-    warn "chromium 安装失败：网页取证会退化为「无截图」，可稍后重试"
-  fi
 else
-  warn "未安装 playwright（可选依赖）：网页取证不可用，pip install '.[sandbox]' 后重跑本脚本"
+  log "安装 chromium（约 150MB，只需一次）"
+  PLAYWRIGHT_BROWSERS_PATH="$PW_PATH" "$VENV_DIR/bin/python" -m playwright install chromium \
+    >/dev/null 2>&1 || die "chromium 安装失败：取证不可用，拒绝部署半残服务（可检查网络/磁盘后重跑）"
+  find "$PW_PATH" -maxdepth 3 -type f \( -name 'chrome' -o -name 'headless_shell' -o -name 'chrome-headless-shell' \) -print -quit 2>/dev/null | grep -q . \
+    || die "chromium 安装后未找到可执行文件，拒绝部署半残服务"
+  ok "chromium 已安装"
 fi
 chown -R "$APP_USER:$APP_USER" "$PW_PATH" 2>/dev/null || true
 
