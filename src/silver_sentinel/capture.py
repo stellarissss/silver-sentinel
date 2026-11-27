@@ -1761,21 +1761,27 @@ def _swap_snapshot() -> tuple[float, int]:
 _BUDGET_LAST = [0.0, 0]  # [monotonic, swapin_pages]
 _BUDGET_LAST_SLOTS = [1]
 # 从"暂停"恢复到取证，要求 swap 降到上限的这个比例以下，避免阈值边缘抖动。
-_BUDGET_RESUME_RATIO = 0.8
+_BUDGET_RESUME_RATIO = 0.95
 # swapin 每秒超过这个页数就认定颠簸（≈4MB/s，4KB/页），暂停取证。
 _BUDGET_SWAPIN_RATE_LIMIT = 1024.0
+# swap 已用超上限时：只有还在换入（rate 超过此值）才判「正在吃 swap」而硬停；
+# 存量静止（rate≈0）说明是历史换出，内存宽裕时允许低速取证，给系统回收窗口。
+_BUDGET_SWAP_GROWING_RATE = 64.0
 
 
 def capture_budget() -> CaptureBudget:
     """按实时内存 + swap 压力决定本轮取证条数。
 
     分档（adaptive 开启时）：
-    - swap 已用 ≥ 上限，或可用内存 < 硬下限，或正在剧烈换入 → 0 条（停一轮）
+    - 可用内存 < 硬下限，或正在剧烈换入（颠簸），或 swap 超上限且仍在增长 → 0 条
     - swap 几乎没用（< 上限 25%）且内存宽裕（≥ 硬下限 2 倍）→ max_batch 条
-    - 其余 → 1 条
+    - 其余（含 swap 存量超上限但已静止、内存宽裕）→ 1 条低速取证
 
+    关键：**标准是"不用/少量 swap" = swap 不在增长，而不是历史存量**。
+    进程重启后 swap 存量（如 445MB）不会立刻归零，但 rate≈0 且内存宽裕时
+    它不影响当前性能，允许 1 条给系统回收窗口；只有 swap 还在涨才硬停。
     adaptive 关闭时退回旧行为：只看可用内存，够就 1 条、不够就 0 条。
-    滞回：一旦进入暂停，要等 swap 降回上限的 80% 以下才恢复，防止反复横跳。
+    滞回：一旦暂停，要等 swap 降回上限的 95% 以下才恢复，防止反复横跳。
     """
     avail = available_memory_mb()
     swap_used, swapin = _swap_snapshot()
@@ -1799,14 +1805,21 @@ def capture_budget() -> CaptureBudget:
     # 恢复门槛：上一轮为 0 时，要求 swap 额外降一截才放行。
     resume_limit = swap_limit * _BUDGET_RESUME_RATIO if _BUDGET_LAST_SLOTS[0] == 0 else swap_limit
 
-    if swap_limit > 0 and swap_used >= resume_limit:
-        slots, reason = 0, f"swap {swap_used:.0f}MB 达上限 {swap_limit}MB"
-    elif floor > 0 and avail < floor:
+    # swap 存量超上限时，只有「还在换入」才算真在吃 swap → 硬停；
+    # 存量静止（rate≈0）且内存宽裕时降级为 1 条，给系统回收窗口。
+    swap_over = swap_limit > 0 and swap_used >= resume_limit
+    swap_growing = rate > _BUDGET_SWAP_GROWING_RATE
+
+    if floor > 0 and avail < floor:
         slots, reason = 0, f"可用内存 {avail:.0f}MB 低于下限 {floor}MB"
     elif rate > _BUDGET_SWAPIN_RATE_LIMIT:
         slots, reason = 0, f"swap 换入 {rate:.0f}页/s，内存颠簸"
+    elif swap_over and swap_growing:
+        slots, reason = 0, f"swap {swap_used:.0f}MB 达上限且仍在换入（{rate:.0f}页/s）"
     elif swap_limit > 0 and swap_used <= swap_limit * 0.25 and avail >= floor * 2:
         slots, reason = max_batch, "内存宽裕且 swap 空闲"
+    elif swap_over:
+        slots, reason = 1, f"swap 存量 {swap_used:.0f}MB 偏高但已静止，低速取证"
     else:
         slots, reason = 1, "常规降速"
 

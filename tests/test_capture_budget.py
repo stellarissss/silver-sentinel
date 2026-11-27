@@ -54,12 +54,26 @@ def budget_env(monkeypatch):
     return cap, state
 
 
-def test_swap_over_limit_stops(budget_env):
+def test_swap_over_limit_and_growing_stops(budget_env):
+    """swap 超上限且仍在换入 → 硬停（真正在吃 swap）。"""
     cap, s = budget_env
     s["swap_used"] = 300.0  # > 256
+    cap.capture_budget()     # 采一次基线
+    s["now"] += 1.0
+    s["swapin"] = 200        # 200 页/s > 64，正在换入
     b = cap.capture_budget()
     assert b.slots == 0
     assert "swap" in b.reason
+
+
+def test_swap_over_limit_but_idle_runs_slow(budget_env):
+    """swap 存量超上限但静止、内存宽裕 → 1 条低速，给系统回收窗口。"""
+    cap, s = budget_env
+    s["swap_used"] = 300.0
+    s["avail"] = 800.0
+    b = cap.capture_budget()
+    assert b.slots == 1
+    assert "静止" in b.reason
 
 
 def test_low_available_memory_stops(budget_env):
@@ -108,17 +122,20 @@ def test_adaptive_off_falls_back_to_fixed_threshold(budget_env, monkeypatch):
     assert cap.capture_budget().slots == 0
 
 
-def test_hysteresis_requires_swap_drop_before_resume(budget_env):
+def test_hysteresis_on_resume_ratio(budget_env):
+    """上一轮暂停后，swap 要降到上限的 95% 以下才按空闲档恢复。"""
     cap, s = budget_env
-    # 先因 swap 超限进入暂停
-    s["swap_used"] = 300.0
+    # 先因内存下限进入暂停
+    s["avail"] = 50.0
     assert cap.capture_budget().slots == 0
-    # swap 降到上限以下但仍高于恢复线(0.8*256≈204) → 仍暂停，防抖动
-    s["swap_used"] = 230.0
-    assert cap.capture_budget().slots == 0
-    # 降到恢复线以下 → 恢复
-    s["swap_used"] = 180.0
-    assert cap.capture_budget().slots >= 1
+    # 内存恢复但 swap 停在 250（上限 256 的 95%=243 之上）→ 不能进满速档，
+    # 只能常规 1 条（滞回恢复线拦住 max_batch）
+    s["avail"] = 800.0
+    s["swap_used"] = 250.0
+    assert cap.capture_budget().slots == 1
+    # swap 降到空闲档（≤ 上限 25% = 64MB）→ 满速
+    s["swap_used"] = 50.0
+    assert cap.capture_budget().slots == 2
 
 
 def test_swap_snapshot_reads_meminfo_and_vmstat(monkeypatch):
