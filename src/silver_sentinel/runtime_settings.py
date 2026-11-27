@@ -40,6 +40,14 @@ CAPTURE_APK_MAX_MB = "capture.apk_max_mb"
 CAPTURE_APK_DAILY_MB = "capture.apk_daily_mb"
 CAPTURE_AUTO_APK_TIERS = "capture.apk_tiers"
 
+# 取证强度：按实时内存 + swap 压力动态调配，每轮拉几条 Chromium。
+# 小内存机器上「固定阈值 + 每轮 1 条」会两头不讨好：内存够时太慢，
+# 内存紧时又卡在阈值上完全停摆。这里把标准改成「尽量不碰 swap」。
+CAPTURE_ADAPTIVE = "capture.adaptive"          # 1 开启动态调配 / 0 退回固定每轮 1 条
+CAPTURE_MAX_BATCH = "capture.max_batch"        # 性能充裕时每轮最多取证条数
+CAPTURE_SWAP_LIMIT_MB = "capture.swap_limit_mb"  # swap 已用超过此值就降速/暂停
+CAPTURE_MIN_FREE_MEM_MB = "capture.min_free_mem_mb"  # 可用内存硬下限，低于此完全停
+
 DEFAULTS: dict[str, str] = {
     LLM_BASE_URL: "",
     LLM_API_KEY: "",
@@ -52,6 +60,10 @@ DEFAULTS: dict[str, str] = {
     CAPTURE_APK_MAX_MB: "50",
     CAPTURE_APK_DAILY_MB: "300",
     CAPTURE_AUTO_APK_TIERS: "watch,confirmed",
+    CAPTURE_ADAPTIVE: "1",
+    CAPTURE_MAX_BATCH: "2",
+    CAPTURE_SWAP_LIMIT_MB: "256",
+    CAPTURE_MIN_FREE_MEM_MB: "120",
 }
 
 _TTL = 5.0
@@ -236,5 +248,9 @@ def llm_public() -> dict[str, Any]:
             "apk_max_mb": get_int(CAPTURE_APK_MAX_MB, 50),
             "apk_daily_mb": get_int(CAPTURE_APK_DAILY_MB, 300),
             "apk_tiers": get(CAPTURE_AUTO_APK_TIERS, "watch,confirmed"),
+            "adaptive": get_bool(CAPTURE_ADAPTIVE, True),
+            "max_batch": get_int(CAPTURE_MAX_BATCH, 2),
+            "swap_limit_mb": get_int(CAPTURE_SWAP_LIMIT_MB, 256),
+            "min_free_mem_mb": get_int(CAPTURE_MIN_FREE_MEM_MB, 120),
         },
     }

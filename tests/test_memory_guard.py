@@ -69,9 +69,13 @@ def test_reset_pool_closes_browser(monkeypatch):
     assert capture._CAPTURE_POOL._max_workers == 1
 
 
-def test_worker_skips_tick_when_memory_low(monkeypatch):
-    """内存不足时 worker 不灌任务、不拉浏览器，任务留在队列里等内存恢复。"""
-    from silver_sentinel import worker
+def test_worker_skips_tick_when_budget_zero(monkeypatch):
+    """取证容量为 0（swap/内存吃紧）时 worker 不灌任务、不拉浏览器，任务留在队列。
+
+    v1.16.16 起判定入口从固定阈值 memory_ok 换成 capture_budget（见新测试文件）。
+    这里只钉住 worker 对「容量为 0」的响应：跳过本轮，不碰 backfill/run_batch。
+    """
+    from silver_sentinel import capture, worker
 
     calls = {"backfill": 0, "run_batch": 0}
 
@@ -83,15 +87,15 @@ def test_worker_skips_tick_when_memory_low(monkeypatch):
         calls["run_batch"] += 1
         return {"ran": 0, "ok": 0}
 
-    monkeypatch.setattr("silver_sentinel.capture.memory_ok", lambda: False)
-    monkeypatch.setattr("silver_sentinel.capture.available_memory_mb", lambda: 120.0)
+    zero = capture.CaptureBudget(0, 120.0, 512.0, 0.0, "swap 达上限")
+    monkeypatch.setattr("silver_sentinel.capture.capture_budget", lambda: zero)
     monkeypatch.setattr("silver_sentinel.capture.backfill", fake_backfill)
     monkeypatch.setattr("silver_sentinel.capture.run_batch", fake_run_batch)
 
     cw = worker.CaptureWorker()
     ran = cw.tick()
     assert ran == 0
-    assert calls == {"backfill": 0, "run_batch": 0}, "内存不足时不应取证"
+    assert calls == {"backfill": 0, "run_batch": 0}, "容量为 0 时不应取证"
     assert cw.idle_rounds >= 1
 
 

@@ -775,6 +775,11 @@ function fillSettings(d) {
   set("#set-apk-max", cap.apk_max_mb ?? 50);
   set("#set-apk-daily", cap.apk_daily_mb ?? 300);
   set("#set-apk-tiers", cap.apk_tiers || "watch,confirmed");
+  const adaptiveEl = $("#set-adaptive");
+  if (adaptiveEl) adaptiveEl.checked = cap.adaptive !== false;
+  set("#set-max-batch", cap.max_batch ?? 2);
+  set("#set-swap-limit", cap.swap_limit_mb ?? 256);
+  set("#set-min-free", cap.min_free_mem_mb ?? 120);
 
   // 保存后统一回填，避免前端自己猜服务端把值规范化成了什么
   const refill = (data) => { SETTINGS.data = data; fillSettings(data); };
@@ -1233,6 +1238,31 @@ document.addEventListener("DOMContentLoaded", () => {
         toast(`保存失败：${e.message}`);
       } finally {
         capSave.disabled = false;
+      }
+    });
+  }
+
+  /* ---- 设置：取证强度（swap/内存动态调配） ---- */
+  const intensitySave = $("#btn-intensity-save");
+  if (intensitySave) {
+    intensitySave.addEventListener("click", async () => {
+      intensitySave.disabled = true;
+      try {
+        const data = await api("/api/settings/capture", {
+          method: "POST",
+          body: JSON.stringify({
+            adaptive: ($("#set-adaptive") || {}).checked !== false,
+            max_batch: Number(($("#set-max-batch") || {}).value || 2),
+            swap_limit_mb: Number(($("#set-swap-limit") || {}).value ?? 256),
+            min_free_mem_mb: Number(($("#set-min-free") || {}).value ?? 120),
+          }),
+        });
+        if (window.ssRefillSettings) window.ssRefillSettings(data);
+        toast("取证强度已保存，实时生效");
+      } catch (e) {
+        toast(`保存失败：${e.message}`);
+      } finally {
+        intensitySave.disabled = false;
       }
     });
   }

@@ -24,6 +24,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -1702,6 +1703,115 @@ def memory_ok() -> bool:
     if threshold <= 0:
         return True
     return available_memory_mb() >= threshold
+
+
+# ---------------------------------------------------------------- 动态取证容量
+#
+# 2026-11-27 新机复盘：单线程池每轮固定拉 1 个 Chromium，但"拉不拉"卡在
+# 一个固定可用内存阈值（默认 350MB）上。新机总内存 1.9G、进程常驻 925MB，
+# 可用内存长期 240~280MB，永远够不到 350MB —— 于是每轮都被拦，取证近乎
+# 停摆，而 swap 已经悄悄用了 1.5G 却完全没人看。
+#
+# 用户给的新标准很清楚：**以"不用/少量 swap"为准**，按性能实时调配。
+# 所以这里改成采样 swap 用量 + 可用内存 + 换入/换出速率，动态给出本轮该
+# 取证几条（0/1/2），而不是一个脱节的固定数字。目标是让取证自我节制：
+# 内存宽裕、swap 没动 → 多取；swap 开始增长 → 降速；swap 吃紧 → 停一轮。
+
+
+@dataclass(frozen=True)
+class CaptureBudget:
+    """本轮取证容量判定结果。slots=0 表示这一轮不拉浏览器。"""
+
+    slots: int
+    avail_mb: float
+    swap_used_mb: float
+    swapin_rate: float      # 每秒 swap 换入页数（>0 表示正在从 swap 读回，内存吃紧）
+    reason: str
+
+
+def _swap_snapshot() -> tuple[float, int]:
+    """返回 (swap 已用 MB, swapin 累计页数)。读不到返回 (0, 0)，不误伤可用性。
+
+    swapin（pgpgin from swap）持续 >0 是内存颠簸的硬信号：进程要的数据被换
+    到磁盘又读回来，此时再拉 Chromium 只会把整机拖进 do_swap_page 死亡螺旋。
+    """
+    used_mb = 0.0
+    swapin = 0
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:  # noqa: PTH123
+            total = free = 0
+            for line in fh:
+                if line.startswith("SwapTotal:"):
+                    total = int(line.split()[1])
+                elif line.startswith("SwapFree:"):
+                    free = int(line.split()[1])
+            if total > 0:
+                used_mb = (total - free) / 1024
+        with open("/proc/vmstat", encoding="ascii") as fh:  # noqa: PTH123
+            for line in fh:
+                if line.startswith("pswpin "):
+                    swapin = int(line.split()[1])
+                    break
+    except (OSError, ValueError, IndexError):
+        return 0.0, 0
+    return max(0.0, used_mb), swapin
+
+
+# 上一次采样，用于算 swapin 速率（页数/秒）和滞回。
+_BUDGET_LAST = [0.0, 0]  # [monotonic, swapin_pages]
+_BUDGET_LAST_SLOTS = [1]
+# 从"暂停"恢复到取证，要求 swap 降到上限的这个比例以下，避免阈值边缘抖动。
+_BUDGET_RESUME_RATIO = 0.8
+# swapin 每秒超过这个页数就认定颠簸（≈4MB/s，4KB/页），暂停取证。
+_BUDGET_SWAPIN_RATE_LIMIT = 1024.0
+
+
+def capture_budget() -> CaptureBudget:
+    """按实时内存 + swap 压力决定本轮取证条数。
+
+    分档（adaptive 开启时）：
+    - swap 已用 ≥ 上限，或可用内存 < 硬下限，或正在剧烈换入 → 0 条（停一轮）
+    - swap 几乎没用（< 上限 25%）且内存宽裕（≥ 硬下限 2 倍）→ max_batch 条
+    - 其余 → 1 条
+
+    adaptive 关闭时退回旧行为：只看可用内存，够就 1 条、不够就 0 条。
+    滞回：一旦进入暂停，要等 swap 降回上限的 80% 以下才恢复，防止反复横跳。
+    """
+    avail = available_memory_mb()
+    swap_used, swapin = _swap_snapshot()
+    now = time.monotonic()
+    last_t, last_in = _BUDGET_LAST
+    dt = now - last_t
+    rate = max(0.0, (swapin - last_in) / dt) if (last_t and dt > 0.1 and swapin >= last_in) else 0.0
+    _BUDGET_LAST[0], _BUDGET_LAST[1] = now, swapin
+
+    adaptive = runtime_settings.get_bool(
+        runtime_settings.CAPTURE_ADAPTIVE, True
+    )
+    if not adaptive:
+        slots = 1 if memory_ok() else 0
+        return CaptureBudget(slots, avail, swap_used, rate, "fixed(adaptive off)")
+
+    max_batch = max(1, runtime_settings.get_int(runtime_settings.CAPTURE_MAX_BATCH, 2))
+    swap_limit = runtime_settings.get_int(runtime_settings.CAPTURE_SWAP_LIMIT_MB, 256)
+    floor = runtime_settings.get_int(runtime_settings.CAPTURE_MIN_FREE_MEM_MB, 120)
+
+    # 恢复门槛：上一轮为 0 时，要求 swap 额外降一截才放行。
+    resume_limit = swap_limit * _BUDGET_RESUME_RATIO if _BUDGET_LAST_SLOTS[0] == 0 else swap_limit
+
+    if swap_limit > 0 and swap_used >= resume_limit:
+        slots, reason = 0, f"swap {swap_used:.0f}MB 达上限 {swap_limit}MB"
+    elif floor > 0 and avail < floor:
+        slots, reason = 0, f"可用内存 {avail:.0f}MB 低于下限 {floor}MB"
+    elif rate > _BUDGET_SWAPIN_RATE_LIMIT:
+        slots, reason = 0, f"swap 换入 {rate:.0f}页/s，内存颠簸"
+    elif swap_limit > 0 and swap_used <= swap_limit * 0.25 and avail >= floor * 2:
+        slots, reason = max_batch, "内存宽裕且 swap 空闲"
+    else:
+        slots, reason = 1, "常规降速"
+
+    _BUDGET_LAST_SLOTS[0] = slots
+    return CaptureBudget(slots, avail, swap_used, rate, reason)
 
 
 def _apk_size_cap(tier: str) -> int:

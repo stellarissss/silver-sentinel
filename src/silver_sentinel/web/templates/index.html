@@ -468,6 +468,23 @@
           <button class="btn primary" id="btn-capture-save">保存配额</button>
         </div>
       </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>取证强度</h2><span class="hint">按实时内存与 swap 自动调配，尽量不碰 swap</span></div>
+        <div class="form-grid narrow-form">
+          <label>动态调配</label>
+          <div class="row"><label class="check"><input type="checkbox" id="set-adaptive"> 开启（按 swap/内存实时决定每轮取证条数）</label></div>
+          <label>每轮最多</label>
+          <div class="row"><input id="set-max-batch" type="number" min="1" max="4" class="narrow"><span class="inline">条（内存宽裕、swap 空闲时）</span></div>
+          <label>swap 上限</label>
+          <div class="row"><input id="set-swap-limit" type="number" min="0" class="narrow"><span class="inline">MB（已用超过就降速/暂停，0=不限制）</span></div>
+          <label>内存下限</label>
+          <div class="row"><input id="set-min-free" type="number" min="0" class="narrow"><span class="inline">MB（可用低于此值完全暂停）</span></div>
+        </div>
+        <div class="row actions">
+          <button class="btn primary" id="btn-intensity-save">保存强度</button>
+        </div>
+      </div>
     </section>
   </main>
 

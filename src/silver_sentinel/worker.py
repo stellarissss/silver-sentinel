@@ -98,24 +98,33 @@ class CaptureWorker:
         self.last: dict[str, Any] = {}
 
     def tick(self) -> int:
-        """跑一条。返回实际执行条数。"""
-        from .capture import available_memory_mb, backfill, memory_ok, queue_summary, run_batch
+        """跑一批。返回实际执行条数。
+
+        每轮先问 `capture_budget()`：按实时内存 + swap 压力决定这一轮能拉几条
+        Chromium（0/1/max_batch）。标准从"固定内存阈值"改成"尽量不碰 swap"：
+        内存宽裕且 swap 空闲就多取，swap 增长就降速，swap 吃紧就停一轮。
+        停一轮时任务留在队列里，压力缓解后下一轮接着跑，不会丢线索。
+        """
+        from .capture import backfill, capture_budget, queue_summary, run_batch
 
         t0 = time.monotonic()
-        # 内存看门狗：可用内存见底时这一轮不拉 Chromium。小内存机器上，
-        # 内存不足还硬取证 → swap 颠簸 → 取证线程卡在 do_swap_page → 超时
-        # 重建 → 内存更少，是反复卡死的根源。跳过一轮，给系统喘息的窗口；
-        # 任务留在队列里，内存恢复后下一轮接着跑，不会丢线索。
-        if not memory_ok():
+        budget = capture_budget()
+        if budget.slots <= 0:
             self.idle_rounds += 1
             log.warning(
-                "可用内存 %.0fMB 低于阈值 %dMB，暂停本轮取证等待内存恢复",
-                available_memory_mb(), settings.capture_min_free_mem_mb,
+                "取证降速：%s（可用内存 %.0fMB，swap %.0fMB），暂停本轮等待内存恢复",
+                budget.reason, budget.avail_mb, budget.swap_used_mb,
             )
-            beat("capture", skipped_low_mem=True, avail_mb=round(available_memory_mb()))
+            beat(
+                "capture",
+                throttled=True,
+                reason=budget.reason,
+                avail_mb=round(budget.avail_mb),
+                swap_mb=round(budget.swap_used_mb),
+            )
             return 0
         added = backfill(limit=settings.capture_backfill_limit)
-        result = run_batch(limit=1)
+        result = run_batch(limit=budget.slots)
         spent = time.monotonic() - t0
         ran = int(result.get("ran") or 0)
         ok = int(result.get("ok") or 0)
@@ -128,6 +137,9 @@ class CaptureWorker:
             "ran": ran,
             "ok": ok,
             "elapsed": round(spent, 1),
+            "budget": budget.slots,
+            "avail_mb": round(budget.avail_mb),
+            "swap_mb": round(budget.swap_used_mb),
             "queue": queue_summary(),
         }
         # 一轮耗时异常要留痕。线上踩过：某个站把 Playwright 卡住，整个

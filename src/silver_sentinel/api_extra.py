@@ -989,6 +989,10 @@ class CaptureIn(BaseModel):
     apk_max_mb: int | None = None
     apk_daily_mb: int | None = None
     apk_tiers: str | None = None
+    adaptive: bool | None = None
+    max_batch: int | None = None
+    swap_limit_mb: int | None = None
+    min_free_mem_mb: int | None = None
 
 
 @router.get("/api/settings")
@@ -1046,6 +1050,16 @@ def settings_capture(payload: CaptureIn) -> dict[str, Any]:
         values[runtime_settings.CAPTURE_APK_DAILY_MB] = str(max(10, payload.apk_daily_mb))
     if payload.apk_tiers is not None:
         values[runtime_settings.CAPTURE_AUTO_APK_TIERS] = payload.apk_tiers
+    if payload.adaptive is not None:
+        values[runtime_settings.CAPTURE_ADAPTIVE] = "1" if payload.adaptive else "0"
+    if payload.max_batch is not None:
+        values[runtime_settings.CAPTURE_MAX_BATCH] = str(max(1, min(4, payload.max_batch)))
+    if payload.swap_limit_mb is not None:
+        values[runtime_settings.CAPTURE_SWAP_LIMIT_MB] = str(max(0, min(8192, payload.swap_limit_mb)))
+    if payload.min_free_mem_mb is not None:
+        values[runtime_settings.CAPTURE_MIN_FREE_MEM_MB] = str(
+            max(0, min(4096, payload.min_free_mem_mb))
+        )
     if values:
         runtime_settings.set_many(values, by="web")
     return runtime_settings.llm_public()
